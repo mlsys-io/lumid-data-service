@@ -1,0 +1,71 @@
+services:
+  finai-injection:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: finai-injection:latest
+    container_name: finai-injection
+    restart: unless-stopped
+    networks:
+      - findata-net
+    ports:
+      - "0.0.0.0:5011:8089"
+    volumes:
+      # Blob storage (RW) — SHARED with the read service. Bytes uploaded via
+      # POST /ingest/blob land here; the read service's GET /blobs/{key} also
+      # serves from the same folder. Keep FINDATA_BLOB_PUBLIC_BASE_URL identical
+      # across both services so emitted storage_url values resolve everywhere.
+      - /data/findata/blobs:/app/blobs
+      # OPTIONAL — adapter mode. Mount the loaders/ tree (+ CLAUDE.md so the
+      # root resolver finds it) to enable POST /ingest/adapter/{id}. OMIT BOTH
+      # to run fully standalone: typed/stream/file/blob/webhook still work,
+      # adapter mode returns 503. This is the portability boundary.
+      - /data/findata/loaders:/app/loaders:ro
+      - /data/findata/CLAUDE.md:/app/CLAUDE.md:ro
+    extra_hosts:
+      # Lumilake handoff reaches the docker host gateway.
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Same Postgres as the read service (one warehouse, unified provenance).
+      FINDATA_DB_HOST: finai-tsdb-pg17
+      FINDATA_DB_PORT: "5432"
+      FINDATA_DB_USER: postgres
+      FINDATA_DB_PASSWORD: ${FINDATA_DB_PASSWORD:?set FINDATA_DB_PASSWORD in .env}
+      FINDATA_DB_NAME: fin_ai_world_model_v2
+      FINDATA_POOL_MIN: "2"
+      FINDATA_POOL_MAX: "20"
+      # Generous write-side statement timeout (large stream/file merges must
+      # not be killed mid-COPY; a wedged backend still can't pin forever).
+      FINDATA_INGEST_STATEMENT_TIMEOUT_MS: "600000"
+      # Auth — same Lumid settings + local-key bypass as the read service so a
+      # PAT / local key validates identically on both. The read service's MCP
+      # write tools call in with one of these local keys (role=local).
+      FINDATA_LUMID_URL: "https://lum.id"
+      FINDATA_LUMID_ENABLED: "true"
+      FINDATA_LUMID_CACHE_TTL: "300"
+      FINDATA_LUMID_TIMEOUT_S: "5"
+      FINDATA_API_KEYS: "${FINDATA_API_KEYS:-}"
+      FINDATA_RATE_LIMIT_ANON: "20/minute"
+      FINDATA_RATE_LIMIT_AUTHED: "600/minute"
+      # Blob plane — local filesystem under the bind-mounted /app/blobs.
+      FINDATA_BLOB_ROOT: "${FINDATA_BLOB_ROOT:-/app/blobs}"
+      FINDATA_BLOB_PUBLIC_BASE_URL: "${FINDATA_BLOB_PUBLIC_BASE_URL:-https://kv.run:5000}"
+      FINDATA_BLOB_MAX_BYTES: "${FINDATA_BLOB_MAX_BYTES:-104857600}"
+      # Lumilake handoff — fire-and-forget POST after each successful ingest.
+      # Empty disables. ONLY the injection service fires this (never the read service).
+      FINDATA_LUMILAKE_BASE_URL: "${FINDATA_LUMILAKE_BASE_URL:-http://host.docker.internal:9000}"
+      FINDATA_LUMILAKE_WORKFLOW: "${FINDATA_LUMILAKE_WORKFLOW:-findata-ingress-followup}"
+      FINDATA_LUMILAKE_TOKEN: "${FINDATA_LUMILAKE_TOKEN:-}"
+      FINDATA_LUMILAKE_TIMEOUT_S: "10"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8089/health', timeout=3); sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    mem_limit: 1g
+    cpus: 2.0
+
+networks:
+  findata-net:
+    external: true
