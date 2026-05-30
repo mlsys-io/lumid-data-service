@@ -38,9 +38,16 @@ fn cell_to_json(row: &Row, idx: usize) -> Value {
         "timestamp" => row.try_get::<_, Option<NaiveDateTime>>(idx).ok().flatten()
             .map(naive_ts_to_json).unwrap_or(Value::Null),
         "timestamptz" => row.try_get::<_, Option<DateTime<Utc>>>(idx).ok().flatten()
-            // 'Z' suffix + auto subsecond precision — matches FastAPI/pydantic
-            // datetime serialization on the Python side.
-            .map(|t| Value::String(t.to_rfc3339_opts(SecondsFormat::AutoSi, true)))
+            // 'Z' suffix; whole seconds → no fraction, otherwise 6-digit
+            // microseconds — matches FastAPI/pydantic datetime serialization.
+            .map(|t| {
+                let fmt = if t.timestamp_subsec_nanos() == 0 {
+                    SecondsFormat::Secs
+                } else {
+                    SecondsFormat::Micros
+                };
+                Value::String(t.to_rfc3339_opts(fmt, true))
+            })
             .unwrap_or(Value::Null),
         "json" | "jsonb" => row.try_get::<_, Option<Value>>(idx).ok().flatten()
             .unwrap_or(Value::Null),

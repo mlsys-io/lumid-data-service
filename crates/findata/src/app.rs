@@ -48,6 +48,59 @@ pub fn build_router(state: AppState) -> Router {
         .route("/funds-disclosure/:symbol", get(handlers::investors::funds_disclosure))
         // Earnings
         .route("/earnings", get(handlers::earnings::earnings_calendar))
+        .route("/earnings/:symbol/history", get(handlers::earnings_history::history))
+        .route("/earnings-quality/:symbol", get(handlers::earnings_history::quality))
+        // Corp actions
+        .route("/dividends/:symbol", get(handlers::corp_actions::dividends))
+        .route("/splits/:symbol", get(handlers::corp_actions::splits))
+        .route("/market-cap/:symbol/history", get(handlers::corp_actions::market_cap_history))
+        // Valuation
+        .route("/dcf/:symbol", get(handlers::valuation::dcf))
+        .route("/enterprise-value/:symbol", get(handlers::valuation::enterprise_value))
+        .route("/financial-scores/:symbol", get(handlers::valuation::financial_scores))
+        .route("/owner-earnings/:symbol", get(handlers::valuation::owner_earnings))
+        // ETF
+        .route("/etf/:symbol/info", get(handlers::etf::info))
+        .route("/etf/:symbol/holdings", get(handlers::etf::holdings))
+        .route("/etf/:symbol/sector-weightings", get(handlers::etf::sector_weightings))
+        .route("/etf/:symbol/country-weightings", get(handlers::etf::country_weightings))
+        .route("/symbol/:symbol/etf-exposure", get(handlers::etf::symbol_etf_exposure))
+        // Investors (acquisitions)
+        .route("/acquisitions/:symbol", get(handlers::investors::acquisitions))
+        // Regulatory + ESG + filings
+        .route("/filings/:symbol", get(handlers::regulatory::filings))
+        .route("/esg/:symbol/disclosures", get(handlers::regulatory::esg_disclosures))
+        .route("/esg/:symbol/ratings", get(handlers::regulatory::esg_ratings))
+        .route("/esg/:symbol/historical", get(handlers::regulatory::esg_historical))
+        .route("/lobbying/:symbol", get(handlers::regulatory::lobbying))
+        .route("/usa-spending/:symbol", get(handlers::regulatory::usa_spending))
+        .route("/uspto-patents/:symbol", get(handlers::regulatory::uspto_patents))
+        .route("/visa-applications/:symbol", get(handlers::regulatory::visa_applications))
+        // Reference depth + misc
+        .route("/executives/:symbol", get(handlers::reference::executives))
+        .route("/governance/:symbol/compensation", get(handlers::reference::compensation))
+        .route("/peers/:symbol", get(handlers::reference::peers))
+        .route("/supply-chain/:symbol", get(handlers::reference::supply_chain))
+        .route("/shares-float/:symbol", get(handlers::reference::shares_float))
+        .route("/employee-count/:symbol", get(handlers::reference::employee_count))
+        .route("/symbol-changes", get(handlers::reference::symbol_changes))
+        .route("/exchange/:exchange/holidays", get(handlers::reference::exchange_holidays))
+        .route("/exchange-market-hours", get(handlers::reference::exchange_market_hours))
+        // Macro
+        .route("/macro/treasury-rates", get(handlers::macro_data::treasury_rates))
+        .route("/macro/economic-indicators", get(handlers::macro_data::economic_indicators))
+        .route("/macro/economic-calendar", get(handlers::macro_data::economic_calendar))
+        .route("/macro/cot/:symbol", get(handlers::macro_data::cot))
+        // Events extras
+        .route("/ipos", get(handlers::events_extra::ipos))
+        .route("/mergers-acquisitions", get(handlers::events_extra::mergers_acquisitions))
+        .route("/fda-calendar", get(handlers::events_extra::fda_calendar))
+        // Transcripts
+        .route("/transcripts/:symbol", get(handlers::transcripts::list_transcripts))
+        .route("/transcripts/:symbol/:year/:quarter", get(handlers::transcripts::one_transcript))
+        // News meta
+        .route("/news/social-sentiment/:symbol", get(handlers::news::social_sentiment))
+        .route("/news/symbol-sentiment/:symbol", get(handlers::news::symbol_sentiment))
         .layer(from_fn_with_state(state.clone(), crate::auth::gate));
 
     public

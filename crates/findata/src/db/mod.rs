@@ -5,6 +5,7 @@
 //! `options` connection parameter so no per-checkout hook is needed.
 
 pub mod lineage;
+pub mod qb;
 pub mod rows;
 
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};

@@ -30,3 +30,40 @@ pub async fn for_symbol(
     let rows = queries::news::for_symbol(&st.pool, &symbol, p.since, p.limit).await?;
     Ok(Json(strip_lineage_rows(rows)))
 }
+
+#[derive(Deserialize)]
+pub struct SocialParams {
+    pub since: Option<DateTime<Utc>>,
+    #[serde(default = "d200")]
+    pub limit: i64,
+}
+fn d200() -> i64 {
+    200
+}
+pub async fn social_sentiment(
+    State(st): State<AppState>,
+    Path(symbol): Path<String>,
+    Query(p): Query<SocialParams>,
+) -> ApiResult<Json<Vec<Map<String, Value>>>> {
+    Ok(Json(strip_lineage_rows(
+        queries::news::social_sentiment(&st.pool, &symbol, p.since, p.limit).await?,
+    )))
+}
+
+#[derive(Deserialize)]
+pub struct SymSentParams {
+    #[serde(default = "d20")]
+    pub limit: i64,
+}
+fn d20() -> i64 {
+    20
+}
+pub async fn symbol_sentiment(
+    State(st): State<AppState>,
+    Path(symbol): Path<String>,
+    Query(p): Query<SymSentParams>,
+) -> ApiResult<Json<Vec<Map<String, Value>>>> {
+    Ok(Json(strip_lineage_rows(
+        queries::news::symbol_sentiment(&st.pool, &symbol, p.limit).await?,
+    )))
+}

@@ -109,3 +109,22 @@ pub async fn funds_disclosure(
 ) -> ApiResult<Json<Value>> {
     Ok(Json(q::funds_disclosure(&st.pool, &symbol, p.limit).await?))
 }
+
+#[derive(Deserialize)]
+pub struct AcqParams {
+    pub since: Option<NaiveDate>,
+    #[serde(default = "d_acq")]
+    pub limit: i64,
+}
+fn d_acq() -> i64 {
+    50
+}
+pub async fn acquisitions(
+    State(st): State<AppState>,
+    Path(symbol): Path<String>,
+    Query(p): Query<AcqParams>,
+) -> ApiResult<Json<Vec<Map<String, Value>>>> {
+    Ok(Json(strip_lineage_rows(
+        q::acquisitions(&st.pool, &symbol, p.since, p.limit).await?,
+    )))
+}

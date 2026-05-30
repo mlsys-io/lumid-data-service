@@ -156,6 +156,33 @@ pub async fn fund_ownership(
     Ok(json!({"symbol": sym, "as_of": asof.to_string(), "count": funds.len(), "funds": funds}))
 }
 
+// ----- acquisitions (SC 13D/G) -----
+pub async fn acquisitions(
+    pool: &Pool,
+    symbol: &str,
+    since: Option<NaiveDate>,
+    limit: i64,
+) -> ApiResult<Vec<Map<String, Value>>> {
+    let mut params: Params = vec![Box::new(symbol.to_uppercase())];
+    let mut where_ = vec!["symbol = $1".to_string()];
+    if let Some(d) = since {
+        params.push(Box::new(d));
+        where_.push(format!("date >= ${}", params.len()));
+    }
+    params.push(Box::new(limit.clamp(1, 200)));
+    let lim = params.len();
+    let sql = format!(
+        "SELECT date, filer, filer_type, percent_of_class::float8 AS percent_of_class, \
+                shares_owned::float8 AS shares_owned \
+           FROM ownership.acquisition_of_beneficial_ownership WHERE {} \
+          ORDER BY date DESC NULLS LAST LIMIT ${lim}",
+        where_.join(" AND ")
+    );
+    let client = pool.get().await?;
+    let rows = client.query(&sql, &refs(&params)).await?;
+    Ok(rows_to_objects(&rows))
+}
+
 pub async fn funds_disclosure(pool: &Pool, symbol: &str, limit: i64) -> ApiResult<Value> {
     let sym = symbol.to_uppercase();
     let limit = limit.clamp(1, 200);
