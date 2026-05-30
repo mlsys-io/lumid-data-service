@@ -116,16 +116,30 @@ pub async fn status(State(st): State<AppState>) -> Html<String> {
             _ => true,
         }
     }
+    // US equities trade Mon–Fri ~13:30–20:00 UTC (9:30am–4:00pm ET; ±1h with DST,
+    // approximated). Outside that, no live equity ticks is expected.
+    fn equity_open(now: chrono::DateTime<chrono::Utc>) -> bool {
+        use chrono::{Datelike, Timelike, Weekday};
+        if matches!(now.weekday(), Weekday::Sat | Weekday::Sun) {
+            return false;
+        }
+        let m = now.hour() * 60 + now.minute();
+        (13 * 60 + 30..=20 * 60).contains(&m)
+    }
     let now_cls = chrono::Utc::now();
     let mut feeds_html = String::new();
     let mut feed_fail = false;
     for (cls, a) in &feeds {
         let cf = *cls == "crypto" || *cls == "forex";
+        let _ = cf;
         let (state, detail) = if a.live > 0 {
             let lat = a.latency.map(|l| format!("{l}ms")).unwrap_or_else(|| "?".into());
-            let standby = a.source.contains("finnhub") && cf || a.source.starts_with("tier_b");
-            let how = if standby { "live via standby" } else { "live" };
-            let st = if standby { "degraded" } else { "up" };
+            // A live WS feed (tier_a, incl. the Finnhub crypto/forex shadow which
+            // is the de-facto primary here) is healthy = up. Only the REST poller
+            // (tier_b) is a degraded fallback.
+            let poller = a.source.starts_with("tier_b");
+            let how = if poller { "live via poller" } else { "live" };
+            let st = if poller { "degraded" } else { "up" };
             (st, format!("{how} · {} · {lat} · {}s ago ({}/{} symbols)", a.source, a.best_age, a.live, a.total))
         } else if *cls == "crypto" {
             // Truly 24/7 — no live ticks is a real failure.
@@ -139,7 +153,13 @@ pub async fn status(State(st): State<AppState>) -> Html<String> {
                 ("degraded", "forex market closed (weekend) — /quotes uses last close".to_string())
             }
         } else {
-            ("degraded", "no live ticks (market closed?) — /quotes uses last close".to_string())
+            // equity
+            if equity_open(now_cls) {
+                feed_fail = true;
+                ("fail", "no live ticks during market hours — /quotes uses last-close fallback".to_string())
+            } else {
+                ("degraded", "equity market closed — /quotes uses last close".to_string())
+            }
         };
         feeds_html.push_str(&pill(cls, state, &detail));
     }
@@ -181,13 +201,6 @@ pub async fn status(State(st): State<AppState>) -> Html<String> {
             <span class=dim>no warm symbols configured (FINDATA_RT_WARM_SYMBOLS)</span></div>".to_string();
     }
 
-    // Connection diagnostics (raw WS link state) — connection-kind only.
-    let conns_html = rt.iter().filter(|h| h.kind == "connection").map(|h| {
-        let state = match h.state.as_str() { "up" => "up", "degraded" => "degraded", "down" => "fail", _ => "off" };
-        let detail = if h.detail.is_empty() { format!("as of {}", h.ts) } else { format!("{} · as of {}", h.detail, h.ts) };
-        pill(&h.name, state, &detail)
-    }).collect::<String>();
-
     // Overall verdict: measured feed failure (a 24/7 feed with no live data)
     // is a genuine DEGRADED — not the FMP login state, which a standby covers.
     let overall_ok = db_ok && redis_state != "fail" && !feed_fail;
@@ -210,7 +223,6 @@ a{{color:#0f766e}}</style></head><body>\
 <h1>System status &nbsp;{}</h1>\
 <h2>Services</h2>{}{}{}\
 <h2>Realtime feeds <span class=dim>(measured from tick freshness)</span></h2>{}\
-<h2>Feed connections <span class=dim>(raw link state)</span></h2>{}\
 <h2>Endpoint freshness (SLA)</h2>\
 <div class=sla><span class='box green'>{} green</span><span class='box amber'>{} amber</span>\
 <span class='box red'>{} red</span><span class='box gray'>{} gray</span></div>\
@@ -221,7 +233,6 @@ a{{color:#0f766e}}</style></head><body>\
         pill("redis", redis_state, "realtime broker · Tier-C cache"),
         pill("pool", "info", &format!("{in_use} in use / {} idle (size {})", ps.available, ps.size)),
         feeds_html,
-        conns_html,
         green, amber, red, gray,
     );
     Html(body)
