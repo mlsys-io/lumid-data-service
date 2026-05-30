@@ -134,6 +134,33 @@ pub fn build_router(state: AppState) -> Router {
         .route("/exec-comp-benchmark/:industry", get(handlers::market_extras::exec_comp))
         .route("/universe/actively-trading", get(handlers::market_extras::universe_active))
         .route("/index/:index_symbol/constituents", get(handlers::market_extras::index_constituents))
+        // Prediction markets
+        .route("/prediction-markets/markets/search", get(handlers::prediction_markets::search_markets))
+        .route("/prediction-markets/markets/polymarket/:condition_id", get(handlers::prediction_markets::get_polymarket_market))
+        .route("/prediction-markets/markets/kalshi/:ticker", get(handlers::prediction_markets::get_kalshi_market))
+        .route("/prediction-markets/trades/polymarket/:condition_id", get(handlers::prediction_markets::polymarket_trades))
+        .route("/prediction-markets/trades/kalshi/:ticker", get(handlers::prediction_markets::kalshi_trades))
+        .route("/prediction-markets/orderbook/polymarket/:asset_id", get(handlers::prediction_markets::polymarket_orderbook))
+        .route("/prediction-markets/orderbook/kalshi/:ticker", get(handlers::prediction_markets::kalshi_orderbook))
+        .route("/prediction-markets/candles/:venue/:market_id", get(handlers::prediction_markets::candles))
+        .route("/prediction-markets/open-interest/:venue/:market_id", get(handlers::prediction_markets::open_interest))
+        .route("/prediction-markets/top-holders/:venue/:market_id", get(handlers::prediction_markets::top_holders))
+        .route("/prediction-markets/wallet/:address", get(handlers::prediction_markets::wallet_profile))
+        .route("/prediction-markets/wallet/:address/pnl", get(handlers::prediction_markets::wallet_pnl))
+        .route("/prediction-markets/wallet/:address/positions", get(handlers::prediction_markets::wallet_positions))
+        .route("/prediction-markets/wallet/:address/activity", get(handlers::prediction_markets::wallet_activity))
+        .route("/prediction-markets/leaderboard", get(handlers::prediction_markets::leaderboard))
+        .route("/prediction-markets/matched-pairs/:venue/:venue_id", get(handlers::prediction_markets::matched_pairs))
+        .route("/prediction-markets/events", get(handlers::prediction_markets::polymarket_events))
+        // KOL
+        .route("/kols", get(handlers::kols::list_kols))
+        .route("/kols/tweets", get(handlers::kols::recent_tweets))
+        .route("/kols/tweets/search", get(handlers::kols::search_archive))
+        .route("/kols/tweets/by-symbol/:symbol", get(handlers::kols::tweets_for_symbol))
+        .route("/kols/tweets/by-symbol/:symbol/history", get(handlers::kols::history_for_symbol))
+        .route("/kols/archive/stats", get(handlers::kols::archive_stats))
+        .route("/kols/:handle/tweets", get(handlers::kols::tweets_for_handle))
+        .route("/kols/:handle/tweets/history", get(handlers::kols::history_for_handle))
         .layer(from_fn_with_state(state.clone(), crate::auth::gate));
 
     public
