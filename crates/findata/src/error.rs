@@ -28,6 +28,25 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// Shallow clone for cache single-flight (`moka::try_get_with` hands back
+    /// `Arc<ApiError>`; the caller needs an owned `ApiError` to return). The
+    /// `Internal` source chain isn't `Clone`, so it's flattened to its message.
+    pub fn clone_lite(&self) -> ApiError {
+        match self {
+            ApiError::BadRequest(s) => ApiError::BadRequest(s.clone()),
+            ApiError::Unauthorized(s) => ApiError::Unauthorized(s.clone()),
+            ApiError::RateLimited { retry_after_s, limit } => ApiError::RateLimited {
+                retry_after_s: *retry_after_s,
+                limit: limit.clone(),
+            },
+            ApiError::NotFound(s) => ApiError::NotFound(s.clone()),
+            ApiError::Validation(v) => ApiError::Validation(v.clone()),
+            ApiError::Forbidden(s) => ApiError::Forbidden(s.clone()),
+            ApiError::Unavailable(s) => ApiError::Unavailable(s.clone()),
+            ApiError::Internal(e) => ApiError::Internal(anyhow::anyhow!("{e:#}")),
+        }
+    }
+
     fn status(&self) -> StatusCode {
         match self {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,

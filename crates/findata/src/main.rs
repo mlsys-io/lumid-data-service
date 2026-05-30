@@ -13,6 +13,7 @@ mod handlers;
 mod ingest;
 mod parsers;
 mod queries;
+mod read;
 mod realtime;
 mod state;
 mod validation;
