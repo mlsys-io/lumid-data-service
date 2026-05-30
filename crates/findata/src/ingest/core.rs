@@ -1,0 +1,343 @@
+//! `ingest_records` orchestration — port of `ingest/core.py`.
+//!
+//! Validates each record against the per-table metadata, opens (or adopts) a
+//! `provenance.runs` row, COPY-stages + DISTINCT-FROM-merges, and stamps the
+//! run with status + counts. The `IngestResult` JSON shape matches the Python
+//! dataclass exactly (run_id, target_schema, target_table, received, inserted,
+//! updated, failed, rejected, status).
+
+use std::collections::HashSet;
+
+use deadpool_postgres::Pool;
+use serde::Serialize;
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+use crate::error::ApiError;
+use crate::validation::{self, Rejected, SERVER_STAMPED_COLS};
+use crate::write::{engine, introspect, run};
+
+use super::lumilake::{self, LumilakeInfo};
+
+/// Partner-declared source_endpoint: 1..=200 chars from [A-Za-z0-9_:/?=&.-].
+/// Hand-rolled to avoid a regex dependency (mirrors the Python `_SOURCE_ENDPOINT_RE`).
+fn valid_source_endpoint(s: &str) -> bool {
+    let len = s.chars().count();
+    if !(1..=200).contains(&len) {
+        return false;
+    }
+    s.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '/' | '?' | '=' | '&' | '.' | '-')
+    })
+}
+
+#[derive(Serialize, Clone)]
+pub struct IngestResult {
+    pub run_id: String,
+    pub target_schema: String,
+    pub target_table: String,
+    pub received: usize,
+    pub inserted: i64,
+    pub updated: i64,
+    pub failed: usize,
+    pub rejected: Vec<Rejected>,
+    pub status: String,
+}
+
+impl IngestResult {
+    pub fn to_json(&self) -> Value {
+        json!({
+            "run_id": self.run_id,
+            "target_schema": self.target_schema,
+            "target_table": self.target_table,
+            "received": self.received,
+            "inserted": self.inserted,
+            "updated": self.updated,
+            "failed": self.failed,
+            "rejected": self.rejected,
+            "status": self.status,
+        })
+    }
+}
+
+/// Distinguishes "table unknown" (→ caller decides sandbox/404) from other
+/// ingest failures.
+pub enum IngestErr {
+    /// Target table doesn't exist / can't be introspected (mirrors
+    /// SchemaIntrospectionError).
+    UnknownTable(String),
+    /// Any other ingest failure (→ 400/500 via Into<ApiError>).
+    Failed(ApiError),
+}
+
+impl From<IngestErr> for ApiError {
+    fn from(e: IngestErr) -> Self {
+        match e {
+            IngestErr::UnknownTable(t) => ApiError::NotFound(format!("unknown table: {t}")),
+            IngestErr::Failed(a) => a,
+        }
+    }
+}
+
+/// Options carried into a single ingest call.
+pub struct IngestParams<'a> {
+    pub target_schema: &'a str,
+    pub target_table: &'a str,
+    pub source: &'a str,
+    pub source_endpoint: &'a str,
+    pub submitted_by: Option<&'a str>,
+    /// When Some, the caller owns the run lifecycle (stream mode); we WILL NOT
+    /// close the run.
+    pub run_id: Option<Uuid>,
+    pub declared_endpoint: Option<&'a str>,
+    pub mode: &'a str,
+    pub user_agent: Option<&'a str>,
+    /// When true (default), validate each record against the per-table model.
+    pub validate: bool,
+    /// Fire the lumilake handoff after a successful, non-empty write.
+    pub fire_lumilake: bool,
+}
+
+/// Write `records` to `target_schema.target_table` with full provenance.
+pub async fn ingest_records(
+    pool: &Pool,
+    p: &IngestParams<'_>,
+    records: &[Value],
+) -> Result<IngestResult, IngestErr> {
+    if p.target_schema.is_empty() || p.target_table.is_empty() {
+        return Err(IngestErr::Failed(ApiError::BadRequest(
+            "target_schema and target_table are required".into(),
+        )));
+    }
+    if p.source.is_empty() {
+        return Err(IngestErr::Failed(ApiError::BadRequest(
+            "source is required".into(),
+        )));
+    }
+    if p.source_endpoint.is_empty() || !valid_source_endpoint(p.source_endpoint) {
+        return Err(IngestErr::Failed(ApiError::BadRequest(format!(
+            "source_endpoint must match [A-Za-z0-9_:/?=&.-]{{1,200}} (got {:?})",
+            p.source_endpoint
+        ))));
+    }
+
+    let received = records.len();
+
+    let mut client = pool
+        .get()
+        .await
+        .map_err(|e| IngestErr::Failed(e.into()))?;
+
+    // Introspect target (also confirms existence). Done before opening a run.
+    let meta = introspect::table_meta(&client, p.target_schema, p.target_table)
+        .await
+        .map_err(|e| IngestErr::Failed(e.into()))?;
+    let meta = match meta {
+        Some(m) => m,
+        None => {
+            return Err(IngestErr::UnknownTable(format!(
+                "{}.{}",
+                p.target_schema, p.target_table
+            )))
+        }
+    };
+
+    // Validate before opening a run row (a pure-validation failure leaves no
+    // 0/0 'failed' run behind).
+    let (parsed, rejected): (Vec<Value>, Vec<Rejected>) = if p.validate {
+        validation::validate_batch(&meta, records)
+    } else {
+        (records.to_vec(), Vec::new())
+    };
+
+    // All rejected, none parsed → short-circuit (route maps to 422).
+    if p.validate && parsed.is_empty() && !rejected.is_empty() {
+        return Ok(IngestResult {
+            run_id: String::new(),
+            target_schema: p.target_schema.to_string(),
+            target_table: p.target_table.to_string(),
+            received,
+            inserted: 0,
+            updated: 0,
+            failed: rejected.len(),
+            rejected,
+            status: "failed".to_string(),
+        });
+    }
+
+    // Open or adopt the run row.
+    let owned_run = p.run_id.is_none();
+    let run_id = match p.run_id {
+        Some(rid) => rid,
+        None => {
+            let mut args = json!({
+                "target_schema": p.target_schema,
+                "target_table": p.target_table,
+                "mode": p.mode,
+                "n_records_received": received,
+            });
+            let o = args.as_object_mut().unwrap();
+            if let Some(d) = p.declared_endpoint {
+                o.insert("declared_endpoint".into(), json!(d));
+            }
+            if let Some(ua) = p.user_agent {
+                o.insert("user_agent".into(), json!(ua));
+            }
+            if let Some(sb) = p.submitted_by {
+                o.insert("submitted_by".into(), json!(sb));
+            }
+            let rid = run::open_run(&client, "ingress:generic", &args, None)
+                .await
+                .map_err(|e| IngestErr::Failed(e.into()))?;
+            if let Some(sb) = p.submitted_by {
+                run::set_submitted_by(&client, &rid, sb)
+                    .await
+                    .map_err(|e| IngestErr::Failed(e.into()))?;
+            }
+            rid
+        }
+    };
+
+    // Run the COPY + merge inside one transaction.
+    let result = write_parsed(
+        &mut client,
+        &meta,
+        p,
+        &parsed,
+        &run_id,
+    )
+    .await;
+
+    match result {
+        Ok((inserted, updated)) => {
+            let status = if rejected.is_empty() { "ok" } else { "partial" };
+            if owned_run {
+                let _ = run::close_run(
+                    &client,
+                    &run_id,
+                    status,
+                    inserted,
+                    updated,
+                    rejected.len() as i64,
+                    None,
+                )
+                .await;
+            }
+            let out = IngestResult {
+                run_id: run_id.to_string(),
+                target_schema: p.target_schema.to_string(),
+                target_table: p.target_table.to_string(),
+                received,
+                inserted,
+                updated,
+                failed: rejected.len(),
+                rejected,
+                status: status.to_string(),
+            };
+            if p.fire_lumilake && (inserted + updated) > 0 {
+                lumilake::submit_after_ingest(
+                    &out,
+                    LumilakeInfo {
+                        target_schema: p.target_schema.to_string(),
+                        target_table: p.target_table.to_string(),
+                        mode: p.mode.to_string(),
+                        declared_endpoint: p.declared_endpoint.map(|s| s.to_string()),
+                        submitted_by: p.submitted_by.map(|s| s.to_string()),
+                    },
+                );
+            }
+            Ok(out)
+        }
+        Err(e) => {
+            let error_text = format!("{e:#}");
+            let trunc = &error_text[error_text.len().saturating_sub(4000)..];
+            if owned_run {
+                let _ = run::close_run(
+                    &client,
+                    &run_id,
+                    "failed",
+                    0,
+                    0,
+                    rejected.len() as i64,
+                    Some(trunc),
+                )
+                .await;
+            }
+            tracing::error!(
+                "ingest_records to {}.{} failed: {error_text}",
+                p.target_schema,
+                p.target_table
+            );
+            Err(IngestErr::Failed(ApiError::BadRequest(format!(
+                "ingest failed: {e}"
+            ))))
+        }
+    }
+}
+
+/// COPY+merge the parsed records (column intersection + transaction). Returns
+/// `(inserted, updated)`. Empty parsed → (0,0) with no DB work.
+async fn write_parsed(
+    client: &mut deadpool_postgres::Client,
+    meta: &introspect::TableMeta,
+    p: &IngestParams<'_>,
+    parsed: &[Value],
+    run_id: &Uuid,
+) -> anyhow::Result<(i64, i64)> {
+    if parsed.is_empty() {
+        return Ok((0, 0));
+    }
+    let writable: HashSet<&str> = meta.columns.iter().map(|c| c.name.as_str()).collect();
+
+    // Column union across records ∩ writable − server-stamped (raw kept).
+    let mut present: HashSet<String> = HashSet::new();
+    for rec in parsed {
+        if let Some(o) = rec.as_object() {
+            for k in o.keys() {
+                present.insert(k.clone());
+            }
+        }
+    }
+    // Preserve target column order.
+    let cols: Vec<String> = meta
+        .columns
+        .iter()
+        .map(|c| c.name.clone())
+        .filter(|c| {
+            present.contains(c)
+                && writable.contains(c.as_str())
+                && !SERVER_STAMPED_COLS.contains(c.as_str())
+        })
+        .collect();
+
+    if cols.is_empty() {
+        anyhow::bail!(
+            "no usable columns after intersection with {}.{}",
+            p.target_schema,
+            p.target_table
+        );
+    }
+    if meta.conflict_cols.is_empty() {
+        anyhow::bail!(
+            "{}.{} has no UNIQUE/PRIMARY KEY — refusing to upsert",
+            p.target_schema,
+            p.target_table
+        );
+    }
+
+    let tx = client.transaction().await?;
+    let (ins, upd) = engine::copy_and_merge(
+        &tx,
+        p.target_schema,
+        p.target_table,
+        &cols,
+        parsed,
+        p.source,
+        p.source_endpoint,
+        run_id,
+        &meta.conflict_cols,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok((ins, upd))
+}
