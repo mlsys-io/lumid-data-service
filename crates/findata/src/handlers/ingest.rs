@@ -60,6 +60,17 @@ fn ingest_err_to_api(e: IngestErr) -> ApiError {
     e.into()
 }
 
+/// Drop cached reads of the written table so the just-ingressed rows are
+/// immediately queryable (read-your-writes). Table-level; also publishes to the
+/// `cache:invalidate` Redis channel for other replicas.
+async fn invalidate_reads(st: &AppState, r: &IngestResult) {
+    if r.inserted + r.updated > 0 {
+        st.read_cache
+            .invalidate_table(&r.target_schema, &r.target_table)
+            .await;
+    }
+}
+
 /// "all records rejected" → 422 with the result body (matches the Python
 /// short-circuit at the end of post_typed / post_file).
 fn all_failed(result: &IngestResult) -> bool {
@@ -112,6 +123,7 @@ pub async fn post_typed(
     let result = ingest_records(&st.pool, &params, &body.records)
         .await
         .map_err(ingest_err_to_api)?;
+    invalidate_reads(&st, &result).await;
     if all_failed(&result) {
         return Err(ApiError::Validation(result.to_json()));
     }
@@ -211,6 +223,10 @@ pub async fn post_stream(
     )
     .await;
     drop(client);
+
+    if inserted + updated > 0 {
+        st.read_cache.invalidate_table(&schema, &table).await;
+    }
 
     let mut rejected_capped = rejected;
     rejected_capped.truncate(50); // don't blow the response on huge streams
@@ -350,6 +366,7 @@ pub async fn post_file(
     let result = ingest_records(&st.pool, &params, &records)
         .await
         .map_err(ingest_err_to_api)?;
+    invalidate_reads(&st, &result).await;
     if all_failed(&result) {
         return Err(ApiError::Validation(result.to_json()));
     }
@@ -497,6 +514,7 @@ pub async fn post_webhook(
     let result = ingest_records(&st.pool, &params, &records)
         .await
         .map_err(ingest_err_to_api)?;
+    invalidate_reads(&st, &result).await;
 
     webhook::stamp_used(st.pool.clone(), wh.webhook_id);
     Ok(Json(result.to_json()))

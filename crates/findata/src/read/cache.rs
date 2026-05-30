@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures_util::StreamExt;
 use moka::future::Cache;
 use moka::Expiry;
 use redis::AsyncCommands;
@@ -24,21 +25,24 @@ use crate::error::{ApiError, ApiResult};
 pub const INVALIDATE_CHANNEL: &str = "cache:invalidate";
 const KEY_NS: &str = "rc:v1";
 
-/// Cache key: endpoint id + canonical (post-coercion) param string.
+/// Cache key: endpoint id + generation + canonical (post-coercion) params.
+/// The `gen` is bumped on invalidation, so all prior L1/L2 entries for the
+/// endpoint become instantly unreachable (no lazy moka sweep, no L2 scan).
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     pub endpoint_id: Arc<str>,
+    pub gen: u64,
     pub params_canon: Arc<str>,
 }
 
 impl CacheKey {
-    pub fn new(endpoint_id: Arc<str>, params_canon: String) -> Self {
-        Self { endpoint_id, params_canon: params_canon.into() }
+    pub fn new(endpoint_id: Arc<str>, gen: u64, params_canon: String) -> Self {
+        Self { endpoint_id, gen, params_canon: params_canon.into() }
     }
     fn redis_key(&self) -> String {
         let mut h = Sha256::new();
         h.update(self.params_canon.as_bytes());
-        format!("{KEY_NS}:{}:{:x}", self.endpoint_id, h.finalize())
+        format!("{KEY_NS}:{}:{}:{:x}", self.endpoint_id, self.gen, h.finalize())
     }
 }
 
@@ -77,6 +81,8 @@ pub struct CacheManager {
     redis: Option<redis::aio::MultiplexedConnection>,
     /// "schema.table" → endpoint ids that read it (for invalidation).
     reverse: HashMap<String, HashSet<Arc<str>>>,
+    /// Per-endpoint generation; bumped on invalidation (lock-free reads).
+    generations: dashmap::DashMap<Arc<str>, u64>,
 }
 
 impl CacheManager {
@@ -95,7 +101,12 @@ impl CacheManager {
             .expire_after(PerEntryTtl)
             .time_to_live(ttl_ceiling) // safety ceiling
             .build();
-        Arc::new(Self { l1, redis, reverse })
+        Arc::new(Self { l1, redis, reverse, generations: dashmap::DashMap::new() })
+    }
+
+    /// Current generation for an endpoint (0 until first invalidation).
+    pub fn generation(&self, endpoint_id: &str) -> u64 {
+        self.generations.get(endpoint_id).map(|g| *g).unwrap_or(0)
     }
 
     /// Fetch from L1 → L2 → `compute`, filling both. Single-flight per key.
@@ -142,23 +153,23 @@ impl CacheManager {
             .map_err(|arc: Arc<ApiError>| arc.clone_lite())
     }
 
-    /// Drop all cached variants of every endpoint that reads `schema.table`
-    /// (local L1). Returns the affected endpoint ids (for the pub/sub fanout).
+    /// Invalidate every endpoint that reads `schema.table` by bumping its
+    /// generation — instantly orphaning all prior L1+L2 entries (their keys
+    /// carry the old gen and are never looked up again; LRU/TTL reclaims them).
+    /// Immediate, unlike moka's lazy `invalidate_entries_if`. Returns the
+    /// affected endpoint ids (for the pub/sub fanout).
     pub async fn invalidate_table_local(&self, schema: &str, table: &str) -> Vec<Arc<str>> {
         let full = format!("{schema}.{table}");
         let Some(ids) = self.reverse.get(&full) else {
             return Vec::new();
         };
-        let affected: HashSet<Arc<str>> = ids.clone();
-        let pred = affected.clone();
-        // moka predicate invalidation (lazy; entries dropped on next maintenance).
-        let _ = self
-            .l1
-            .invalidate_entries_if(move |k, _v| pred.contains(&k.endpoint_id));
-        affected.into_iter().collect()
+        for id in ids {
+            *self.generations.entry(id.clone()).or_insert(0) += 1;
+        }
+        ids.iter().cloned().collect()
     }
 
-    /// Full invalidation: local L1 + cross-replica publish. Call after a
+    /// Full invalidation: local L1+L2 + cross-replica publish. Call after a
     /// committed write to `schema.table`.
     pub async fn invalidate_table(&self, schema: &str, table: &str) {
         let affected = self.invalidate_table_local(schema, table).await;
@@ -170,6 +181,36 @@ impl CacheManager {
                 .publish(INVALIDATE_CHANNEL, format!("{schema}.{table}"))
                 .await;
         }
+    }
+
+    /// Subscribe to `cache:invalidate` and drop L1+L2 for the named table on
+    /// each message. This is how writers that bypass the ingress plane — the
+    /// cron loaders/scrapers writing directly to Postgres — keep cached reads
+    /// fresh: after a batch they `PUBLISH cache:invalidate "schema.table"`.
+    /// Also delivers cross-replica invalidations. Reconnects on drop.
+    pub fn start_invalidation_listener(self: &Arc<Self>, client: redis::Client) {
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match client.get_async_pubsub().await {
+                    Ok(mut ps) => {
+                        if ps.subscribe(INVALIDATE_CHANNEL).await.is_ok() {
+                            tracing::info!("cache invalidation listener subscribed");
+                            let mut stream = ps.on_message();
+                            while let Some(msg) = stream.next().await {
+                                if let Ok(p) = msg.get_payload::<String>() {
+                                    if let Some((schema, table)) = p.split_once('.') {
+                                        mgr.invalidate_table_local(schema, table).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => tracing::warn!("cache invalidate pubsub connect failed: {e}"),
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
     }
 }
 

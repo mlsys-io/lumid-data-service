@@ -65,7 +65,8 @@ async fn run_spec(
 
     // Produce (or fetch cached) the serialized body.
     let body: ApiResult<Arc<CachedBody>> = if spec.cache {
-        let key = CacheKey::new(id, bound.canon.clone());
+        let gen = st.read_cache.generation(&id);
+        let key = CacheKey::new(id, gen, bound.canon.clone());
         st.read_cache
             .get_or_compute(key, ttl, true, || async {
                 produce(st, spec, &bound, has_symbol, symbol.clone()).await
