@@ -101,6 +101,39 @@ pub fn build_router(state: AppState) -> Router {
         // News meta
         .route("/news/social-sentiment/:symbol", get(handlers::news::social_sentiment))
         .route("/news/symbol-sentiment/:symbol", get(handlers::news::symbol_sentiment))
+        // News global feeds
+        .route("/news/latest", get(handlers::news::latest))
+        .route("/news/search", get(handlers::news::search))
+        .route("/news/stats", get(handlers::news::stats))
+        // Screener
+        .route("/screener", get(handlers::screener::screener))
+        // Quotes snapshot + stats + metrics
+        .route("/quotes", get(handlers::quotes::quotes_snapshot))
+        .route("/quote-stats/:symbol", get(handlers::quotes::quote_stats))
+        .route("/metrics-snapshot/:symbol", get(handlers::quotes::metrics_snapshot))
+        // Technical
+        .route("/technical/:symbol", get(handlers::technical::technical))
+        .route("/technical/:symbol/latest", get(handlers::technical::technical_latest))
+        // Institutional 13-F
+        .route("/institutional/:symbol/holders/analytics", get(handlers::institutional::holder_analytics))
+        .route("/institutional/holder/:cik/performance", get(handlers::institutional::holder_performance))
+        .route("/institutional/holder/:cik/industries", get(handlers::institutional::holder_industries))
+        .route("/institutional/holder/:cik/dates", get(handlers::institutional::holder_dates))
+        .route("/institutional/industries", get(handlers::institutional::industries_summary))
+        // XBRL
+        .route("/xbrl/:symbol/filings", get(handlers::xbrl::xbrl_index))
+        .route("/xbrl/:symbol/filing/:accession", get(handlers::xbrl::xbrl_filing))
+        // Market extras
+        .route("/market-movers", get(handlers::market_extras::market_movers))
+        .route("/dividends-calendar", get(handlers::market_extras::dividends_calendar))
+        .route("/splits-calendar", get(handlers::market_extras::splits_calendar))
+        .route("/sectors/pe", get(handlers::market_extras::sectors_pe))
+        .route("/sectors/performance", get(handlers::market_extras::sectors_perf))
+        .route("/industries/pe", get(handlers::market_extras::industries_pe))
+        .route("/industries/performance", get(handlers::market_extras::industries_perf))
+        .route("/exec-comp-benchmark/:industry", get(handlers::market_extras::exec_comp))
+        .route("/universe/actively-trading", get(handlers::market_extras::universe_active))
+        .route("/index/:index_symbol/constituents", get(handlers::market_extras::index_constituents))
         .layer(from_fn_with_state(state.clone(), crate::auth::gate));
 
     public

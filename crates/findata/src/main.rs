@@ -38,12 +38,35 @@ async fn main() -> anyhow::Result<()> {
         if settings.lumid_enabled { "enabled" } else { "disabled" }
     );
 
+    // Optional read-only Redis (quote-snapshot last-tick).
+    let redis = if settings.redis_url.is_empty() {
+        None
+    } else {
+        match redis::Client::open(settings.redis_url.clone()) {
+            Ok(c) => match c.get_multiplexed_async_connection().await {
+                Ok(conn) => {
+                    tracing::info!("redis connected ({})", settings.redis_url);
+                    Some(conn)
+                }
+                Err(e) => {
+                    tracing::warn!("redis connect failed: {e} — /quotes returns no_cache");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!("redis url invalid: {e}");
+                None
+            }
+        }
+    };
+
     let state = state::AppState {
         pool,
         settings: Arc::new(settings),
         lumid,
         local_keys,
         rate,
+        redis,
     };
 
     let router = app::build_router(state);

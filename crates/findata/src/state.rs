@@ -16,4 +16,6 @@ pub struct AppState {
     pub lumid: Arc<LumidClient>,
     pub local_keys: Arc<HashMap<String, String>>,
     pub rate: Arc<RateLimiter>,
+    /// Read-only Redis (quote-snapshot last-tick). None when unconfigured.
+    pub redis: Option<redis::aio::MultiplexedConnection>,
 }

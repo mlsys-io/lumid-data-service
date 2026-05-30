@@ -93,8 +93,10 @@ fn decimal_to_json(d: Decimal) -> Value {
             return Value::from(i);
         }
     }
-    serde_json::from_str::<Value>(&d.normalize().to_string())
-        .unwrap_or_else(|_| d.to_f64().map(json_num_f64).unwrap_or(Value::Null))
+    // Fractional: parse the exact decimal digits via std str→f64 (correctly
+    // rounded, IEEE round-to-nearest) to match Python's float(Decimal) exactly.
+    // (rust_decimal::to_f64 is NOT always correctly rounded — last-ULP drift.)
+    d.normalize().to_string().parse::<f64>().ok().map(json_num_f64).unwrap_or(Value::Null)
 }
 
 /// Naive timestamp → ISO-8601 with 'T', omitting microseconds when zero (Python

@@ -35,6 +35,11 @@ pub struct Settings {
     // Rate limit, "<n>/<unit>" e.g. "600/minute".
     pub rate_limit_anon: String,
     pub rate_limit_authed: String,
+
+    // Redis (read-only: quote-snapshot last-tick). Empty disables.
+    pub redis_url: String,
+    /// Max symbols per /quotes request (mirrors rt_sse_request_syms).
+    pub quotes_max_symbols: usize,
 }
 
 impl Settings {
@@ -59,6 +64,8 @@ impl Settings {
             api_keys_raw: env_str("FINDATA_API_KEYS", ""),
             rate_limit_anon: env_str("FINDATA_RATE_LIMIT_ANON", "60/minute"),
             rate_limit_authed: env_str("FINDATA_RATE_LIMIT_AUTHED", "600/minute"),
+            redis_url: env_str("FINDATA_REDIS_URL", ""),
+            quotes_max_symbols: env_u32("FINDATA_RT_SSE_REQUEST_SYMS", 100) as usize,
         }
     }
 }

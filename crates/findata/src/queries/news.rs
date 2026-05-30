@@ -45,6 +45,91 @@ pub async fn for_symbol(
     Ok(rows_to_objects(&rows))
 }
 
+// ----- global feeds: latest / search / stats -----
+fn category_alias(c: &str) -> String {
+    match c.to_lowercase().as_str() {
+        "general" => "general_market",
+        "stock" => "stock_market",
+        "press" | "press_release" => "press_release",
+        "crypto" => "crypto",
+        "forex" => "forex",
+        "company" => "company",
+        other => return other.to_string(),
+    }
+    .to_string()
+}
+
+pub async fn latest(
+    pool: &Pool,
+    category: Option<&str>,
+    since: Option<DateTime<Utc>>,
+    limit: i64,
+) -> ApiResult<Vec<Map<String, Value>>> {
+    let since = since.unwrap_or_else(|| Utc::now() - Duration::days(30));
+    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = vec![Box::new(since)];
+    let mut where_ = "published_at >= $1".to_string();
+    if let Some(c) = category {
+        params.push(Box::new(category_alias(c)));
+        where_.push_str(&format!(" AND category = ${}", params.len()));
+    }
+    params.push(Box::new(limit.clamp(1, 200)));
+    let lim = params.len();
+    let sql = format!(
+        "SELECT published_at, publisher, headline, summary, url, category, symbol \
+           FROM news.articles WHERE {where_} ORDER BY published_at DESC LIMIT ${lim}"
+    );
+    let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+        params.iter().map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+    let client = pool.get().await?;
+    let rows = client.query(&sql, &refs).await?;
+    Ok(rows_to_objects(&rows))
+}
+
+pub async fn search(
+    pool: &Pool,
+    q: &str,
+    category: Option<&str>,
+    since: Option<DateTime<Utc>>,
+    limit: i64,
+) -> ApiResult<Vec<Map<String, Value>>> {
+    let since = since.unwrap_or_else(|| Utc::now() - Duration::days(30));
+    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> =
+        vec![Box::new(q.to_string()), Box::new(since)];
+    let mut where_ =
+        "search_tsv @@ websearch_to_tsquery('english', $1) AND published_at >= $2".to_string();
+    if let Some(c) = category {
+        params.push(Box::new(category_alias(c)));
+        where_.push_str(&format!(" AND category = ${}", params.len()));
+    }
+    params.push(Box::new(limit.clamp(1, 200)));
+    let lim = params.len();
+    let sql = format!(
+        "SELECT published_at, publisher, headline, summary, url, category, symbol \
+           FROM news.articles WHERE {where_} ORDER BY published_at DESC LIMIT ${lim}"
+    );
+    let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+        params.iter().map(|b| b.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+    let client = pool.get().await?;
+    let rows = client.query(&sql, &refs).await?;
+    Ok(rows_to_objects(&rows))
+}
+
+pub async fn stats(pool: &Pool) -> ApiResult<serde_json::Value> {
+    let client = pool.get().await?;
+    let rows = client
+        .query(
+            "SELECT category, \
+                    count(*) FILTER (WHERE published_at > now() - interval '7 days')  AS rows_last_7d, \
+                    count(*) FILTER (WHERE published_at > now() - interval '30 days') AS rows_last_30d, \
+                    max(published_at) AS latest_in_60d \
+               FROM news.articles WHERE published_at > now() - interval '60 days' \
+              GROUP BY category ORDER BY rows_last_30d DESC NULLS LAST",
+            &[],
+        )
+        .await?;
+    Ok(serde_json::json!({"categories": rows_to_objects(&rows)}))
+}
+
 // ----- news_meta: social + symbol sentiment -----
 pub async fn social_sentiment(
     pool: &Pool,

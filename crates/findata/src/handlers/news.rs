@@ -32,6 +32,49 @@ pub async fn for_symbol(
 }
 
 #[derive(Deserialize)]
+pub struct LatestParams {
+    pub category: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+    #[serde(default = "d50")]
+    pub limit: i64,
+}
+fn d50() -> i64 {
+    50
+}
+
+pub async fn latest(
+    State(st): State<AppState>,
+    Query(p): Query<LatestParams>,
+) -> ApiResult<Json<Vec<Map<String, Value>>>> {
+    Ok(Json(strip_lineage_rows(
+        queries::news::latest(&st.pool, p.category.as_deref(), p.since, p.limit).await?,
+    )))
+}
+
+#[derive(Deserialize)]
+pub struct SearchParams {
+    #[serde(rename = "q")]
+    pub query: String,
+    pub category: Option<String>,
+    pub since: Option<DateTime<Utc>>,
+    #[serde(default = "d50")]
+    pub limit: i64,
+}
+
+pub async fn search(
+    State(st): State<AppState>,
+    Query(p): Query<SearchParams>,
+) -> ApiResult<Json<Vec<Map<String, Value>>>> {
+    Ok(Json(strip_lineage_rows(
+        queries::news::search(&st.pool, &p.query, p.category.as_deref(), p.since, p.limit).await?,
+    )))
+}
+
+pub async fn stats(State(st): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(queries::news::stats(&st.pool).await?))
+}
+
+#[derive(Deserialize)]
 pub struct SocialParams {
     pub since: Option<DateTime<Utc>>,
     #[serde(default = "d200")]
