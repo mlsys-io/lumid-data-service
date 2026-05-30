@@ -2,6 +2,7 @@
 //! parameterized SQL and returns JSON objects via `db::rows`.
 
 pub mod analysis;
+pub mod blobs;
 pub mod catalog;
 pub mod corp_actions;
 pub mod earnings;
@@ -11,6 +12,7 @@ pub mod etf;
 pub mod events_extra;
 pub mod freshness;
 pub mod fundamentals;
+pub mod gov_trades;
 pub mod institutional;
 pub mod investors;
 pub mod kols;

@@ -6,7 +6,7 @@
 //! the remaining endpoints + the write plane + the proxy gateway.
 
 use axum::middleware::from_fn_with_state;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
@@ -201,6 +201,22 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/embeddings", post(handlers::llm::embeddings))
         .route("/v1/messages", post(handlers::llm::messages))
         .route("/v1/messages/count_tokens", post(handlers::llm::count_tokens))
+
+        // Government trades — port of api/routes/gov_trades.py.
+        .route("/gov-trades/:symbol", get(handlers::gov_trades::for_symbol))
+
+        // Blob serving (read side) — port of api/routes/blobs.py.
+        .route("/blobs/*key", get(handlers::blobs::serve_blob))
+        .route("/storage/v1/object/findata/*path", get(handlers::blobs::legacy_storage_alias))
+
+        // KOL media — port of api/routes/kol_media.py.
+        .route("/kols/media", get(handlers::kol_media::info))
+        .route("/kols/media/by-url", get(handlers::kol_media::by_url))
+        .route("/kols/media/*rel", get(handlers::kol_media::serve))
+
+        // KOL roster admin (super_admin / local) — port of api/routes/admin_kols.py.
+        .route("/admin/kols", post(handlers::admin_kols::add_kol))
+        .route("/admin/kols/:handle", delete(handlers::admin_kols::remove_kol))
 
         .layer(from_fn_with_state(state.clone(), crate::auth::gate));
 

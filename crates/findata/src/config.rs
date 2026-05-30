@@ -50,6 +50,8 @@ pub struct Settings {
     pub blob_max_bytes: u64,
     /// Public base URL prefix for served blobs (empty → relative `/blobs/...`).
     pub blob_public_base_url: String,
+    /// Root dir for served KOL media (empty disables `/kols/media/*` serving).
+    pub kol_media_root: String,
 
     // LLM reverse proxy. Empty `llm_backend_url` disables the /v1/* routes (503).
     pub llm_backend_url: String,
@@ -83,6 +85,7 @@ impl Settings {
             blob_root: env_str("FINDATA_BLOB_ROOT", "/app/blobs"),
             blob_max_bytes: env_u64("FINDATA_BLOB_MAX_BYTES", 100 * 1024 * 1024),
             blob_public_base_url: env_str("FINDATA_BLOB_PUBLIC_BASE_URL", ""),
+            kol_media_root: env_str("FINDATA_KOL_MEDIA_ROOT", ""),
             llm_backend_url: env_str("FINDATA_LLM_BACKEND_URL", ""),
             llm_default_model: env_str("FINDATA_LLM_DEFAULT_MODEL", ""),
         }

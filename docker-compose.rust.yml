@@ -27,6 +27,9 @@ services:
       # uploaded via POST /ingest/blob land here; keep FINDATA_BLOB_PUBLIC_BASE_URL
       # identical across every service so emitted storage_url values resolve.
       - /data/findata/blobs:/app/blobs
+      # OPTIONAL — KOL media (read-only, ~770 GB). Mount + set FINDATA_KOL_MEDIA_ROOT
+      # to enable GET /kols/media/*; omit both to leave media serving disabled.
+      # - /data/findata/twitter_media:/app/kol_media:ro
     extra_hosts:
       # Lumilake handoff reaches the docker host gateway.
       - "host.docker.internal:host-gateway"
@@ -58,6 +61,8 @@ services:
       FINDATA_BLOB_ROOT: "${FINDATA_BLOB_ROOT:-/app/blobs}"
       FINDATA_BLOB_PUBLIC_BASE_URL: "${FINDATA_BLOB_PUBLIC_BASE_URL:-https://kv.run:5000}"
       FINDATA_BLOB_MAX_BYTES: "${FINDATA_BLOB_MAX_BYTES:-104857600}"
+      # KOL media serving — empty disables GET /kols/media/*.
+      FINDATA_KOL_MEDIA_ROOT: "${FINDATA_KOL_MEDIA_ROOT:-}"
       # LLM reverse proxy — empty backend disables /v1/* (returns 503).
       FINDATA_LLM_BACKEND_URL: "${FINDATA_LLM_BACKEND_URL:-}"
       FINDATA_LLM_DEFAULT_MODEL: "${FINDATA_LLM_DEFAULT_MODEL:-}"
