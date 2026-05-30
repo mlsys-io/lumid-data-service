@@ -1,0 +1,26 @@
+[package]
+name = "findata"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "findata"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros", "ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+deadpool-postgres = "0.14"
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
