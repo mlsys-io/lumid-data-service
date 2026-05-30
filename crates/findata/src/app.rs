@@ -25,6 +25,11 @@ pub fn build_router(
         .route("/", get(handlers::landing::landing))
         .route("/reference", get(handlers::landing::landing))
         .route("/llm", get(handlers::landing::llm_landing))
+        // Status board + usage dashboard: browsable HTML linked from the public
+        // landing, so public (matches Python: bare @app.get, no auth dep).
+        .route("/status", get(handlers::freshness::status))
+        .route("/usage", get(handlers::usage::usage))
+        .route("/freshness", get(handlers::freshness::freshness))
         // Webhook ingress: HMAC-authenticated, mounted OUTSIDE the gate.
         .route("/webhook/:webhook_id", post(handlers::ingest::post_webhook))
         // WebSocket realtime: self-authenticating (the WS upgrade can't carry
@@ -33,9 +38,6 @@ pub fn build_router(
         .route("/ws/news", get(handlers::ws::news));
 
     let gated = Router::new()
-        // Generic provenance freshness (platform).
-        .route("/freshness", get(handlers::freshness::freshness))
-
         // Catalog read plane (provenance-exposing) — port of api/routes/catalog.py.
         .route("/catalog/schemas", get(handlers::catalog::get_schemas))
         .route("/catalog/schemas/:schema/tables", get(handlers::catalog::get_schema_tables))
@@ -58,9 +60,6 @@ pub fn build_router(
         .route("/admin/ingress/acl", post(handlers::ingest::grant_acl).delete(handlers::ingest::revoke_acl))
         .route("/admin/ingress/refresh-schemas", post(handlers::ingest::refresh_schemas))
         .route("/admin/ingress/refresh-acl", post(handlers::ingest::refresh_acl))
-
-        // API usage dashboard — port of api/metrics.py::render_usage.
-        .route("/usage", get(handlers::usage::usage))
 
         // LLM reverse proxy (OpenAI + Anthropic compatible) — port of api/routes/llm.py.
         .route("/v1/models", get(handlers::llm::list_models))
