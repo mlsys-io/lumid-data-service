@@ -4,24 +4,11 @@
 //! canary read set. Subsequent phases add the full read surface, the write
 //! engine, and the reverse-proxy gateway to the Python sidecars.
 
-mod app;
-mod auth;
-mod config;
-mod db;
-mod error;
-mod handlers;
-mod ingest;
-mod parsers;
-mod queries;
-mod read;
-mod realtime;
-mod state;
-mod validation;
-mod write;
-
 use std::sync::Arc;
 
 use tracing_subscriber::EnvFilter;
+
+use findata::{app, auth, config, db, read, realtime, state};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
