@@ -105,19 +105,39 @@ pub async fn status(State(st): State<AppState>) -> Html<String> {
     // Classify each feed. "fail" only for a 24/7 class (crypto/forex) with no
     // live ticks (no standby delivering). A standby/fallback source (finnhub
     // shadow for crypto/forex, or tier_b polling) ⇒ degraded, not up.
+    // Forex runs 24/5 — opens ~Sun 21:00 UTC (5pm ET), closes ~Fri 21:00 UTC.
+    // During the weekend close, no live forex ticks is expected, not a failure.
+    fn forex_open(now: chrono::DateTime<chrono::Utc>) -> bool {
+        use chrono::{Datelike, Timelike, Weekday};
+        match now.weekday() {
+            Weekday::Sat => false,
+            Weekday::Sun => now.hour() >= 21,
+            Weekday::Fri => now.hour() < 21,
+            _ => true,
+        }
+    }
+    let now_cls = chrono::Utc::now();
     let mut feeds_html = String::new();
     let mut feed_fail = false;
     for (cls, a) in &feeds {
-        let is_247 = *cls == "crypto" || *cls == "forex";
+        let cf = *cls == "crypto" || *cls == "forex";
         let (state, detail) = if a.live > 0 {
             let lat = a.latency.map(|l| format!("{l}ms")).unwrap_or_else(|| "?".into());
-            let standby = a.source.contains("finnhub") && is_247 || a.source.starts_with("tier_b");
+            let standby = a.source.contains("finnhub") && cf || a.source.starts_with("tier_b");
             let how = if standby { "live via standby" } else { "live" };
             let st = if standby { "degraded" } else { "up" };
             (st, format!("{how} · {} · {lat} · {}s ago ({}/{} symbols)", a.source, a.best_age, a.live, a.total))
-        } else if is_247 {
+        } else if *cls == "crypto" {
+            // Truly 24/7 — no live ticks is a real failure.
             feed_fail = true;
             ("fail", "no live ticks — no standby delivering; /quotes uses last-close fallback".to_string())
+        } else if *cls == "forex" {
+            if forex_open(now_cls) {
+                feed_fail = true;
+                ("fail", "no live ticks during market hours — /quotes uses last-close fallback".to_string())
+            } else {
+                ("degraded", "forex market closed (weekend) — /quotes uses last close".to_string())
+            }
         } else {
             ("degraded", "no live ticks (market closed?) — /quotes uses last close".to_string())
         };
