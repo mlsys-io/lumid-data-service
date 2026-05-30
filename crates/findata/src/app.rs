@@ -30,6 +30,11 @@ pub fn build_router(
         .route("/status", get(handlers::freshness::status))
         .route("/usage", get(handlers::usage::usage))
         .route("/freshness", get(handlers::freshness::freshness))
+        // Doc aliases linked from the landing. FastAPI's /docs + /redoc weren't
+        // ported (no OpenAPI spec generator on the Rust side); /reference is the
+        // canonical API reference, so redirect the legacy paths there.
+        .route("/docs", get(|| async { axum::response::Redirect::permanent("/reference") }))
+        .route("/redoc", get(|| async { axum::response::Redirect::permanent("/reference") }))
         // Webhook ingress: HMAC-authenticated, mounted OUTSIDE the gate.
         .route("/webhook/:webhook_id", post(handlers::ingest::post_webhook))
         // WebSocket realtime: self-authenticating (the WS upgrade can't carry

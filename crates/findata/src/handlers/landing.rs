@@ -599,7 +599,6 @@ const LANDING_HTML: &str = r##"<!DOCTYPE html>
       <a href="/status">Status</a>
       <a href="/usage">Usage</a>
       <a href="/reference">Reference</a>
-      <a href="/openapi.json">OpenAPI</a>
       <div class="spacer"></div>
       <span class="signature">findata · mlsys-io</span>
     </div>
