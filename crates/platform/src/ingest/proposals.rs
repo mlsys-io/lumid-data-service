@@ -1,0 +1,233 @@
+//! Ingress proposals — the "I don't know the schema yet" path.
+//!
+//! When a caller POSTs records to a table that doesn't exist *and* their role
+//! has propose rights, instead of 404 we infer a schema from the records and
+//! stage a row in `provenance.ingress_proposals` (status `pending`). An admin
+//! reviews it (`GET /catalog/ingress/proposals`) and approves
+//! (`POST /admin/ingress/proposals/:id/approve`) — which CREATEs the table
+//! (inferred columns + the universal provenance columns + a primary key) and
+//! grants the proposer's role write ACL. Net-new data, no DDL by hand.
+//!
+//! Safety: every identifier (schema/table/column) is normalised + validated
+//! against `^[a-z_][a-z0-9_]{0,62}$` and emitted double-quoted, so caller JSON
+//! keys can never inject SQL.
+
+use std::collections::BTreeMap;
+
+use deadpool_postgres::Pool;
+use serde_json::{json, Map, Value};
+
+use crate::error::{ApiError, ApiResult};
+
+fn norm_ident(s: &str) -> Option<String> {
+    let l = s.trim().to_lowercase();
+    let ok = !l.is_empty()
+        && l.len() <= 63
+        && l.chars().next().map(|c| c.is_ascii_lowercase() || c == '_').unwrap_or(false)
+        && l.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    ok.then_some(l)
+}
+
+/// Universal provenance columns every fact table carries (stamped on write).
+const PROVENANCE_COLS: &[&str] = &["source", "source_endpoint", "source_run_id", "ingest_ts", "raw"];
+
+/// Infer a Postgres type for a column from its values across the sample.
+fn infer_type(values: &[&Value]) -> &'static str {
+    let mut any_str = false;
+    let mut any_float = false;
+    let mut any_int = false;
+    let mut any_bool = false;
+    let mut any_json = false;
+    for v in values {
+        match v {
+            Value::String(_) => any_str = true,
+            Value::Bool(_) => any_bool = true,
+            Value::Number(n) => {
+                if n.is_f64() && n.as_i64().is_none() { any_float = true } else { any_int = true }
+            }
+            Value::Array(_) | Value::Object(_) => any_json = true,
+            Value::Null => {}
+        }
+    }
+    if any_json { return "jsonb" }
+    if any_str { return "text" }
+    if any_float { return "double precision" }
+    if any_int { return "bigint" }
+    if any_bool { return "boolean" }
+    "text"
+}
+
+/// Create a pending proposal from the records. Returns the response body.
+pub async fn create(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+    role: &str,
+    sub: &str,
+    records: &[Value],
+) -> ApiResult<Value> {
+    let schema_n = norm_ident(schema).ok_or_else(|| ApiError::BadRequest(format!("invalid schema {schema:?}")))?;
+    let table_n = norm_ident(table).ok_or_else(|| ApiError::BadRequest(format!("invalid table {table:?}")))?;
+
+    // Union of keys → inferred column types (provenance cols excluded; added at create).
+    let mut cols: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for rec in records {
+        let Some(obj) = rec.as_object() else { continue };
+        for (k, v) in obj {
+            match norm_ident(k) {
+                Some(c) if !PROVENANCE_COLS.contains(&c.as_str()) => cols.entry(c).or_default().push(v),
+                Some(_) => {} // a provenance col supplied by caller — ignore
+                None => { if !skipped.contains(k) { skipped.push(k.clone()) } }
+            }
+        }
+    }
+    if cols.is_empty() {
+        return Err(ApiError::BadRequest("no usable columns inferred from records".into()));
+    }
+    let inferred: Map<String, Value> =
+        cols.iter().map(|(c, vs)| (c.clone(), Value::String(infer_type(vs).into()))).collect();
+
+    // Heuristic natural key: prefer common identity-ish columns present.
+    let key: Vec<String> = ["symbol", "id", "date", "ts", "timestamp"]
+        .iter()
+        .filter(|k| cols.contains_key(**k))
+        .map(|k| k.to_string())
+        .collect();
+
+    let sample: Vec<Value> = records.iter().take(3).cloned().collect();
+    let client = pool.get().await?;
+    let row = client
+        .query_one(
+            "INSERT INTO provenance.ingress_proposals \
+               (declared_schema, declared_table, proposer_sub, proposer_role, \
+                inferred_schema, inferred_key, sample_records, drop_count, status) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending') \
+             RETURNING proposal_id::text",
+            &[&schema_n, &table_n, &sub, &role, &Value::Object(inferred.clone()),
+              &key, &Value::Array(sample), &(skipped.len() as i64)],
+        )
+        .await?;
+    let pid: String = row.get(0);
+    Ok(json!({
+        "status": "proposed",
+        "proposal_id": pid,
+        "target": format!("{schema_n}.{table_n}"),
+        "inferred_columns": inferred,
+        "inferred_key": key,
+        "skipped_keys": skipped,
+        "note": "net-new table — pending admin approval (GET /catalog/ingress/proposals)"
+    }))
+}
+
+/// List proposals, optionally filtered by status.
+pub async fn list(pool: &Pool, status: Option<&str>) -> ApiResult<Value> {
+    let client = pool.get().await?;
+    let rows = if let Some(s) = status {
+        client.query("SELECT proposal_id::text, declared_schema, declared_table, proposer_role, \
+            inferred_schema, inferred_key, drop_count, status, applied_table, created_at \
+            FROM provenance.ingress_proposals WHERE status=$1 ORDER BY created_at DESC LIMIT 200", &[&s]).await?
+    } else {
+        client.query("SELECT proposal_id::text, declared_schema, declared_table, proposer_role, \
+            inferred_schema, inferred_key, drop_count, status, applied_table, created_at \
+            FROM provenance.ingress_proposals ORDER BY created_at DESC LIMIT 200", &[]).await?
+    };
+    let items: Vec<Value> = rows.iter().map(|r| json!({
+        "proposal_id": r.get::<_, String>(0),
+        "schema": r.get::<_, String>(1),
+        "table": r.get::<_, String>(2),
+        "proposer_role": r.get::<_, String>(3),
+        "inferred_schema": r.get::<_, Value>(4),
+        "inferred_key": r.get::<_, Vec<String>>(5),
+        "status": r.get::<_, String>(7),
+        "applied_table": r.get::<_, Option<String>>(8),
+    })).collect();
+    Ok(json!({"count": items.len(), "proposals": items}))
+}
+
+/// Approve a proposal: CREATE the table (inferred + provenance cols + PK) and
+/// grant the proposer's role write ACL. Idempotent-ish (CREATE IF NOT EXISTS).
+pub async fn approve(pool: &Pool, proposal_id: &str, reviewer: &str) -> ApiResult<Value> {
+    let mut client = pool.get().await?;
+    let row = client
+        .query_opt(
+            "SELECT declared_schema, declared_table, proposer_role, inferred_schema, inferred_key \
+             FROM provenance.ingress_proposals WHERE proposal_id::text=$1 AND status='pending'",
+            &[&proposal_id],
+        )
+        .await?
+        .ok_or_else(|| ApiError::NotFound("no pending proposal with that id".into()))?;
+    let schema: String = row.get(0);
+    let table: String = row.get(1);
+    let role: String = row.get(2);
+    let inferred: Value = row.get(3);
+    let key: Vec<String> = row.get(4);
+
+    // Re-validate identifiers (defence in depth) + build column DDL.
+    let schema_n = norm_ident(&schema).ok_or_else(|| ApiError::BadRequest("bad schema".into()))?;
+    let table_n = norm_ident(&table).ok_or_else(|| ApiError::BadRequest("bad table".into()))?;
+    let obj = inferred.as_object().ok_or_else(|| ApiError::Internal(anyhow::anyhow!("bad inferred_schema")))?;
+    let mut col_ddl = Vec::new();
+    for (c, ty) in obj {
+        let c_n = norm_ident(c).ok_or_else(|| ApiError::BadRequest(format!("bad column {c:?}")))?;
+        let ty_s = match ty.as_str().unwrap_or("text") {
+            "text" | "bigint" | "double precision" | "boolean" | "jsonb" => ty.as_str().unwrap(),
+            _ => "text",
+        };
+        col_ddl.push(format!("\"{c_n}\" {ty_s}"));
+    }
+    // PK = inferred key (+ source for multi-source safety) if all present; else a surrogate.
+    let key_n: Vec<String> = key.iter().filter_map(|k| norm_ident(k)).filter(|k| obj.contains_key(k)).collect();
+    let pk = if key_n.is_empty() {
+        "  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n".to_string()
+    } else {
+        String::new()
+    };
+    let pk_constraint = if key_n.is_empty() {
+        String::new()
+    } else {
+        let mut cols = key_n.clone();
+        cols.push("source".into());
+        format!(",\n  PRIMARY KEY ({})", cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", "))
+    };
+
+    let ddl = format!(
+        "CREATE TABLE IF NOT EXISTS \"{schema_n}\".\"{table_n}\" (\n{pk}  {cols},\n\
+           source text NOT NULL,\n  source_endpoint text NOT NULL,\n\
+           source_run_id uuid NOT NULL REFERENCES provenance.runs(run_id),\n\
+           ingest_ts timestamptz NOT NULL DEFAULT now(),\n  raw jsonb{pkc}\n)",
+        cols = col_ddl.join(",\n  "),
+        pkc = pk_constraint,
+    );
+
+    let tx = client.transaction().await?;
+    tx.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema_n}\"")).await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("create schema: {e}")))?;
+    tx.batch_execute(&ddl).await.map_err(|e| ApiError::Internal(anyhow::anyhow!("create table: {e}")))?;
+    tx.execute(
+        "INSERT INTO provenance.ingress_acl (role, target_schema, target_table, can_write, notes) \
+         VALUES ($1,$2,$3,true,'auto-granted on proposal approval') \
+         ON CONFLICT (role, target_schema, target_table) DO UPDATE SET can_write=true",
+        &[&role, &schema_n, &table_n],
+    ).await?;
+    tx.execute(
+        "UPDATE provenance.ingress_proposals SET status='applied', applied_table=$2, \
+         reviewer_sub=$3, reviewed_at=now(), updated_at=now() WHERE proposal_id::text=$1",
+        &[&proposal_id, &format!("{schema_n}.{table_n}"), &reviewer],
+    ).await?;
+    tx.commit().await?;
+    super::acl::invalidate();
+    Ok(json!({"status": "applied", "table": format!("{schema_n}.{table_n}"), "granted_role": role}))
+}
+
+/// Reject a pending proposal.
+pub async fn reject(pool: &Pool, proposal_id: &str, reviewer: &str, notes: Option<&str>) -> ApiResult<Value> {
+    let client = pool.get().await?;
+    let n = client.execute(
+        "UPDATE provenance.ingress_proposals SET status='rejected', reviewer_sub=$2, \
+         review_notes=$3, reviewed_at=now(), updated_at=now() WHERE proposal_id::text=$1 AND status='pending'",
+        &[&proposal_id, &reviewer, &notes],
+    ).await?;
+    if n == 0 { return Err(ApiError::NotFound("no pending proposal with that id".into())); }
+    Ok(json!({"status": "rejected", "proposal_id": proposal_id}))
+}
