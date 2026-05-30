@@ -22,7 +22,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/reference", get(handlers::landing::landing))
         .route("/llm", get(handlers::landing::llm_landing))
         // Webhook ingress: HMAC-authenticated, mounted OUTSIDE the gate.
-        .route("/webhook/:webhook_id", post(handlers::ingest::post_webhook));
+        .route("/webhook/:webhook_id", post(handlers::ingest::post_webhook))
+        // WebSocket realtime: self-authenticating (the WS upgrade can't carry
+        // the gate's 401 body), so mounted OUTSIDE the gate.
+        .route("/ws/quotes", get(handlers::ws::quotes))
+        .route("/ws/news", get(handlers::ws::news));
 
     let gated = Router::new()
         .route("/symbols/search", get(handlers::symbols::search))
@@ -217,6 +221,10 @@ pub fn build_router(state: AppState) -> Router {
         // KOL roster admin (super_admin / local) — port of api/routes/admin_kols.py.
         .route("/admin/kols", post(handlers::admin_kols::add_kol))
         .route("/admin/kols/:handle", delete(handlers::admin_kols::remove_kol))
+
+        // Realtime SSE (normal GET → gated through the auth middleware).
+        .route("/quotes/stream", get(handlers::sse_quotes::quotes_stream))
+        .route("/prediction-markets/stream", get(handlers::pm_stream::stream))
 
         .layer(from_fn_with_state(state.clone(), crate::auth::gate));
 

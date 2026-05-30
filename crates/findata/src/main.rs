@@ -13,6 +13,7 @@ mod handlers;
 mod ingest;
 mod parsers;
 mod queries;
+mod realtime;
 mod state;
 mod validation;
 mod write;
@@ -42,26 +43,36 @@ async fn main() -> anyhow::Result<()> {
         if settings.lumid_enabled { "enabled" } else { "disabled" }
     );
 
-    // Optional read-only Redis (quote-snapshot last-tick).
-    let redis = if settings.redis_url.is_empty() {
-        None
+    // Optional Redis: a multiplexed connection (quote-snapshot last-tick +
+    // hub cache/publish) and the Client handle (pub/sub connections for the
+    // realtime streams).
+    let (redis, redis_client) = if settings.redis_url.is_empty() {
+        (None, None)
     } else {
         match redis::Client::open(settings.redis_url.clone()) {
             Ok(c) => match c.get_multiplexed_async_connection().await {
                 Ok(conn) => {
                     tracing::info!("redis connected ({})", settings.redis_url);
-                    Some(conn)
+                    (Some(conn), Some(c))
                 }
                 Err(e) => {
                     tracing::warn!("redis connect failed: {e} — /quotes returns no_cache");
-                    None
+                    (None, None)
                 }
             },
             Err(e) => {
                 tracing::warn!("redis url invalid: {e}");
-                None
+                (None, None)
             }
         }
+    };
+
+    // Start the realtime hub (+ optional synthetic publisher) when Redis is up.
+    let hub = match (&redis, &redis_client) {
+        (Some(mux), Some(client)) => {
+            Some(realtime::start(&settings, client.clone(), mux.clone()))
+        }
+        _ => None,
     };
 
     let http = reqwest::Client::builder()
@@ -75,6 +86,8 @@ async fn main() -> anyhow::Result<()> {
         local_keys,
         rate,
         redis,
+        redis_client,
+        hub,
         http,
     };
 

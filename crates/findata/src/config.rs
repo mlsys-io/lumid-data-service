@@ -53,6 +53,21 @@ pub struct Settings {
     /// Root dir for served KOL media (empty disables `/kols/media/*` serving).
     pub kol_media_root: String,
 
+    // Realtime hub (SSE/WS fan-out). Mirrors the FINDATA_RT_* knobs.
+    pub rt_heartbeat_sec: u64,
+    pub rt_ws_lifetime_syms: u64,
+    pub rt_sse_request_syms: usize,
+    pub rt_slowclient_queue: usize,
+    /// Tier-A upstream slot caps + Tier-B/news/KOL poll cadences (R2 upstreams).
+    pub rt_tier_a_finnhub_cap: usize,
+    pub rt_tier_a_fmp_cap: usize,
+    pub rt_tier_b_poll_sec: u64,
+    pub rt_news_poll_sec: u64,
+    pub rt_kol_poll_sec: u64,
+    pub rt_kol_max_per_poll: usize,
+    /// Enable the synthetic test publisher (dev only).
+    pub rt_synthetic: bool,
+
     // LLM reverse proxy. Empty `llm_backend_url` disables the /v1/* routes (503).
     pub llm_backend_url: String,
     pub llm_default_model: String,
@@ -86,6 +101,20 @@ impl Settings {
             blob_max_bytes: env_u64("FINDATA_BLOB_MAX_BYTES", 100 * 1024 * 1024),
             blob_public_base_url: env_str("FINDATA_BLOB_PUBLIC_BASE_URL", ""),
             kol_media_root: env_str("FINDATA_KOL_MEDIA_ROOT", ""),
+            rt_heartbeat_sec: env_u32("FINDATA_RT_HEARTBEAT_SEC", 30) as u64,
+            rt_ws_lifetime_syms: env_u32("FINDATA_RT_WS_LIFETIME_SYMS", 500) as u64,
+            rt_sse_request_syms: env_u32("FINDATA_RT_SSE_REQUEST_SYMS", 100) as usize,
+            rt_slowclient_queue: env_u32("FINDATA_RT_SLOWCLIENT_QUEUE", 100) as usize,
+            rt_tier_a_finnhub_cap: env_u32("FINDATA_RT_TIER_A_FINNHUB_CAP", 60) as usize,
+            rt_tier_a_fmp_cap: env_u32("FINDATA_RT_TIER_A_FMP_CAP", 60) as usize,
+            rt_tier_b_poll_sec: env_u32("FINDATA_RT_TIER_B_POLL_SEC", 5) as u64,
+            rt_news_poll_sec: env_u32("FINDATA_RT_NEWS_POLL_SEC", 60) as u64,
+            rt_kol_poll_sec: env_u32("FINDATA_RT_KOL_POLL_SEC", 300) as u64,
+            rt_kol_max_per_poll: env_u32("FINDATA_RT_KOL_MAX_PER_POLL", 20) as usize,
+            rt_synthetic: matches!(
+                env_str("FINDATA_RT_SYNTHETIC", "").to_lowercase().as_str(),
+                "1" | "true" | "yes"
+            ),
             llm_backend_url: env_str("FINDATA_LLM_BACKEND_URL", ""),
             llm_default_model: env_str("FINDATA_LLM_DEFAULT_MODEL", ""),
         }

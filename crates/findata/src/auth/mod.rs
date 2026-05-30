@@ -96,6 +96,36 @@ async fn resolve_identity(
     }
 }
 
+/// Resolve an Identity from a bare token (no headers). Used by the WebSocket
+/// handlers, which extract the token themselves (Authorization / x-api-key /
+/// `Sec-WebSocket-Protocol: bearer.<tok>`) and authenticate outside the `gate`
+/// middleware. Mirrors `resolve_identity`'s local-key-then-Lumid order.
+pub async fn resolve_bearer(
+    st: &AppState,
+    token: &str,
+) -> Result<Option<Identity>, ApiError> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Ok(None);
+    }
+    if let Some(label) = st.local_keys.get(token) {
+        return Ok(Some(Identity {
+            sub: format!("local:{label}"),
+            role: "local".to_string(),
+            email: None,
+            active: true,
+        }));
+    }
+    match st.lumid.introspect(token).await {
+        Ok(Some(id)) => Ok(Some(id)),
+        Ok(None) => Ok(None),
+        Err(LumidError::Unreachable(e)) => {
+            tracing::warn!("lumid unreachable while validating ws bearer: {e}");
+            Err(ApiError::Unavailable("auth service unreachable".into()))
+        }
+    }
+}
+
 /// Middleware applied to the gated (data) router group. Requires identity and
 /// rate-limits. `/health` is mounted outside this layer.
 pub async fn gate(
