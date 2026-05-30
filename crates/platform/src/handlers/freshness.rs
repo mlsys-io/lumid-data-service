@@ -52,6 +52,7 @@ pub async fn status(State(st): State<AppState>) -> Html<String> {
     fn pill(name: &str, state: &str, descr: &str) -> String {
         let cls = match state {
             "ok" | "info" => "ok",
+            "degraded" => "warn",
             "off" => "off",
             _ => "bad",
         };
@@ -72,7 +73,7 @@ pub async fn status(State(st): State<AppState>) -> Html<String> {
             .map(|h| {
                 let state = match h.state.as_str() {
                     "up" => "ok",
-                    "degraded" => "info",
+                    "degraded" => "degraded",
                     "down" => "fail",
                     _ => "off",
                 };
@@ -95,6 +96,7 @@ h1{{font-size:1.4rem;font-weight:600}}h2{{font-size:.95rem;color:#0f766e;margin-
 .row{{display:flex;gap:.7rem;align-items:center;margin:.4rem 0}}\
 .pill{{padding:.15rem .6rem;border-radius:999px;font-size:.8rem;font-weight:600}}\
 .pill.ok{{background:#d1faf0;color:#0f766e}}.pill.bad{{background:#fde2e1;color:#b42318}}\
+.pill.warn{{background:#fdf2d0;color:#92600a}}\
 .pill.off{{background:#eceae4;color:#6b6b6b}}.dim{{color:#6b6b6b;font-size:.85rem}}\
 .sla{{display:flex;gap:.5rem;margin:.4rem 0}}.box{{padding:.4rem .8rem;border-radius:8px;font-weight:600}}\
 .green{{background:#d1faf0;color:#0f766e}}.amber{{background:#fdf2d0;color:#92600a}}\
