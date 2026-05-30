@@ -123,17 +123,43 @@ pub async fn status(State(st): State<AppState>) -> Html<String> {
         };
         feeds_html.push_str(&pill(cls, state, &detail));
     }
+
+    // Realtime health hash: data feeds (kind=feed, e.g. PM/predexon recorders)
+    // and link connections (kind=connection, e.g. the quote WS upstreams).
+    let rt = match st.redis.clone() {
+        Some(mut c) => crate::realtime::health::read_all(&mut c).await,
+        None => Vec::new(),
+    };
+    // Append measured feed-kind entries to the feeds section, classified by
+    // DATA freshness (the recorders refresh their ts on every flush, so an aged
+    // ts = stalled feed). A reported "down" is a hard fail.
+    let now2 = chrono::Utc::now();
+    for h in rt.iter().filter(|h| h.kind == "feed") {
+        let (state, detail) = if h.state == "down" {
+            feed_fail = true;
+            ("fail", format!("{} · as of {}", h.detail, h.ts))
+        } else {
+            let age = chrono::DateTime::parse_from_rfc3339(&h.ts)
+                .map(|t| (now2 - t.with_timezone(&chrono::Utc)).num_seconds())
+                .unwrap_or(i64::MAX);
+            if age < 60 {
+                ("up", format!("{} · {age}s ago", h.detail))
+            } else if age < 300 {
+                ("degraded", format!("lagging · {} · {age}s ago", h.detail))
+            } else {
+                feed_fail = true;
+                ("fail", format!("stalled · {} · {age}s ago", h.detail))
+            }
+        };
+        feeds_html.push_str(&pill(&h.name, state, &detail));
+    }
     if feeds_html.is_empty() {
         feeds_html = "<div class=row><span class='pill off'>feeds: n/a</span>\
             <span class=dim>no warm symbols configured (FINDATA_RT_WARM_SYMBOLS)</span></div>".to_string();
     }
 
-    // Connection diagnostics (raw link state reported by the WS workers).
-    let rt = match st.redis.clone() {
-        Some(mut c) => crate::realtime::health::read_all(&mut c).await,
-        None => Vec::new(),
-    };
-    let conns_html = rt.iter().map(|h| {
+    // Connection diagnostics (raw WS link state) — connection-kind only.
+    let conns_html = rt.iter().filter(|h| h.kind == "connection").map(|h| {
         let state = match h.state.as_str() { "up" => "up", "degraded" => "degraded", "down" => "fail", _ => "off" };
         let detail = if h.detail.is_empty() { format!("as of {}", h.ts) } else { format!("{} · as of {}", h.detail, h.ts) };
         pill(&h.name, state, &detail)
