@@ -59,7 +59,14 @@ async fn main() -> anyhow::Result<()> {
     // Redis is up.
     let hub = match (&redis, &redis_client) {
         (Some(mux), Some(client)) => Some(
-            realtime::start(settings.clone(), client.clone(), mux.clone(), pool.clone()).await,
+            realtime::start(
+                settings.clone(),
+                client.clone(),
+                mux.clone(),
+                pool.clone(),
+                realtime::upstream::financial_workers(),
+            )
+            .await,
         ),
         _ => None,
     };

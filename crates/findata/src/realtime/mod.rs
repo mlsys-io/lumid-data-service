@@ -22,6 +22,7 @@ pub async fn start(
     client: redis::Client,
     mux: redis::aio::MultiplexedConnection,
     pool: Pool,
+    workers: Vec<Box<dyn upstream::UpstreamWorker>>,
 ) -> Arc<hub::Hub> {
     let hub = hub::Hub::new(mux.clone());
     hub.start_listener(client);
@@ -29,26 +30,16 @@ pub async fn start(
         synthetic::run(mux.clone());
     }
 
-    // Upstreams register their demand listeners in this order. Listeners fire
-    // in registration order, so FMP gets first refusal on crypto/forex, then
-    // Finnhub (equities + crypto/forex shadow), then the additive news/kol
-    // overlays, and finally Tier-B polling for whatever Tier-A didn't claim.
-    if let Err(e) = upstream::fmp_ws::start(hub.clone(), mux.clone(), settings.clone()).await {
-        tracing::warn!("fmp_ws upstream start failed: {e}");
-    }
-    if let Err(e) = upstream::finnhub_ws::start(hub.clone(), mux.clone(), settings.clone()).await {
-        tracing::warn!("finnhub_ws upstream start failed: {e}");
-    }
-    if let Err(e) = upstream::news::start(hub.clone(), mux.clone(), settings.clone()).await {
-        tracing::warn!("news upstream start failed: {e}");
-    }
-    if let Err(e) =
-        upstream::kol::start(hub.clone(), mux.clone(), settings.clone(), pool).await
-    {
-        tracing::warn!("kol upstream start failed: {e}");
-    }
-    if let Err(e) = upstream::polling::start(hub.clone(), mux.clone(), settings.clone()).await {
-        tracing::warn!("polling upstream start failed: {e}");
+    // Drive the registered upstreams in order. Each registers its demand
+    // listener synchronously before returning, so registration order sets the
+    // tier-claim precedence (FMP → Finnhub → news → kol → polling; bite #28).
+    for w in &workers {
+        if let Err(e) = w
+            .start(hub.clone(), mux.clone(), settings.clone(), pool.clone())
+            .await
+        {
+            tracing::warn!("{} upstream start failed: {e}", w.name());
+        }
     }
 
     hub
