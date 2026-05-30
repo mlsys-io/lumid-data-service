@@ -18,11 +18,13 @@ pub fn build_router(
     read_router: Router<AppState>,
     ext_router: Router<AppState>,
     openapi_router: Router<AppState>,
+    public_ext_router: Router<AppState>,
 ) -> Router {
     let public = Router::new()
         .route("/health", get(handlers::health::health))
         .route("/health/db", get(handlers::health::health_db))
         .merge(openapi_router) // GET /openapi.json (public)
+        .merge(public_ext_router) // app-contributed public routes (e.g. /usage.md)
         // Public landing surfaces (no auth) — ports of api/landing.py + llm_landing.py.
         .route("/", get(handlers::landing::landing))
         .route("/reference", get(handlers::landing::landing))

@@ -216,6 +216,7 @@ const LANDING_HTML: &str = r##"<!DOCTYPE html>
       findata
     </div>
     <a class="link" href="/reference">Reference</a>
+    <a class="link" href="/usage.md">Guide</a>
     <a class="link" href="/llm">LLM</a>
     <a class="link" href="/status">Status</a>
     <a class="link" href="/usage">Usage</a>

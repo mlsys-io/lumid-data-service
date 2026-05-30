@@ -24,6 +24,10 @@ use crate::{app, auth, config, db, mcp, read, realtime, state};
 /// Everything else (config, MCP tools, the generic routes) is derived.
 pub struct ServeParts {
     pub ext_routes: Router<state::AppState>,
+    /// Public (un-gated) routes contributed by the app — merged into the
+    /// platform's public group alongside the landing surfaces. Use for
+    /// app-owned docs / static pages that should need no auth. Default empty.
+    pub public_routes: Router<state::AppState>,
     pub workers: Vec<Box<dyn UpstreamWorker>>,
     /// Enable the platform's LLM reverse-proxy feature (`/v1/*`). Optional per
     /// app — off by default; an app flips this to serve LLM (proxies to
@@ -34,7 +38,7 @@ pub struct ServeParts {
 
 impl Default for ServeParts {
     fn default() -> Self {
-        Self { ext_routes: Router::new(), workers: Vec::new(), enable_llm: false }
+        Self { ext_routes: Router::new(), public_routes: Router::new(), workers: Vec::new(), enable_llm: false }
     }
 }
 
@@ -129,7 +133,7 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
 
     let read_router = read::exec::build_router(&specs);
     let openapi_router = crate::openapi::build_router(&specs);
-    let router = app::build_router(state, read_router, ext_router, openapi_router);
+    let router = app::build_router(state, read_router, ext_router, openapi_router, parts.public_routes);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!("listening on {bind_addr}");
     axum::serve(listener, router).await?;
