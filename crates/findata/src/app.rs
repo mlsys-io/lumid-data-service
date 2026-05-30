@@ -66,13 +66,8 @@ pub fn build_router(
         .route("/admin/ingress/refresh-schemas", post(handlers::ingest::refresh_schemas))
         .route("/admin/ingress/refresh-acl", post(handlers::ingest::refresh_acl))
 
-        // LLM reverse proxy (OpenAI + Anthropic compatible) — port of api/routes/llm.py.
-        .route("/v1/models", get(handlers::llm::list_models))
-        .route("/v1/chat/completions", post(handlers::llm::chat_completions))
-        .route("/v1/completions", post(handlers::llm::completions))
-        .route("/v1/embeddings", post(handlers::llm::embeddings))
-        .route("/v1/messages", post(handlers::llm::messages))
-        .route("/v1/messages/count_tokens", post(handlers::llm::count_tokens))
+        // LLM reverse proxy is now an opt-in plugin — apps merge
+        // `findata::llm::routes()` (src/llm.rs). Not mounted by the platform.
 
         // Government trades — port of api/routes/gov_trades.py.
 
