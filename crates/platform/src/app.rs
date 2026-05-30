@@ -60,11 +60,7 @@ pub fn build_router(
         .route("/catalog/submitters", get(handlers::catalog::get_submitters))
         .route("/catalog/tables/:schema/:table/schema.json", get(handlers::ingest::get_table_schema_json))
 
-        // Ingress write plane — port of injection/routes/ingest_*.py.
-        .route("/ingest/:schema/:table", post(handlers::ingest::post_typed))
-        .route("/ingest/:schema/:table/stream", post(handlers::ingest::post_stream))
-        .route("/ingest/:schema/:table/file", post(handlers::ingest::post_file))
-        .route("/ingest/blob", post(handlers::ingest::post_blob))
+        // Ingress write plane is merged below with a bounded body limit.
 
         // Caller's own usage (authed; the public /usage is the global board).
         .route("/usage/me", get(handlers::usage::usage_me))
@@ -105,6 +101,16 @@ pub fn build_router(
         .route("/quotes/stream", get(handlers::sse_quotes::quotes_stream))
         .route("/prediction-markets/stream", get(handlers::pm_stream::stream))
 
+        // Ingress write plane — bounded body limit (batch NDJSON/file/blob need
+        // more than axum's 2 MB default, but not unbounded → OOM/DoS guard).
+        .merge(
+            Router::new()
+                .route("/ingest/:schema/:table", post(handlers::ingest::post_typed))
+                .route("/ingest/:schema/:table/stream", post(handlers::ingest::post_stream))
+                .route("/ingest/:schema/:table/file", post(handlers::ingest::post_file))
+                .route("/ingest/blob", post(handlers::ingest::post_blob))
+                .layer(axum::extract::DefaultBodyLimit::max(state.settings.ingest_max_bytes as usize)),
+        )
         .merge(read_router)
         .merge(ext_router)
         .layer(from_fn_with_state(state.clone(), crate::auth::gate));
