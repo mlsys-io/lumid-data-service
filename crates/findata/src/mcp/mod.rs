@@ -126,3 +126,71 @@ fn rpc_ok(id: Value, result: Value) -> Response {
 fn rpc_err(id: Value, code: i64, message: &str) -> Response {
     Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})).into_response()
 }
+
+// ── auto-generate tools from declarative read specs ──────────────────────────
+// Purely mechanical (id → name, params → JSON-schema, handler reuses the read
+// pipeline) — no domain knowledge, so it lives in the platform. Any app that
+// loads read specs gets MCP tools for free.
+
+use std::collections::HashMap;
+use crate::read::exec;
+use crate::read::spec::{EndpointSpec, Kind};
+
+/// One MCP tool per read endpoint.
+pub fn registry_from_specs(specs: &[Arc<EndpointSpec>]) -> McpRegistry {
+    McpRegistry::new(specs.iter().cloned().map(tool_from_spec).collect())
+}
+
+fn json_type(ty: &str) -> &'static str {
+    match ty {
+        "int" => "integer",
+        "float" => "number",
+        "bool" => "boolean",
+        _ => "string",
+    }
+}
+
+fn tool_from_spec(spec: Arc<EndpointSpec>) -> McpTool {
+    let name = spec.id.replace('.', "_");
+    let mut props = serde_json::Map::new();
+    let mut required = Vec::new();
+    for p in &spec.params {
+        props.insert(p.name.clone(), json!({"type": json_type(&p.ty)}));
+        if p.required {
+            required.push(Value::String(p.name.clone()));
+        }
+    }
+    let input_schema = json!({"type": "object", "properties": props, "required": required});
+    let description = format!("{} — {} {}", spec.id, spec.method, spec.path);
+    let spec_h = spec.clone();
+    let handler: ToolHandler = Arc::new(move |st: AppState, args: serde_json::Map<String, Value>| {
+        let spec = spec_h.clone();
+        Box::pin(async move {
+            let (path, query) = split_args(&spec, &args);
+            exec::execute_to_value(&st, &spec, path, query).await
+        }) as BoxFut
+    });
+    McpTool { name, description, input_schema, handler }
+}
+
+fn split_args(
+    spec: &EndpointSpec,
+    args: &serde_json::Map<String, Value>,
+) -> (HashMap<String, String>, HashMap<String, String>) {
+    let mut path = HashMap::new();
+    let mut query = HashMap::new();
+    for p in &spec.params {
+        if let Some(v) = args.get(&p.name) {
+            let s = match v {
+                Value::String(s) => s.clone(),
+                Value::Null => continue,
+                other => other.to_string(),
+            };
+            match p.kind {
+                Kind::Path => { path.insert(p.name.clone(), s); }
+                Kind::Query => { query.insert(p.name.clone(), s); }
+            }
+        }
+    }
+    (path, query)
+}
