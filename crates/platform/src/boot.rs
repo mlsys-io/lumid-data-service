@@ -101,6 +101,8 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
+    let blob_store = build_blob_store(&settings);
+
     let spec_path = std::env::var("FINDATA_FINANCIAL_CONFIG").unwrap_or_else(|_| "financial.toml".to_string());
     let specs = match read::load_specs(&spec_path) {
         Ok(s) => {
@@ -124,7 +126,7 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     }
 
     let state = state::AppState {
-        pool, settings, lumid, local_keys, rate, redis, redis_client, hub, http, read_cache,
+        pool, settings, lumid, local_keys, rate, redis, redis_client, hub, http, read_cache, blob_store,
     };
 
     // Auto-MCP: one tool per declarative read endpoint, merged into ext routes.
@@ -143,4 +145,47 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     tracing::info!("listening on {bind_addr}");
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+/// Build the blob object-store backend from settings. Default is the local
+/// filesystem rooted at `blob_root` (on-disk layout identical to the legacy
+/// `tokio::fs` path). When `blob_backend=="s3"` an S3/MinIO store is built; if
+/// that build fails we log and fall back to localfs rather than panicking.
+fn build_blob_store(settings: &config::Settings) -> Arc<dyn object_store::ObjectStore> {
+    use object_store::aws::AmazonS3Builder;
+    use object_store::local::LocalFileSystem;
+
+    if settings.blob_backend.eq_ignore_ascii_case("s3") {
+        match AmazonS3Builder::new()
+            .with_endpoint(&settings.blob_s3_endpoint)
+            .with_bucket_name(&settings.blob_s3_bucket)
+            .with_region(&settings.blob_s3_region)
+            .with_access_key_id(&settings.blob_s3_access_key)
+            .with_secret_access_key(&settings.blob_s3_secret_key)
+            .with_allow_http(true)
+            .with_virtual_hosted_style_request(false)
+            .build()
+        {
+            Ok(s3) => {
+                tracing::info!(
+                    "blob store: s3/minio (endpoint={}, bucket={})",
+                    settings.blob_s3_endpoint,
+                    settings.blob_s3_bucket
+                );
+                return Arc::new(s3);
+            }
+            Err(e) => {
+                tracing::warn!("blob s3 backend build failed ({e}); falling back to localfs");
+            }
+        }
+    }
+
+    // Local filesystem (default + s3 fallback). The prefix root must exist.
+    if let Err(e) = std::fs::create_dir_all(&settings.blob_root) {
+        tracing::warn!("blob root mkdir {} failed: {e}", settings.blob_root);
+    }
+    let local = LocalFileSystem::new_with_prefix(&settings.blob_root)
+        .expect("blob localfs init (blob_root must be a valid directory)");
+    tracing::info!("blob store: localfs (root={})", settings.blob_root);
+    Arc::new(local)
 }

@@ -446,6 +446,7 @@ pub async fn post_blob(
     let result = blob::ingest_blob(
         &st.pool,
         &st.settings,
+        &st.blob_store,
         &body,
         content_type.as_deref(),
         suggested_name.as_deref(),

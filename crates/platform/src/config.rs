@@ -50,6 +50,14 @@ pub struct Settings {
     pub blob_max_bytes: u64,
     /// Public base URL prefix for served blobs (empty → relative `/blobs/...`).
     pub blob_public_base_url: String,
+    /// Object-storage backend selector: `"localfs"` (default) or `"s3"` (S3/MinIO).
+    pub blob_backend: String,
+    /// S3/MinIO endpoint (e.g. `http://minio:9000`). Used only when `blob_backend=="s3"`.
+    pub blob_s3_endpoint: String,
+    pub blob_s3_bucket: String,
+    pub blob_s3_region: String,
+    pub blob_s3_access_key: String,
+    pub blob_s3_secret_key: String,
     /// Root dir for served KOL media (empty disables `/kols/media/*` serving).
     pub kol_media_root: String,
 
@@ -104,6 +112,12 @@ impl Settings {
             blob_root: env_str("FINDATA_BLOB_ROOT", "/app/blobs"),
             blob_max_bytes: env_u64("FINDATA_BLOB_MAX_BYTES", 100 * 1024 * 1024),
             blob_public_base_url: env_str("FINDATA_BLOB_PUBLIC_BASE_URL", ""),
+            blob_backend: env_str("FINDATA_BLOB_BACKEND", "localfs"),
+            blob_s3_endpoint: env_str("FINDATA_BLOB_S3_ENDPOINT", ""),
+            blob_s3_bucket: env_str("FINDATA_BLOB_S3_BUCKET", ""),
+            blob_s3_region: env_str("FINDATA_BLOB_S3_REGION", "us-east-1"),
+            blob_s3_access_key: env_str("FINDATA_BLOB_S3_ACCESS_KEY", ""),
+            blob_s3_secret_key: env_str("FINDATA_BLOB_S3_SECRET_KEY", ""),
             kol_media_root: env_str("FINDATA_KOL_MEDIA_ROOT", ""),
             rt_heartbeat_sec: env_u32("FINDATA_RT_HEARTBEAT_SEC", 30) as u64,
             rt_ws_lifetime_syms: env_u32("FINDATA_RT_WS_LIFETIME_SYMS", 500) as u64,
