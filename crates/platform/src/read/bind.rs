@@ -168,8 +168,18 @@ pub fn resolve(
                     enum_choice.insert(p.name.clone(), choice.clone());
                     canon_parts.push((p.name.clone(), choice.clone()));
                     // An enum's value also drives fragment selection, but may
-                    // ALSO be bound directly (`:name`) — make it available.
-                    values.insert(p.name.clone(), Bv::Text(choice));
+                    // ALSO be bound directly (`:name`). When the select map
+                    // carries a fragment named like the param (the canonical
+                    // value, e.g. `7d -> seven_day`), bind THAT mapped value so
+                    // `:name` matches stored data — not the raw alias. Falls
+                    // back to the choice when no such mapping exists.
+                    let bound = p
+                        .select
+                        .get(&choice)
+                        .and_then(|m| m.get(&p.name))
+                        .cloned()
+                        .unwrap_or_else(|| choice.clone());
+                    values.insert(p.name.clone(), Bv::Text(bound));
                 } else {
                     let v = coerce(p, &r)?;
                     canon_parts.push((p.name.clone(), v.canon()));
