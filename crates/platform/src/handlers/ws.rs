@@ -11,8 +11,10 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::collections::HashSet;
+
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
@@ -59,6 +61,103 @@ pub async fn news(
     ws: WebSocketUpgrade,
 ) -> Response {
     upgrade(st, headers, ws, true).await
+}
+
+#[derive(serde::Deserialize)]
+pub struct PmWsParams {
+    asset_ids: Option<String>,
+    condition_ids: Option<String>,
+}
+
+fn parse_set(s: &Option<String>) -> Option<HashSet<String>> {
+    let set: HashSet<String> = s
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    if set.is_empty() { None } else { Some(set) }
+}
+
+/// `/ws/prediction-markets` — WebSocket alternative to the SSE
+/// `/prediction-markets/stream`. Same source (Redis `pm:events`, fed by the
+/// CLOB recorder) and same optional `asset_ids`/`condition_ids` filters; pushes
+/// each event as a WS text frame with a periodic ping. Self-authenticating
+/// (token via Authorization / x-api-key / `Sec-WebSocket-Protocol: bearer.<tok>`).
+pub async fn prediction_markets(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(p): Query<PmWsParams>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let token = match extract_token(&headers) {
+        Some(t) => t,
+        None => return (StatusCode::UNAUTHORIZED, "bearer token required").into_response(),
+    };
+    match crate::auth::resolve_bearer(&st, &token).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::UNAUTHORIZED, "invalid or unknown token").into_response(),
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, "auth service unreachable").into_response(),
+    };
+    let client = match st.redis_client.clone() {
+        Some(c) => c,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "realtime unavailable").into_response(),
+    };
+    let aids = parse_set(&p.asset_ids);
+    let cids = parse_set(&p.condition_ids);
+    let hb = st.settings.rt_heartbeat_sec.max(5);
+    ws.on_upgrade(move |socket| pm_serve(socket, client, aids, cids, hb))
+}
+
+async fn pm_serve(
+    socket: WebSocket,
+    client: redis::Client,
+    aids: Option<HashSet<String>>,
+    cids: Option<HashSet<String>>,
+    hb_secs: u64,
+) {
+    let mut pubsub = match client.get_async_pubsub().await {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if pubsub.subscribe("pm:events").await.is_err() {
+        return;
+    }
+    let (mut tx, mut rx) = socket.split();
+    let _ = tx
+        .send(Message::Text(json!({"type": "open", "channel": "pm:events"}).to_string()))
+        .await;
+    let mut msgs = pubsub.into_on_message();
+    let mut hb = tokio::time::interval(Duration::from_secs(hb_secs));
+    hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            m = msgs.next() => match m {
+                None => break,
+                Some(msg) => {
+                    if let Ok(raw) = msg.get_payload::<String>() {
+                        if let Ok(d) = serde_json::from_str::<Value>(&raw) {
+                            let pass_a = aids.as_ref().map_or(true, |f|
+                                d.get("asset_id").and_then(|v| v.as_str()).map(|x| f.contains(x)).unwrap_or(false));
+                            let pass_c = cids.as_ref().map_or(true, |f|
+                                d.get("condition_id").and_then(|v| v.as_str()).map(|x| f.contains(x)).unwrap_or(false));
+                            if pass_a && pass_c && tx.send(Message::Text(raw)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            },
+            _ = hb.tick() => {
+                if tx.send(Message::Ping(Vec::new())).await.is_err() { break; }
+            }
+            cm = rx.next() => match cm {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                _ => {}
+            }
+        }
+    }
 }
 
 async fn upgrade(

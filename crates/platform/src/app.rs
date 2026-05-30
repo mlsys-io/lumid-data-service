@@ -44,7 +44,8 @@ pub fn build_router(
         // WebSocket realtime: self-authenticating (the WS upgrade can't carry
         // the gate's 401 body), so mounted OUTSIDE the gate.
         .route("/ws/quotes", get(handlers::ws::quotes))
-        .route("/ws/news", get(handlers::ws::news));
+        .route("/ws/news", get(handlers::ws::news))
+        .route("/ws/prediction-markets", get(handlers::ws::prediction_markets));
 
     let gated = Router::new()
         // Catalog read plane (provenance-exposing) — port of api/routes/catalog.py.
