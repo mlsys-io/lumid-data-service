@@ -76,7 +76,10 @@ async fn handle(reg: &McpRegistry, st: AppState, body: Value) -> Response {
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {"listChanged": false}},
-                "serverInfo": {"name": "findata", "version": env!("CARGO_PKG_VERSION")}
+                "serverInfo": {
+                    "name": std::env::var("FINDATA_SERVICE_NAME").unwrap_or_else(|_| "lumid".into()),
+                    "version": env!("CARGO_PKG_VERSION")
+                }
             }),
         ),
         // Fire-and-forget notification; no response body.

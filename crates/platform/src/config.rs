@@ -58,21 +58,14 @@ pub struct Settings {
     pub rt_ws_lifetime_syms: u64,
     pub rt_sse_request_syms: usize,
     pub rt_slowclient_queue: usize,
-    /// Tier-A upstream slot caps + Tier-B/news/KOL poll cadences (R2 upstreams).
-    pub rt_tier_a_finnhub_cap: usize,
-    pub rt_tier_a_fmp_cap: usize,
+    /// Generic Tier-B/poll cadences (provider-specific slot caps + keys live in
+    /// the app layer — see findata-ext::cfg — so the platform names no provider).
     pub rt_tier_b_poll_sec: u64,
     pub rt_news_poll_sec: u64,
     pub rt_kol_poll_sec: u64,
     pub rt_kol_max_per_poll: usize,
     /// Enable the synthetic test publisher (dev only).
     pub rt_synthetic: bool,
-    /// Upstream provider keys (realtime WS + news/KOL polling).
-    pub fmp_key: String,
-    /// Optional second FMP key for REST failover (bandwidth/tier caps).
-    pub fmp_backup_key: String,
-    pub finnhub_key: String,
-    pub twitterapi_key: String,
 
     // LLM reverse proxy. Empty `llm_backend_url` disables the /v1/* routes (503).
     pub llm_backend_url: String,
@@ -111,8 +104,6 @@ impl Settings {
             rt_ws_lifetime_syms: env_u32("FINDATA_RT_WS_LIFETIME_SYMS", 500) as u64,
             rt_sse_request_syms: env_u32("FINDATA_RT_SSE_REQUEST_SYMS", 100) as usize,
             rt_slowclient_queue: env_u32("FINDATA_RT_SLOWCLIENT_QUEUE", 100) as usize,
-            rt_tier_a_finnhub_cap: env_u32("FINDATA_RT_TIER_A_FINNHUB_CAP", 60) as usize,
-            rt_tier_a_fmp_cap: env_u32("FINDATA_RT_TIER_A_FMP_CAP", 60) as usize,
             rt_tier_b_poll_sec: env_u32("FINDATA_RT_TIER_B_POLL_SEC", 5) as u64,
             rt_news_poll_sec: env_u32("FINDATA_RT_NEWS_POLL_SEC", 60) as u64,
             rt_kol_poll_sec: env_u32("FINDATA_RT_KOL_POLL_SEC", 300) as u64,
@@ -121,26 +112,8 @@ impl Settings {
                 env_str("FINDATA_RT_SYNTHETIC", "").to_lowercase().as_str(),
                 "1" | "true" | "yes"
             ),
-            fmp_key: env_str("FINDATA_FMP_KEY", ""),
-            fmp_backup_key: env_str("FINDATA_FMP_BACKUP_KEY", ""),
-            finnhub_key: env_str("FINDATA_FINNHUB_KEY", ""),
-            twitterapi_key: env_str("FINDATA_TWITTERAPI_KEY", ""),
             llm_backend_url: env_str("FINDATA_LLM_BACKEND_URL", ""),
             llm_default_model: env_str("FINDATA_LLM_DEFAULT_MODEL", ""),
         }
-    }
-
-    /// Ordered FMP REST keys (primary then backup), non-empty + deduped.
-    /// REST callers rotate across these on 429/402/403 (rate/bandwidth/tier
-    /// caps), mirroring the loaders' `FMP_KEYS` failover. The realtime WS uses
-    /// only `fmp_key` (FMP enforces ~one session per key).
-    pub fn fmp_keys(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for k in [&self.fmp_key, &self.fmp_backup_key] {
-            if !k.is_empty() && !out.contains(k) {
-                out.push(k.clone());
-            }
-        }
-        out
     }
 }
