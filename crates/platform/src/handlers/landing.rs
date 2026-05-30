@@ -215,13 +215,11 @@ const LANDING_HTML: &str = r##"<!DOCTYPE html>
       </svg>
       findata
     </div>
-    <a class="link" href="/reference">Reference</a>
     <a class="link" href="/usage.md">Guide</a>
+    <a class="link" href="/openapi.json">OpenAPI</a>
     <a class="link" href="/llm">LLM</a>
     <a class="link" href="/status">Status</a>
     <a class="link" href="/usage">Usage</a>
-    <a class="link" href="/redoc">ReDoc</a>
-    <a class="link" href="/docs">Swagger</a>
     <div class="spacer"></div>
     <span class="pill"><span class="dot"></span>kv.run:5000</span>
   </nav>
@@ -235,7 +233,7 @@ const LANDING_HTML: &str = r##"<!DOCTYPE html>
       <em>4.7 M</em> mirrored images. Refreshed hourly, streamed live.
     </p>
     <div class="cta">
-      <a class="btn primary" href="/reference">Open reference →</a>
+      <a class="btn primary" href="/usage.md">Open the guide →</a>
       <a class="btn secondary" href="#quickstart">Quick start</a>
       <a class="btn secondary" href="#realtime">Realtime &amp; KOL</a>
     </div>
@@ -311,8 +309,8 @@ const LANDING_HTML: &str = r##"<!DOCTYPE html>
     <h2><span class="num">02</span>Surface</h2>
     <p class="intro">
       Endpoints are grouped by data domain. Open any group in the
-      <a href="/reference">reference</a> for a request builder, response schema,
-      and an example payload.
+      <a href="/openapi.json">OpenAPI spec</a> or the <a href="/usage.md">guide</a>
+      for schemas and example payloads.
     </p>
 
     <div class="tiles">
@@ -599,7 +597,7 @@ const LANDING_HTML: &str = r##"<!DOCTYPE html>
     <div class="row">
       <a href="/status">Status</a>
       <a href="/usage">Usage</a>
-      <a href="/reference">Reference</a>
+      <a href="/usage.md">Guide</a>
       <div class="spacer"></div>
       <span class="signature">findata · mlsys-io</span>
     </div>
