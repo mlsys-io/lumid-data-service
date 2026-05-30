@@ -69,6 +69,8 @@ pub struct Settings {
     pub rt_synthetic: bool,
     /// Upstream provider keys (realtime WS + news/KOL polling).
     pub fmp_key: String,
+    /// Optional second FMP key for REST failover (bandwidth/tier caps).
+    pub fmp_backup_key: String,
     pub finnhub_key: String,
     pub twitterapi_key: String,
 
@@ -120,10 +122,25 @@ impl Settings {
                 "1" | "true" | "yes"
             ),
             fmp_key: env_str("FINDATA_FMP_KEY", ""),
+            fmp_backup_key: env_str("FINDATA_FMP_BACKUP_KEY", ""),
             finnhub_key: env_str("FINDATA_FINNHUB_KEY", ""),
             twitterapi_key: env_str("FINDATA_TWITTERAPI_KEY", ""),
             llm_backend_url: env_str("FINDATA_LLM_BACKEND_URL", ""),
             llm_default_model: env_str("FINDATA_LLM_DEFAULT_MODEL", ""),
         }
+    }
+
+    /// Ordered FMP REST keys (primary then backup), non-empty + deduped.
+    /// REST callers rotate across these on 429/402/403 (rate/bandwidth/tier
+    /// caps), mirroring the loaders' `FMP_KEYS` failover. The realtime WS uses
+    /// only `fmp_key` (FMP enforces ~one session per key).
+    pub fn fmp_keys(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for k in [&self.fmp_key, &self.fmp_backup_key] {
+            if !k.is_empty() && !out.contains(k) {
+                out.push(k.clone());
+            }
+        }
+        out
     }
 }
