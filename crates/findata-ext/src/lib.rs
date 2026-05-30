@@ -1,19 +1,26 @@
-//! Financial application routes (the `findata-ext` boundary, in-crate for now).
+//! findata-ext — the financial application layer on top of the portable
+//! platform (`findata` lib). Owns the bespoke read routes that can't be
+//! declarative `financial.toml` specs, and the provider upstream workers.
 //!
-//! The bespoke read endpoints that can't be expressed as declarative
-//! `financial.toml` specs (jsonb pivots, Redis-backed KOL, multi-query
-//! orchestration, asset-class rollups, dynamic filters) — registered into the
-//! platform router via [`routes`]. On the repo split these handlers + their
-//! queries move into a separate `findata-ext` crate that depends on the
-//! platform lib; `routes()` becomes its `register()` contribution.
+//! Depends on the platform; the platform never depends on this crate. The
+//! handler/upstream *implementations* currently still live in the platform
+//! crate (referenced via `findata::…`); a follow-up moves those module bodies
+//! here so the platform becomes fully domain-agnostic.
+
+use std::sync::Arc;
 
 use axum::routing::get;
 use axum::Router;
+use deadpool_postgres::Pool;
+use futures_util::future::BoxFuture;
 
-use crate::handlers;
-use crate::state::AppState;
+use findata::config::Settings;
+use findata::handlers;
+use findata::realtime::hub::Hub;
+use findata::realtime::upstream::{self, UpstreamWorker};
+use findata::state::AppState;
 
-/// The financial bespoke routes merged into the platform's gated group.
+/// The financial bespoke routes, merged into the platform's gated router.
 pub fn routes() -> Router<AppState> {
     Router::new()
         // Symbols + OHLC (3-tier fallback / asset-class rollup)
@@ -54,4 +61,44 @@ pub fn routes() -> Router<AppState> {
         .route("/kols/tweets", get(handlers::kols::recent_tweets))
         .route("/kols/tweets/by-symbol/:symbol", get(handlers::kols::tweets_for_symbol))
         .route("/kols/:handle/tweets", get(handlers::kols::tweets_for_handle))
+}
+
+// ---- Provider upstream workers (impl the platform's UpstreamWorker trait) ----
+
+macro_rules! worker {
+    ($ty:ident, $name:literal, |$h:ident, $m:ident, $s:ident, $p:ident| $body:expr) => {
+        pub struct $ty;
+        impl UpstreamWorker for $ty {
+            fn name(&self) -> &'static str {
+                $name
+            }
+            fn start(
+                &self,
+                $h: Arc<Hub>,
+                $m: redis::aio::MultiplexedConnection,
+                $s: Arc<Settings>,
+                $p: Pool,
+            ) -> BoxFuture<'static, anyhow::Result<()>> {
+                Box::pin(async move { $body })
+            }
+        }
+    };
+}
+
+worker!(FmpWs, "fmp_ws", |hub, mux, settings, _pool| upstream::fmp_ws::start(hub, mux, settings).await);
+worker!(FinnhubWs, "finnhub_ws", |hub, mux, settings, _pool| upstream::finnhub_ws::start(hub, mux, settings).await);
+worker!(News, "news", |hub, mux, settings, _pool| upstream::news::start(hub, mux, settings).await);
+worker!(Kol, "kol", |hub, mux, settings, pool| upstream::kol::start(hub, mux, settings, pool).await);
+worker!(Polling, "polling", |hub, mux, settings, _pool| upstream::polling::start(hub, mux, settings).await);
+
+/// Provider set in registration order (FMP → Finnhub → news → kol → polling) —
+/// preserves the crypto/forex claim precedence (bite #28).
+pub fn workers() -> Vec<Box<dyn UpstreamWorker>> {
+    vec![
+        Box::new(FmpWs),
+        Box::new(FinnhubWs),
+        Box::new(News),
+        Box::new(Kol),
+        Box::new(Polling),
+    ]
 }

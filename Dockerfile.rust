@@ -1,39 +1,46 @@
-# Multi-stage build for the unified Rust (axum) data service.
+# Multi-stage build for the data service (3-crate workspace:
+# findata [platform lib] + findata-ext [financial] + findata-app [bin]).
 #
-# Stage 1 compiles a release binary; the dependency layer is cached by building
-# against a stub `main.rs` first, so source-only edits skip the (slow) crate
-# rebuild. Stage 2 is a slim Debian runtime — the binary is statically linked
-# against rustls (no OpenSSL) and bundles zstd/miniz_oxide, so the runtime needs
-# only ca-certificates (+ curl for the healthcheck).
+# Stage 1 compiles the release binary with a dependency-cache layer (build
+# against stub crate sources first, so source-only edits skip the slow crate
+# rebuild). Stage 2 is a slim Debian runtime — the binary links rustls (no
+# OpenSSL) and bundles zstd/miniz_oxide, so it needs only ca-certificates
+# (+ curl for the healthcheck). financial.toml is baked in (override the read
+# spec path with FINDATA_FINANCIAL_CONFIG).
 
 FROM rust:1-bookworm AS builder
 WORKDIR /build
 
 # --- dependency cache layer -------------------------------------------------
-# Copy only the manifests + a stub entrypoint, then build deps. This layer is
-# reused as long as Cargo.toml / Cargo.lock don't change.
+# Copy only the workspace + crate manifests + stub sources, then build deps.
+# Reused as long as the Cargo.toml/Cargo.lock set is unchanged.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/findata/Cargo.toml crates/findata/Cargo.toml
-RUN mkdir -p crates/findata/src \
-    && echo 'fn main() {}' > crates/findata/src/main.rs \
-    && cargo build --release --locked \
-    && rm -rf crates/findata/src
+COPY crates/findata-ext/Cargo.toml crates/findata-ext/Cargo.toml
+COPY crates/findata-app-bin/Cargo.toml crates/findata-app-bin/Cargo.toml
+RUN mkdir -p crates/findata/src crates/findata-ext/src crates/findata-app-bin/src \
+    && echo '' > crates/findata/src/lib.rs \
+    && echo '' > crates/findata-ext/src/lib.rs \
+    && echo 'fn main() {}' > crates/findata-app-bin/src/main.rs \
+    && cargo build --release --locked --bin findata-app \
+    ; rm -rf crates/findata/src crates/findata-ext/src crates/findata-app-bin/src
 
 # --- real build -------------------------------------------------------------
 COPY crates ./crates
-# Bust cargo's mtime cache so the real binary recompiles (deps stay cached).
-RUN touch crates/findata/src/main.rs \
-    && cargo build --release --locked
+RUN find crates -name '*.rs' -exec touch {} + \
+    && cargo build --release --locked --bin findata-app
 
 FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/target/release/findata /usr/local/bin/findata
+WORKDIR /app
+COPY --from=builder /build/target/release/findata-app /usr/local/bin/findata-app
+COPY financial.toml /app/financial.toml
 
-# Default bind; overridable via FINDATA_BIND_ADDR.
 ENV FINDATA_BIND_ADDR=0.0.0.0:8088
+ENV FINDATA_FINANCIAL_CONFIG=/app/financial.toml
 EXPOSE 8088
 
-CMD ["findata"]
+CMD ["findata-app"]

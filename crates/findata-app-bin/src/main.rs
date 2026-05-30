@@ -1,14 +1,11 @@
-//! lumid-data-service — the unified Rust (axum) data service.
-//!
-//! Phase 0: skeleton + DB foundation. Phase 1: auth + tiered rate limit + the
-//! canary read set. Subsequent phases add the full read surface, the write
-//! engine, and the reverse-proxy gateway to the Python sidecars.
+//! findata-app — the financial deployment binary: wires the portable platform
+//! (`findata` lib) with the financial extension (`findata-ext`).
 
 use std::sync::Arc;
 
 use tracing_subscriber::EnvFilter;
 
-use findata::{app, auth, config, db, financial, read, realtime, state};
+use findata::{app, auth, config, db, read, realtime, state};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -31,9 +28,8 @@ async fn main() -> anyhow::Result<()> {
         if settings.lumid_enabled { "enabled" } else { "disabled" }
     );
 
-    // Optional Redis: a multiplexed connection (quote-snapshot last-tick +
-    // hub cache/publish) and the Client handle (pub/sub connections for the
-    // realtime streams).
+    // Optional Redis: a multiplexed connection (quote cache + hub publish) and
+    // the Client handle (pub/sub connections for realtime streams).
     let (redis, redis_client) = if settings.redis_url.is_empty() {
         (None, None)
     } else {
@@ -55,8 +51,8 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Start the realtime hub (+ synthetic publisher + provider upstreams) when
-    // Redis is up.
+    // Start the realtime hub (+ synthetic publisher + the financial provider
+    // upstreams from findata-ext) when Redis is up.
     let hub = match (&redis, &redis_client) {
         (Some(mux), Some(client)) => Some(
             realtime::start(
@@ -64,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
                 client.clone(),
                 mux.clone(),
                 pool.clone(),
-                realtime::upstream::financial_workers(),
+                findata_ext::workers(),
             )
             .await,
         ),
@@ -75,8 +71,7 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
-    // Config-driven read layer: load + validate financial.toml, build the
-    // multi-tier cache (reverse index for invalidation), and the read router.
+    // Config-driven read layer: load + validate financial.toml, build the cache.
     let spec_path = std::env::var("FINDATA_FINANCIAL_CONFIG")
         .unwrap_or_else(|_| "financial.toml".to_string());
     let specs = match read::load_specs(&spec_path) {
@@ -110,12 +105,10 @@ async fn main() -> anyhow::Result<()> {
         read_cache,
     };
 
-    // Build the config-driven read router (validates every spec path) and
-    // merge it into the app behind the same auth gate.
     let read_router = read::exec::build_router(&specs);
-    let router = app::build_router(state, read_router, financial::routes());
+    let router = app::build_router(state, read_router, findata_ext::routes());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    tracing::info!("lumid-data-service listening on {bind_addr}");
+    tracing::info!("findata-app listening on {bind_addr}");
     axum::serve(listener, router).await?;
     Ok(())
 }

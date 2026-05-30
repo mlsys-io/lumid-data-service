@@ -1,0 +1,13 @@
+[package]
+name = "findata-ext"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+findata = { path = "../findata" }
+axum = { version = "0.7", features = ["macros", "ws", "multipart"] }
+deadpool-postgres = "0.14"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
+futures-util = "0.3"
+anyhow = "1"

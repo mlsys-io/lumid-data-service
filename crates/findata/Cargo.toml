@@ -4,9 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "findata"
-path = "src/main.rs"
+# Platform library only — the binary lives in crates/findata-app-bin.
 
 [dependencies]
 axum = { version = "0.7", features = ["macros", "ws", "multipart"] }
