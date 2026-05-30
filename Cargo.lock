@@ -651,42 +651,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "findata-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "findata",
- "findata-ext",
- "redis",
- "reqwest",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "findata-ext"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "deadpool-postgres",
- "findata",
- "futures-util",
- "redis",
- "reqwest",
- "rust_decimal",
- "serde",
- "serde_json",
- "tokio",
- "tokio-postgres",
- "tokio-tungstenite",
- "tracing",
-]
-
-[[package]]
 name = "flate2"
 version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
