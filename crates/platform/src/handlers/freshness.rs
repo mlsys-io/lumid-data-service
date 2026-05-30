@@ -138,6 +138,9 @@ pub async fn status(State(st): State<AppState>) -> Html<String> {
         let (state, detail) = if h.state == "down" {
             feed_fail = true;
             ("fail", format!("{} · as of {}", h.detail, h.ts))
+        } else if h.state == "degraded" {
+            // Reported degraded (e.g. a subscription error) — honor regardless of age.
+            ("degraded", format!("{} · as of {}", h.detail, h.ts))
         } else {
             let age = chrono::DateTime::parse_from_rfc3339(&h.ts)
                 .map(|t| (now2 - t.with_timezone(&chrono::Utc)).num_seconds())
