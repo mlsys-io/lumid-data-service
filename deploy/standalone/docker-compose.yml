@@ -1,0 +1,104 @@
+# Standalone single-folder deployment of a lumid-platform app.
+#
+# EVERYTHING lives under THIS folder:
+#   ./data/pgdata   — Postgres + TimescaleDB data
+#   ./data/minio    — MinIO object storage (blobs)
+#   ./data/redis    — Redis (realtime + read-cache L2)
+#   ./app.toml      — your declarative read endpoints   (mounted into the app)
+#   ./schema.sql    — your warehouse DDL (run once on first DB boot)
+#   ./.env          — secrets + config
+#
+# A new app builder: copy this folder, drop in app.toml + schema.sql + .env,
+# then:   docker compose up -d
+# No external services, no shared host paths — the folder is the deployment.
+
+name: ${APP_NAME:-lumid-app}
+
+services:
+  db:
+    image: timescale/timescaledb-ha:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in .env}
+      POSTGRES_DB: ${DB_NAME:-appdb}
+    volumes:
+      - ./data/pgdata:/home/postgres/pgdata/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/10_schema.sql:ro   # runs once on fresh pgdata
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ${DB_NAME:-appdb}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--maxmemory-policy", "volatile-lru", "--appendonly", "yes"]
+    volumes:
+      - ./data/redis:/data
+
+  minio:
+    image: minio/minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:?set MINIO_PASSWORD in .env}
+    volumes:
+      - ./data/minio:/data
+    ports:
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"   # web console (optional)
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: create the blob bucket, then exit.
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set m http://minio:9000 ${MINIO_USER:-minioadmin} ${MINIO_PASSWORD} &&
+      mc mb -p m/${BLOB_BUCKET:-blobs} || true"
+
+  app:
+    # Config-only apps (declarative reads, no custom Rust) use the generic
+    # platform binary image built from crates/mint-app-bin. Apps with bespoke
+    # handlers/upstreams set APP_IMAGE to their own image.
+    image: ${APP_IMAGE:-lumid-app:latest}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    environment:
+      FINDATA_DB_HOST: db
+      FINDATA_DB_PORT: "5432"
+      FINDATA_DB_USER: postgres
+      FINDATA_DB_PASSWORD: ${DB_PASSWORD}
+      FINDATA_DB_NAME: ${DB_NAME:-appdb}
+      FINDATA_REDIS_URL: redis://redis:6379
+      # Blobs → the in-folder MinIO (object storage stays inside the bundle).
+      FINDATA_BLOB_BACKEND: s3
+      FINDATA_BLOB_S3_ENDPOINT: http://minio:9000
+      FINDATA_BLOB_S3_BUCKET: ${BLOB_BUCKET:-blobs}
+      FINDATA_BLOB_S3_ACCESS_KEY: ${MINIO_USER:-minioadmin}
+      FINDATA_BLOB_S3_SECRET_KEY: ${MINIO_PASSWORD}
+      FINDATA_BLOB_S3_REGION: us-east-1
+      # Your declarative read endpoints.
+      FINDATA_FINANCIAL_CONFIG: /app/app.toml
+      # Standalone auth: local key(s), no external introspection. Set a real key.
+      FINDATA_LUMID_ENABLED: "false"
+      FINDATA_API_KEYS: ${API_KEYS:-devkey:dev}
+      FINDATA_BIND_ADDR: "0.0.0.0:8088"
+    volumes:
+      - ./app.toml:/app/app.toml:ro
+    ports:
+      - "${APP_PORT:-5012}:8088"
