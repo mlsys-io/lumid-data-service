@@ -66,6 +66,11 @@ pub struct Settings {
     pub rt_kol_max_per_poll: usize,
     /// Enable the synthetic test publisher (dev only).
     pub rt_synthetic: bool,
+    /// Symbols to keep subscribed independent of client demand, so their
+    /// `last:tick` cache stays warm and `/quotes` returns live ticks even with
+    /// no active stream. Comma-separated (`FINDATA_RT_WARM_SYMBOLS`). Best for
+    /// 24/7 venues (crypto/forex). Empty = demand-gated only (default).
+    pub rt_warm_symbols: Vec<String>,
 
     // LLM reverse proxy. Empty `llm_backend_url` disables the /v1/* routes (503).
     pub llm_backend_url: String,
@@ -112,6 +117,11 @@ impl Settings {
                 env_str("FINDATA_RT_SYNTHETIC", "").to_lowercase().as_str(),
                 "1" | "true" | "yes"
             ),
+            rt_warm_symbols: env_str("FINDATA_RT_WARM_SYMBOLS", "")
+                .split(',')
+                .map(|s| s.trim().to_uppercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
             llm_backend_url: env_str("FINDATA_LLM_BACKEND_URL", ""),
             llm_default_model: env_str("FINDATA_LLM_DEFAULT_MODEL", ""),
         }

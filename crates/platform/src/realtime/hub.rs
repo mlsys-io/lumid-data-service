@@ -378,6 +378,35 @@ impl Hub {
         }
     }
 
+    /// Keep a baseline set of symbols subscribed independent of client demand,
+    /// so their `last:tick` cache stays warm — `/quotes` returns live ticks
+    /// even with no active client stream. Registers one internal connection
+    /// that never unregisters (demand stays ≥1); a background task drains its
+    /// queue so buffered frames don't pile up. No-op on an empty set. Best for
+    /// 24/7 venues (crypto/forex); equities only flow during market hours.
+    pub async fn warm(self: &Arc<Self>, symbols: &[String]) {
+        let syms: Vec<String> = symbols
+            .iter()
+            .map(|s| s.trim().to_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if syms.is_empty() {
+            return;
+        }
+        let conn = Connection::new(gen_conn_id(), "internal:warm".to_string(), ConnKind::Sse, 2048);
+        self.register(conn.clone(), false).await;
+        self.subscribe(&conn, &syms).await;
+        tracing::info!("hub: warm set subscribed ({} symbols): {}", syms.len(), syms.join(","));
+        // Drain the warm connection periodically — we only want its persistent
+        // demand, not its frames.
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let _ = conn.drain().await;
+            }
+        });
+    }
+
     // ----- subscribe / unsubscribe -----
 
     /// Add `symbols` to the connection. Returns {symbol: tier_label}.

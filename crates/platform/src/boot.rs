@@ -86,9 +86,14 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     };
 
     let hub = match (&redis, &redis_client) {
-        (Some(mux), Some(client)) => Some(
-            realtime::start(settings.clone(), client.clone(), mux.clone(), pool.clone(), parts.workers).await,
-        ),
+        (Some(mux), Some(client)) => {
+            let h =
+                realtime::start(settings.clone(), client.clone(), mux.clone(), pool.clone(), parts.workers).await;
+            // Warm a baseline subscription set so `/quotes` stays live without a
+            // client stream (demand-gating otherwise leaves last:tick cold).
+            h.warm(&settings.rt_warm_symbols).await;
+            Some(h)
+        }
         _ => None,
     };
 
