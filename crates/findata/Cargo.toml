@@ -37,3 +37,4 @@ csv = "1"
 flate2 = "1"
 zstd = "0.13"
 hex = "0.4"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots", "connect"] }

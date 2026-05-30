@@ -28,7 +28,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    let settings = config::Settings::from_env();
+    let settings = Arc::new(config::Settings::from_env());
     let bind_addr = settings.bind_addr.clone();
     let pool = db::build_pool(&settings)?;
     let lumid = Arc::new(auth::lumid::LumidClient::new(&settings));
@@ -67,11 +67,12 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Start the realtime hub (+ optional synthetic publisher) when Redis is up.
+    // Start the realtime hub (+ synthetic publisher + provider upstreams) when
+    // Redis is up.
     let hub = match (&redis, &redis_client) {
-        (Some(mux), Some(client)) => {
-            Some(realtime::start(&settings, client.clone(), mux.clone()))
-        }
+        (Some(mux), Some(client)) => Some(
+            realtime::start(settings.clone(), client.clone(), mux.clone(), pool.clone()).await,
+        ),
         _ => None,
     };
 
@@ -81,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = state::AppState {
         pool,
-        settings: Arc::new(settings),
+        settings,
         lumid,
         local_keys,
         rate,

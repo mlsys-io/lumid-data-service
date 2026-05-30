@@ -66,6 +66,15 @@ services:
       # LLM reverse proxy — empty backend disables /v1/* (returns 503).
       FINDATA_LLM_BACKEND_URL: "${FINDATA_LLM_BACKEND_URL:-}"
       FINDATA_LLM_DEFAULT_MODEL: "${FINDATA_LLM_DEFAULT_MODEL:-}"
+      # Realtime upstream provider keys (empty disables that upstream).
+      FINDATA_FMP_KEY: "${FINDATA_FMP_KEY:-}"
+      FINDATA_FINNHUB_KEY: "${FINDATA_FINNHUB_KEY:-}"
+      FINDATA_TWITTERAPI_KEY: "${FINDATA_TWITTERAPI_KEY:-}"
+      # Realtime hub knobs (defaults match the Python service).
+      FINDATA_RT_HEARTBEAT_SEC: "${FINDATA_RT_HEARTBEAT_SEC:-30}"
+      FINDATA_RT_TIER_A_FINNHUB_CAP: "${FINDATA_RT_TIER_A_FINNHUB_CAP:-60}"
+      FINDATA_RT_TIER_A_FMP_CAP: "${FINDATA_RT_TIER_A_FMP_CAP:-60}"
+      FINDATA_RT_SYNTHETIC: "${FINDATA_RT_SYNTHETIC:-}"
       # Lumilake handoff — fire-and-forget POST after each successful ingest.
       # Empty disables.
       FINDATA_LUMILAKE_BASE_URL: "${FINDATA_LUMILAKE_BASE_URL:-http://host.docker.internal:9000}"

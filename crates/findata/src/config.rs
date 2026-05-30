@@ -67,6 +67,10 @@ pub struct Settings {
     pub rt_kol_max_per_poll: usize,
     /// Enable the synthetic test publisher (dev only).
     pub rt_synthetic: bool,
+    /// Upstream provider keys (realtime WS + news/KOL polling).
+    pub fmp_key: String,
+    pub finnhub_key: String,
+    pub twitterapi_key: String,
 
     // LLM reverse proxy. Empty `llm_backend_url` disables the /v1/* routes (503).
     pub llm_backend_url: String,
@@ -115,6 +119,9 @@ impl Settings {
                 env_str("FINDATA_RT_SYNTHETIC", "").to_lowercase().as_str(),
                 "1" | "true" | "yes"
             ),
+            fmp_key: env_str("FINDATA_FMP_KEY", ""),
+            finnhub_key: env_str("FINDATA_FINNHUB_KEY", ""),
+            twitterapi_key: env_str("FINDATA_TWITTERAPI_KEY", ""),
             llm_backend_url: env_str("FINDATA_LLM_BACKEND_URL", ""),
             llm_default_model: env_str("FINDATA_LLM_DEFAULT_MODEL", ""),
         }
