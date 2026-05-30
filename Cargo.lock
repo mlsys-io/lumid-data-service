@@ -671,10 +671,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "chrono",
  "deadpool-postgres",
  "findata",
  "futures-util",
  "redis",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "tokio-tungstenite",
+ "tracing",
 ]
 
 [[package]]

@@ -2,10 +2,15 @@
 //! platform (`findata` lib). Owns the bespoke read routes that can't be
 //! declarative `financial.toml` specs, and the provider upstream workers.
 //!
-//! Depends on the platform; the platform never depends on this crate. The
-//! handler/upstream *implementations* currently still live in the platform
-//! crate (referenced via `findata::…`); a follow-up moves those module bodies
-//! here so the platform becomes fully domain-agnostic.
+//! Owns the financial handler/query/upstream module bodies (under
+//! `handlers`/`queries`/`upstream`) — they depend on the platform via
+//! `findata::…`. The platform never depends on this crate and contains no
+//! financial provider/table names; the financial layer is this crate +
+//! `financial.toml`.
+
+pub mod handlers;
+pub mod queries;
+pub mod upstream;
 
 use std::sync::Arc;
 
@@ -15,9 +20,8 @@ use deadpool_postgres::Pool;
 use futures_util::future::BoxFuture;
 
 use findata::config::Settings;
-use findata::handlers;
 use findata::realtime::hub::Hub;
-use findata::realtime::upstream::{self, UpstreamWorker};
+use findata::realtime::upstream::UpstreamWorker;
 use findata::state::AppState;
 
 /// The financial bespoke routes, merged into the platform's gated router.
@@ -85,11 +89,11 @@ macro_rules! worker {
     };
 }
 
-worker!(FmpWs, "fmp_ws", |hub, mux, settings, _pool| upstream::fmp_ws::start(hub, mux, settings).await);
-worker!(FinnhubWs, "finnhub_ws", |hub, mux, settings, _pool| upstream::finnhub_ws::start(hub, mux, settings).await);
-worker!(News, "news", |hub, mux, settings, _pool| upstream::news::start(hub, mux, settings).await);
-worker!(Kol, "kol", |hub, mux, settings, pool| upstream::kol::start(hub, mux, settings, pool).await);
-worker!(Polling, "polling", |hub, mux, settings, _pool| upstream::polling::start(hub, mux, settings).await);
+worker!(FmpWs, "fmp_ws", |hub, mux, settings, _pool| crate::upstream::fmp_ws::start(hub, mux, settings).await);
+worker!(FinnhubWs, "finnhub_ws", |hub, mux, settings, _pool| crate::upstream::finnhub_ws::start(hub, mux, settings).await);
+worker!(News, "news", |hub, mux, settings, _pool| crate::upstream::news::start(hub, mux, settings).await);
+worker!(Kol, "kol", |hub, mux, settings, pool| crate::upstream::kol::start(hub, mux, settings, pool).await);
+worker!(Polling, "polling", |hub, mux, settings, _pool| crate::upstream::polling::start(hub, mux, settings).await);
 
 /// Provider set in registration order (FMP → Finnhub → news → kol → polling) —
 /// preserves the crypto/forex claim precedence (bite #28).

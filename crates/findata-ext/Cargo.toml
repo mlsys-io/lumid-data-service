@@ -7,7 +7,16 @@ license.workspace = true
 [dependencies]
 findata = { path = "../findata" }
 axum = { version = "0.7", features = ["macros", "ws", "multipart"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 deadpool-postgres = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
+chrono = { version = "0.4", features = ["serde"] }
 redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots", "connect"] }
 futures-util = "0.3"
 anyhow = "1"
+tracing = "0.1"
