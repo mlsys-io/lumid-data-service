@@ -25,11 +25,16 @@ use crate::{app, auth, config, db, mcp, read, realtime, state};
 pub struct ServeParts {
     pub ext_routes: Router<state::AppState>,
     pub workers: Vec<Box<dyn UpstreamWorker>>,
+    /// Enable the platform's LLM reverse-proxy feature (`/v1/*`). Optional per
+    /// app — off by default; an app flips this to serve LLM (proxies to
+    /// `FINDATA_LLM_BACKEND_URL`). The capability lives in the platform; only
+    /// the decision to expose it is the app's.
+    pub enable_llm: bool,
 }
 
 impl Default for ServeParts {
     fn default() -> Self {
-        Self { ext_routes: Router::new(), workers: Vec::new() }
+        Self { ext_routes: Router::new(), workers: Vec::new(), enable_llm: false }
     }
 }
 
@@ -116,7 +121,11 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     // Auto-MCP: one tool per declarative read endpoint, merged into ext routes.
     let mcp_registry = Arc::new(mcp::registry_from_specs(&specs));
     tracing::info!("mcp: {} tools (POST /mcp)", mcp_registry.len());
-    let ext_router = parts.ext_routes.merge(mcp::build_router(mcp_registry));
+    let mut ext_router = parts.ext_routes.merge(mcp::build_router(mcp_registry));
+    if parts.enable_llm {
+        ext_router = ext_router.merge(crate::llm::routes());
+        tracing::info!("llm proxy enabled (/v1/*)");
+    }
 
     let read_router = read::exec::build_router(&specs);
     let router = app::build_router(state, read_router, ext_router);
