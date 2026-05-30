@@ -102,6 +102,23 @@ async fn produce(
     serde_json::to_vec(&value).map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))
 }
 
+/// Execute a spec from plain param maps (no axum extractors) and return the
+/// shaped JSON value — the read pipeline (bind → execute → shape) without the
+/// HTTP/cache/ETag layer. Used by the MCP tool layer to reuse declarative specs
+/// as tools. (Reads go straight to the DB here; the cache fronts the HTTP path.)
+pub async fn execute_to_value(
+    st: &AppState,
+    spec: &EndpointSpec,
+    path: HashMap<String, String>,
+    query: HashMap<String, String>,
+) -> ApiResult<Value> {
+    let bound = bind::resolve(spec, &path, &query)?;
+    let has_symbol = path.contains_key("symbol");
+    let symbol = path.get("symbol").cloned();
+    let bytes = produce(st, spec, &bound, has_symbol, symbol).await?;
+    serde_json::from_slice(&bytes).map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))
+}
+
 fn shape(
     spec: &EndpointSpec,
     objs: Vec<Map<String, Value>>,

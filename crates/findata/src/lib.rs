@@ -13,6 +13,7 @@ pub mod db;
 pub mod error;
 pub mod handlers;
 pub mod ingest;
+pub mod mcp;
 pub mod parsers;
 pub mod queries;
 pub mod read;
