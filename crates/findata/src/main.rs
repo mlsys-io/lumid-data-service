@@ -81,6 +81,28 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
+    // Config-driven read layer: load + validate financial.toml, build the
+    // multi-tier cache (reverse index for invalidation), and the read router.
+    let spec_path = std::env::var("FINDATA_FINANCIAL_CONFIG")
+        .unwrap_or_else(|_| "financial.toml".to_string());
+    let specs = match read::load_specs(&spec_path) {
+        Ok(s) => {
+            tracing::info!("read layer: {} declarative endpoints from {spec_path}", s.len());
+            s
+        }
+        Err(e) => {
+            tracing::warn!("read layer disabled: {e}");
+            Vec::new()
+        }
+    };
+    let reverse = read::build_reverse(&specs);
+    let read_cache = read::cache::CacheManager::new(
+        256 * 1024 * 1024,
+        std::time::Duration::from_secs(86_400),
+        redis.clone(),
+        reverse,
+    );
+
     let state = state::AppState {
         pool,
         settings,
@@ -91,9 +113,13 @@ async fn main() -> anyhow::Result<()> {
         redis_client,
         hub,
         http,
+        read_cache,
     };
 
-    let router = app::build_router(state);
+    // Build the config-driven read router (validates every spec path) and
+    // merge it into the app behind the same auth gate.
+    let read_router = read::exec::build_router(&specs);
+    let router = app::build_router(state, read_router);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!("lumid-data-service listening on {bind_addr}");
     axum::serve(listener, router).await?;

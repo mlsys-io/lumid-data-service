@@ -8,7 +8,30 @@
 //! by the multi-tier [`cache`]. Logic-heavy endpoints that can't be a single
 //! parameterized SELECT stay compiled in `findata-ext` (see DEFERRED_TO_EXT.md).
 //!
-//! Implemented so far: the [`cache`] layer. The spec parser / param binder /
-//! generic executor land next; until then nothing mounts these routes.
-
+pub mod bind;
 pub mod cache;
+pub mod exec;
+pub mod spec;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use spec::EndpointSpec;
+
+/// Load + validate `financial.toml` into Arc'd specs.
+pub fn load_specs(path: &str) -> Result<Vec<Arc<EndpointSpec>>, crate::error::ApiError> {
+    Ok(spec::load(path)?.into_iter().map(Arc::new).collect())
+}
+
+/// Build the `"schema.table" → {endpoint_id}` reverse index for cache
+/// invalidation, from each spec's declared `tables`.
+pub fn build_reverse(specs: &[Arc<EndpointSpec>]) -> HashMap<String, HashSet<Arc<str>>> {
+    let mut rev: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
+    for s in specs {
+        let id: Arc<str> = Arc::from(s.id.as_str());
+        for t in &s.tables {
+            rev.entry(t.clone()).or_default().insert(id.clone());
+        }
+    }
+    rev
+}

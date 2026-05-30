@@ -22,6 +22,8 @@ pub struct AppState {
     pub redis_client: Option<redis::Client>,
     /// Realtime fan-out hub. None when Redis is unconfigured.
     pub hub: Option<std::sync::Arc<crate::realtime::hub::Hub>>,
+    /// Multi-tier response cache backing the config-driven read layer.
+    pub read_cache: std::sync::Arc<crate::read::cache::CacheManager>,
     /// Shared HTTP client for the LLM reverse proxy (and any outbound calls).
     pub http: reqwest::Client,
 }

@@ -1,10 +1,9 @@
 # financial.toml — declarative read-endpoint specs (config half of the platform split).
-# Generated from the existing Rust query modules; SQL copied verbatim for parity.
-# Logic-heavy endpoints that can't be declarative live in findata-ext (see DEFERRED.md).
+# Generated from the Rust query modules; SQL copied verbatim for parity. Valid TOML.
+# Bespoke endpoints (jsonb pivot / Redis / multi-query) live in findata-ext — see DEFERRED_TO_EXT.md.
 
 
-# ===== group: fundamentals+analysis (3 endpoints) =====
-
+# ===== fundamentals+analysis (3) =====
 [[read.endpoint]]
 id = "fundamentals.latest"
 method = "GET"
@@ -13,51 +12,85 @@ tables = ["fundamentals.latest_per_symbol"]
 ttl = "6h"
 shape = "one"
 strip_lineage = true
-row_cap = 1
+cache = true
 sql = """
-    SELECT symbol, period_end_date, period_type, report_date, currency,
-           revenue, gross_profit, operating_income, ebitda, net_income,
-           eps, eps_diluted,
-           total_assets, total_liabilities, total_equity,
-           cash_and_equivalents, total_debt, long_term_debt,
-           operating_cash_flow, investing_cash_flow, financing_cash_flow,
-           free_cash_flow, capex, dividends_paid, stock_repurchases
-      FROM fundamentals.latest_per_symbol
-     WHERE symbol = :symbol AND source = 'fmp'
+SELECT symbol, period_end_date, period_type, report_date, currency,
+       revenue, gross_profit, operating_income, ebitda, net_income,
+       eps, eps_diluted,
+       total_assets, total_liabilities, total_equity,
+       cash_and_equivalents, total_debt, long_term_debt,
+       operating_cash_flow, investing_cash_flow, financing_cash_flow,
+       free_cash_flow, capex, dividends_paid, stock_repurchases
+  FROM fundamentals.latest_per_symbol
+ WHERE symbol = :symbol AND source = 'fmp'
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
 
 [[read.endpoint]]
 id = "fundamentals.history"
 method = "GET"
 path = "/fundamentals/:symbol/history"
-tables = ["fundamentals.income_statement","fundamentals.balance_sheet","fundamentals.cash_flow_statement"]
+tables = ["fundamentals.income_statement", "fundamentals.balance_sheet", "fundamentals.cash_flow_statement"]
 ttl = "6h"
 shape = "rows"
 strip_lineage = true
 row_cap = 200
+cache = true
 sql = """
-    SELECT {{cols}}
-      FROM {{table}}
-     WHERE symbol = :symbol AND source = 'fmp'{{period_filter}}
-     ORDER BY period_end_date DESC
-     LIMIT :limit
+SELECT {{cols}}
+  FROM {{table}}
+ WHERE symbol = :symbol AND source = 'fmp'{{period_filter}}
+ ORDER BY period_end_date DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 40; min = 1; max = 200
-  [[read.endpoint.param]]
-  name = "statement"; kind = "query"; type = "enum"; default = "income"
-  [read.endpoint.param.select.income]   = { table = "fundamentals.income_statement", cols = "period_end_date, period_type, revenue, gross_profit, operating_income, ebitda, net_income, eps" }
-  [read.endpoint.param.select.balance]  = { table = "fundamentals.balance_sheet", cols = "period_end_date, period_type, total_assets, total_liabilities, total_equity, cash_and_equivalents, total_debt" }
-  [read.endpoint.param.select.cashflow] = { table = "fundamentals.cash_flow_statement", cols = "period_end_date, period_type, operating_cash_flow, investing_cash_flow, financing_cash_flow, free_cash_flow, capex" }
-  [[read.endpoint.param]]
-  name = "period"; kind = "query"; type = "enum"; default = "quarter"
-  [read.endpoint.param.select.quarter] = { period_filter = " AND period_type IN ('Q1','Q2','Q3','Q4')" }
-  [read.endpoint.param.select.fy]      = { period_filter = " AND period_type = 'FY'" }
-  [read.endpoint.param.select.all]     = { period_filter = "" }
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "statement"
+kind = "query"
+type = "enum"
+default = "income"
+[read.endpoint.param.select.income]
+table = "fundamentals.income_statement"
+cols = "period_end_date, period_type, revenue, gross_profit, operating_income, ebitda, net_income, eps"
+[read.endpoint.param.select.balance]
+table = "fundamentals.balance_sheet"
+cols = "period_end_date, period_type, total_assets, total_liabilities, total_equity, cash_and_equivalents, total_debt"
+[read.endpoint.param.select.cashflow]
+table = "fundamentals.cash_flow_statement"
+cols = "period_end_date, period_type, operating_cash_flow, investing_cash_flow, financing_cash_flow, free_cash_flow, capex"
+
+[[read.endpoint.param]]
+name = "period"
+kind = "query"
+type = "enum"
+default = "quarter"
+[read.endpoint.param.select.quarter]
+period_filter = " AND period_type IN ('Q1','Q2','Q3','Q4')"
+[read.endpoint.param.select.fy]
+period_filter = " AND period_type = 'FY'"
+[read.endpoint.param.select.all]
+period_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 40
+min = 1
+max = 200
+
 
 [[read.endpoint]]
 id = "analysis.key_metrics"
@@ -68,29 +101,45 @@ ttl = "6h"
 shape = "rows"
 strip_lineage = true
 row_cap = 200
+cache = true
 sql = """
-    SELECT period_end_date, period_type, pe::float8, pb::float8, ps::float8,
-           ev_ebitda::float8, ev_revenue::float8, debt_to_equity::float8,
-           current_ratio::float8, quick_ratio::float8, roe::float8, roa::float8,
-           fcf_yield::float8
-      FROM fundamentals.key_metrics
-     WHERE symbol = :symbol AND source = 'fmp'{{period_filter}}
-     ORDER BY period_end_date DESC
-     LIMIT :limit
+SELECT period_end_date, period_type, pe::float8, pb::float8, ps::float8,
+       ev_ebitda::float8, ev_revenue::float8, debt_to_equity::float8,
+       current_ratio::float8, quick_ratio::float8, roe::float8, roa::float8,
+       fcf_yield::float8
+  FROM fundamentals.key_metrics
+ WHERE symbol = :symbol AND source = 'fmp'{{period_filter}}
+ ORDER BY period_end_date DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 20; min = 1; max = 200
-  [[read.endpoint.param]]
-  name = "period"; kind = "query"; type = "enum"; default = "quarter"
-  [read.endpoint.param.select.quarter] = { period_filter = " AND period_type IN ('Q1','Q2','Q3','Q4')" }
-  [read.endpoint.param.select.fy]      = { period_filter = " AND period_type = 'FY'" }
-  [read.endpoint.param.select.all]     = { period_filter = "" }
 
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
 
-# ===== group: estimates+investors (8 endpoints) =====
+[[read.endpoint.param]]
+name = "period"
+kind = "query"
+type = "enum"
+default = "quarter"
+[read.endpoint.param.select.quarter]
+period_filter = " AND period_type IN ('Q1','Q2','Q3','Q4')"
+[read.endpoint.param.select.fy]
+period_filter = " AND period_type = 'FY'"
+[read.endpoint.param.select.all]
+period_filter = ""
 
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 20
+min = 1
+max = 200
+
+# ===== estimates+investors (11) =====
 [[read.endpoint]]
 id = "estimates.price_target"
 method = "GET"
@@ -99,23 +148,27 @@ tables = ["estimates.price_target_consensus", "estimates.price_target_summary"]
 ttl = "3h"
 shape = "one"
 strip_lineage = true
-row_cap = 1
+cache = true
 sql = """
-    SELECT c.symbol,
-           c.consensus::float8 AS target_consensus,
-           c.high::float8      AS target_high,
-           c.low::float8       AS target_low,
-           s.last_avg::float8  AS target_median,
-           s.num_analysts      AS analysts,
-           GREATEST(c.ingest_ts, s.ingest_ts) AS updated_at
-      FROM estimates.price_target_consensus c
-      LEFT JOIN estimates.price_target_summary s
-        ON s.symbol = c.symbol AND s.source = c.source
-     WHERE c.symbol = :symbol AND c.source = 'fmp'
-     LIMIT 1
+SELECT c.symbol,
+       c.consensus::float8 AS target_consensus,
+       c.high::float8      AS target_high,
+       c.low::float8       AS target_low,
+       s.last_avg::float8  AS target_median,
+       s.num_analysts      AS analysts,
+       GREATEST(c.ingest_ts, s.ingest_ts) AS updated_at
+  FROM estimates.price_target_consensus c
+  LEFT JOIN estimates.price_target_summary s
+    ON s.symbol = c.symbol AND s.source = c.source
+ WHERE c.symbol = :symbol AND c.source = 'fmp'
+ LIMIT 1
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
 
 [[read.endpoint]]
 id = "estimates.grades"
@@ -126,17 +179,28 @@ ttl = "3h"
 shape = "rows"
 strip_lineage = true
 row_cap = 200
+cache = true
 sql = """
-    SELECT date, firm, grade, action
-      FROM estimates.grades
-     WHERE symbol = :symbol AND source = 'fmp'
-     ORDER BY date DESC
-     LIMIT :limit
+SELECT date, firm, grade, action
+  FROM estimates.grades
+ WHERE symbol = :symbol AND source = 'fmp'
+ ORDER BY date DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 50; min = 1; max = 200
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 200
 
 [[read.endpoint]]
 id = "estimates.recommendation"
@@ -147,17 +211,28 @@ ttl = "3h"
 shape = "rows"
 strip_lineage = true
 row_cap = 60
+cache = true
 sql = """
-    SELECT period, strong_buy, buy, hold, sell, strong_sell
-      FROM estimates.recommendation
-     WHERE symbol = :symbol AND source = 'finnhub'
-     ORDER BY period DESC
-     LIMIT :limit
+SELECT period, strong_buy, buy, hold, sell, strong_sell
+  FROM estimates.recommendation
+ WHERE symbol = :symbol AND source = 'finnhub'
+ ORDER BY period DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 12; min = 1; max = 60
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 12
+min = 1
+max = 60
 
 [[read.endpoint]]
 id = "investors.insider_transactions"
@@ -168,20 +243,39 @@ ttl = "3h"
 shape = "rows"
 strip_lineage = true
 row_cap = 500
+cache = true
 sql = """
-    SELECT date, insider_name, insider_title, transaction_type,
-           shares::float8 AS shares, price::float8 AS price, value::float8 AS value
-      FROM ownership.insider_transactions
-     WHERE symbol = :symbol {{since_filter}}
-     ORDER BY date DESC NULLS LAST
-     LIMIT :limit
+SELECT date, insider_name, insider_title, transaction_type,
+       shares::float8 AS shares, price::float8 AS price, value::float8 AS value
+  FROM ownership.insider_transactions
+ WHERE symbol = :symbol{{since_filter}}
+ ORDER BY date DESC NULLS LAST
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 50; min = 1; max = 500
-  [[read.endpoint.param]]
-  name = "since"; kind = "query"; type = "date"; required = false; sql_when_present = "AND date >= :since"; fragment = "since_filter"
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 500
+
+[[read.endpoint.param]]
+name = "since"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND date >= :since"
+[read.endpoint.param.absent]
+since_filter = ""
 
 [[read.endpoint]]
 id = "investors.insider_sentiment"
@@ -192,17 +286,28 @@ ttl = "3h"
 shape = "rows"
 strip_lineage = true
 row_cap = 120
+cache = true
 sql = """
-    SELECT year, month, change_shares::float8 AS change_shares, mspr::float8 AS mspr
-      FROM ownership.insider_sentiment
-     WHERE symbol = :symbol
-     ORDER BY year DESC, month DESC
-     LIMIT :limit
+SELECT year, month, change_shares::float8 AS change_shares, mspr::float8 AS mspr
+  FROM ownership.insider_sentiment
+ WHERE symbol = :symbol
+ ORDER BY year DESC, month DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit_months"; kind = "query"; type = "int"; default = 24; min = 1; max = 120; bind = "limit"
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 24
+min = 1
+max = 120
 
 [[read.endpoint]]
 id = "investors.insider_statistics"
@@ -213,18 +318,29 @@ ttl = "3h"
 shape = "rows"
 strip_lineage = true
 row_cap = 60
+cache = true
 sql = """
-    SELECT period_end_date, year, quarter, buys, sells,
-           buys_value::float8 AS buys_value, sells_value::float8 AS sells_value
-      FROM ownership.insider_trading_statistics
-     WHERE symbol = :symbol
-     ORDER BY period_end_date DESC
-     LIMIT :limit
+SELECT period_end_date, year, quarter, buys, sells,
+       buys_value::float8 AS buys_value, sells_value::float8 AS sells_value
+  FROM ownership.insider_trading_statistics
+ WHERE symbol = :symbol
+ ORDER BY period_end_date DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit_quarters"; kind = "query"; type = "int"; default = 16; min = 1; max = 60; bind = "limit"
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 16
+min = 1
+max = 60
 
 [[read.endpoint]]
 id = "investors.acquisitions"
@@ -235,20 +351,39 @@ ttl = "3h"
 shape = "rows"
 strip_lineage = true
 row_cap = 200
+cache = true
 sql = """
-    SELECT date, filer, filer_type, percent_of_class::float8 AS percent_of_class,
-           shares_owned::float8 AS shares_owned
-      FROM ownership.acquisition_of_beneficial_ownership
-     WHERE symbol = :symbol {{since_filter}}
-     ORDER BY date DESC NULLS LAST
-     LIMIT :limit
+SELECT date, filer, filer_type, percent_of_class::float8 AS percent_of_class,
+       shares_owned::float8 AS shares_owned
+  FROM ownership.acquisition_of_beneficial_ownership
+ WHERE symbol = :symbol{{since_filter}}
+ ORDER BY date DESC NULLS LAST
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 50; min = 1; max = 200
-  [[read.endpoint.param]]
-  name = "since"; kind = "query"; type = "date"; required = false; sql_when_present = "AND date >= :since"; fragment = "since_filter"
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 200
+
+[[read.endpoint.param]]
+name = "since"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND date >= :since"
+[read.endpoint.param.absent]
+since_filter = ""
 
 [[read.endpoint]]
 id = "gov_trades.for_symbol"
@@ -259,26 +394,165 @@ ttl = "3h"
 shape = "rows"
 strip_lineage = false
 row_cap = 500
+cache = true
 sql = """
-    SELECT date, chamber, member_name, party, state,
-           transaction_type,
-           amount_min::float8 AS amount_min,
-           amount_max::float8 AS amount_max
-      FROM ownership.gov_trades
-     WHERE symbol = :symbol {{since_filter}}
-     ORDER BY date DESC NULLS LAST
-     LIMIT :limit
+SELECT date, chamber, member_name, party, state,
+       transaction_type,
+       amount_min::float8 AS amount_min,
+       amount_max::float8 AS amount_max
+  FROM ownership.gov_trades
+ WHERE symbol = :symbol{{since_filter}}
+ ORDER BY date DESC NULLS LAST
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 50; min = 1; max = 500
-  [[read.endpoint.param]]
-  name = "since"; kind = "query"; type = "date"; required = false; sql_when_present = "AND date >= :since"; fragment = "since_filter"
 
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
 
-# ===== group: news (3 endpoints) =====
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 500
 
+[[read.endpoint.param]]
+name = "since"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND date >= :since"
+[read.endpoint.param.absent]
+since_filter = ""
+
+[[read.endpoint]]
+id = "investors.holders_top"
+method = "GET"
+path = "/holders/:symbol/top"
+tables = ["ownership.institutional_positions"]
+ttl = "6h"
+shape = "envelope"
+envelope_key = "holders"
+strip_lineage = false
+row_cap = 100
+cache = true
+sql = """
+SELECT institution_name, shares::float8 AS shares,
+       market_value::float8 AS market_value
+  FROM ownership.institutional_positions
+ WHERE symbol = :symbol AND source = 'finnhub'
+   AND report_period = {{asof_value}}
+ ORDER BY market_value DESC NULLS LAST
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 25
+min = 1
+max = 100
+
+[[read.endpoint.param]]
+name = "asof"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+asof_value = ":asof"
+[read.endpoint.param.absent]
+asof_value = "(SELECT max(report_period) FROM ownership.institutional_positions WHERE symbol = :symbol AND source = 'finnhub')"
+
+[[read.endpoint]]
+id = "investors.fund_ownership"
+method = "GET"
+path = "/fund-ownership/:symbol"
+tables = ["ownership.fund_ownership"]
+ttl = "6h"
+shape = "envelope"
+envelope_key = "funds"
+strip_lineage = false
+row_cap = 200
+cache = true
+sql = """
+SELECT fund_name, shares::float8 AS shares, market_value::float8 AS market_value,
+       weight_pct::float8 AS weight_pct
+  FROM ownership.fund_ownership
+ WHERE symbol = :symbol AND as_of = {{asof_value}}
+ ORDER BY market_value DESC NULLS LAST
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 200
+
+[[read.endpoint.param]]
+name = "asof"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+asof_value = ":asof"
+[read.endpoint.param.absent]
+asof_value = "(SELECT max(as_of) FROM ownership.fund_ownership WHERE symbol = :symbol)"
+
+[[read.endpoint]]
+id = "investors.funds_disclosure"
+method = "GET"
+path = "/funds-disclosure/:symbol"
+tables = ["ownership.funds_disclosure_holders_latest"]
+ttl = "6h"
+shape = "envelope"
+envelope_key = "funds"
+strip_lineage = false
+row_cap = 200
+cache = true
+sql = """
+SELECT fund_name, as_of, shares::float8 AS shares, weight_pct::float8 AS weight_pct
+  FROM ownership.funds_disclosure_holders_latest
+ WHERE symbol = :symbol
+ ORDER BY weight_pct DESC NULLS LAST
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 200
+
+# ===== news (6) =====
 [[read.endpoint]]
 id = "news.for_symbol"
 method = "GET"
@@ -288,33 +562,199 @@ ttl = "60s"
 shape = "rows"
 strip_lineage = true
 row_cap = 200
+cache = true
 sql = """
-    WITH base AS (
-      SELECT published_at, publisher, headline, summary, url, category
-        FROM news.articles
-       WHERE symbol = :symbol AND published_at >= COALESCE(:since, now() - interval '30 days')
-      UNION ALL
-      SELECT published_at, publisher, headline, summary, url, category
-        FROM news.articles_by_symbol
-       WHERE symbol = :symbol AND published_at >= COALESCE(:since, now() - interval '30 days')
-    ),
-    per_url AS (
-      SELECT DISTINCT ON (url)
-             published_at, publisher, headline, summary, url, category
-        FROM base
-       ORDER BY url, published_at DESC
-    )
-    SELECT published_at, publisher, headline, summary, url, category
-      FROM per_url
-     ORDER BY published_at DESC
-     LIMIT :limit
+WITH base AS (
+  SELECT published_at, publisher, headline, summary, url, category
+    FROM news.articles
+   WHERE symbol = :symbol AND published_at >= {{since_value}}
+  UNION ALL
+  SELECT published_at, publisher, headline, summary, url, category
+    FROM news.articles_by_symbol
+   WHERE symbol = :symbol AND published_at >= {{since_value}}
+),
+per_url AS (
+  SELECT DISTINCT ON (url)
+         published_at, publisher, headline, summary, url, category
+    FROM base
+   ORDER BY url, published_at DESC
+)
+SELECT published_at, publisher, headline, summary, url, category
+  FROM per_url
+ ORDER BY published_at DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "since"; kind = "query"; type = "timestamp"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 50; min = 1; max = 200
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "since"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+since_value = ":since"
+[read.endpoint.param.absent]
+since_value = "now() - interval '30 days'"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 200
+
+
+[[read.endpoint]]
+id = "news.latest"
+method = "GET"
+path = "/news/latest"
+tables = ["news.articles"]
+ttl = "60s"
+shape = "rows"
+strip_lineage = true
+row_cap = 200
+cache = true
+sql = """
+SELECT published_at, publisher, headline, summary, url, category, symbol
+  FROM news.articles
+ WHERE published_at >= {{since_value}}{{category_filter}}
+ ORDER BY published_at DESC
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "since"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+since_value = ":since"
+[read.endpoint.param.absent]
+since_value = "now() - interval '30 days'"
+
+[[read.endpoint.param]]
+name = "category"
+kind = "query"
+type = "enum"
+required = false
+[read.endpoint.param.select.general]
+category_filter = " AND category = 'general_market'"
+[read.endpoint.param.select.stock]
+category_filter = " AND category = 'stock_market'"
+[read.endpoint.param.select.press]
+category_filter = " AND category = 'press_release'"
+[read.endpoint.param.select.press_release]
+category_filter = " AND category = 'press_release'"
+[read.endpoint.param.select.crypto]
+category_filter = " AND category = 'crypto'"
+[read.endpoint.param.select.forex]
+category_filter = " AND category = 'forex'"
+[read.endpoint.param.select.company]
+category_filter = " AND category = 'company'"
+[read.endpoint.param.absent]
+category_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 200
+
+
+[[read.endpoint]]
+id = "news.search"
+method = "GET"
+path = "/news/search"
+tables = ["news.articles"]
+ttl = "60s"
+shape = "rows"
+strip_lineage = true
+row_cap = 200
+cache = true
+sql = """
+SELECT published_at, publisher, headline, summary, url, category, symbol
+  FROM news.articles
+ WHERE search_tsv @@ websearch_to_tsquery('english', :q) AND published_at >= {{since_value}}{{category_filter}}
+ ORDER BY published_at DESC
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "q"
+kind = "query"
+type = "str"
+
+[[read.endpoint.param]]
+name = "since"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+since_value = ":since"
+[read.endpoint.param.absent]
+since_value = "now() - interval '30 days'"
+
+[[read.endpoint.param]]
+name = "category"
+kind = "query"
+type = "enum"
+required = false
+[read.endpoint.param.select.general]
+category_filter = " AND category = 'general_market'"
+[read.endpoint.param.select.stock]
+category_filter = " AND category = 'stock_market'"
+[read.endpoint.param.select.press]
+category_filter = " AND category = 'press_release'"
+[read.endpoint.param.select.press_release]
+category_filter = " AND category = 'press_release'"
+[read.endpoint.param.select.crypto]
+category_filter = " AND category = 'crypto'"
+[read.endpoint.param.select.forex]
+category_filter = " AND category = 'forex'"
+[read.endpoint.param.select.company]
+category_filter = " AND category = 'company'"
+[read.endpoint.param.absent]
+category_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 200
+
+
+[[read.endpoint]]
+id = "news.stats"
+method = "GET"
+path = "/news/stats"
+tables = ["news.articles"]
+ttl = "60s"
+shape = "envelope"
+envelope_key = "categories"
+strip_lineage = true
+row_cap = 200
+cache = true
+sql = """
+SELECT category,
+       count(*) FILTER (WHERE published_at > now() - interval '7 days')  AS rows_last_7d,
+       count(*) FILTER (WHERE published_at > now() - interval '30 days') AS rows_last_30d,
+       max(published_at) AS latest_in_60d
+  FROM news.articles
+ WHERE published_at > now() - interval '60 days'
+ GROUP BY category
+ ORDER BY rows_last_30d DESC NULLS LAST
+"""
+
 
 [[read.endpoint]]
 id = "news.social_sentiment"
@@ -325,21 +765,41 @@ ttl = "60s"
 shape = "rows"
 strip_lineage = true
 row_cap = 1000
+cache = true
 sql = """
-    SELECT ts, mention::float8 AS mention, positive_score::float8 AS positive_score,
-           negative_score::float8 AS negative_score, positive_mention::float8 AS positive_mention,
-           negative_mention::float8 AS negative_mention
-      FROM news.social_sentiment
-     WHERE symbol = :symbol AND ts >= COALESCE(:since, '-infinity'::timestamptz)
-     ORDER BY ts DESC
-     LIMIT :limit
+SELECT ts, mention::float8 AS mention, positive_score::float8 AS positive_score,
+       negative_score::float8 AS negative_score, positive_mention::float8 AS positive_mention,
+       negative_mention::float8 AS negative_mention
+  FROM news.social_sentiment
+ WHERE symbol = :symbol{{since_filter}}
+ ORDER BY ts DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "since"; kind = "query"; type = "timestamp"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 200; min = 1; max = 1000
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "since"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND ts >= :since"
+[read.endpoint.param.absent]
+since_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 200
+min = 1
+max = 1000
+
 
 [[read.endpoint]]
 id = "news.symbol_sentiment"
@@ -350,25 +810,34 @@ ttl = "60s"
 shape = "rows"
 strip_lineage = true
 row_cap = 60
+cache = true
 sql = """
-    SELECT period_end_date, buzz::float8 AS buzz, weekly_avg::float8 AS weekly_avg,
-           articles_last_week, sentiment_score::float8 AS sentiment_score,
-           bearish_pct::float8 AS bearish_pct, bullish_pct::float8 AS bullish_pct
-      FROM news.symbol_sentiment
-     WHERE symbol = :symbol
-     ORDER BY period_end_date DESC
-     LIMIT :limit
+SELECT period_end_date, buzz::float8 AS buzz, weekly_avg::float8 AS weekly_avg,
+       articles_last_week, sentiment_score::float8 AS sentiment_score,
+       bearish_pct::float8 AS bearish_pct, bullish_pct::float8 AS bullish_pct
+  FROM news.symbol_sentiment
+ WHERE symbol = :symbol
+ ORDER BY period_end_date DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 20; min = 1; max = 60
 
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
 
-# ===== group: corpactions+valuation+etf+earnings (12 endpoints) =====
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 20
+min = 1
+max = 60
 
+# ===== corpactions+valuation+etf+earnings (14) =====
 [[read.endpoint]]
-id = "corp_actions.dividends"
+id = "corpactions.dividends"
 method = "GET"
 path = "/dividends/:symbol"
 tables = ["market.dividends"]
@@ -376,26 +845,42 @@ ttl = "6h"
 shape = "rows"
 strip_lineage = true
 row_cap = 500
+cache = true
 sql = """
-  SELECT date, record_date, payment_date, declaration_date, amount::float8 AS amount,
-         adj_amount::float8 AS adj_amount, yield_pct::float8 AS yield_pct, frequency
-    FROM market.dividends
-   WHERE symbol = :symbol {{since_filter}}
-   ORDER BY date DESC NULLS LAST
-   LIMIT :limit
+SELECT date, record_date, payment_date, declaration_date, amount::float8 AS amount, adj_amount::float8 AS adj_amount, yield_pct::float8 AS yield_pct, frequency
+  FROM market.dividends
+ WHERE symbol = :symbol{{since_filter}}
+ ORDER BY date DESC NULLS LAST
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 50; min = 1; max = 500
-  # NOTE: original builds the `date >= since` clause dynamically in code (optional).
-  # Expressed here as an optional bound filter; if the declarative layer cannot bind an
-  # optional :since inside a {{fragment}}, defer this endpoint (see deferred_to_ext note).
-  [[read.endpoint.param]]
-  name = "since"; kind = "query"; type = "date"; optional = true; bind_fragment = "since_filter"; fragment_when_present = "AND date >= :since"
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 500
+
+[[read.endpoint.param]]
+name = "since"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND date >= :since"
+[read.endpoint.param.absent]
+since_filter = ""
+
 
 [[read.endpoint]]
-id = "corp_actions.splits"
+id = "corpactions.splits"
 method = "GET"
 path = "/splits/:symbol"
 tables = ["market.splits"]
@@ -403,18 +888,82 @@ ttl = "6h"
 shape = "rows"
 strip_lineage = true
 row_cap = 200
+cache = true
 sql = """
-  SELECT date, numerator::float8 AS numerator, denominator::float8 AS denominator,
-         ratio::float8 AS ratio
-    FROM market.splits
-   WHERE symbol = :symbol
-   ORDER BY date DESC
-   LIMIT :limit
+SELECT date, numerator::float8 AS numerator, denominator::float8 AS denominator, ratio::float8 AS ratio
+  FROM market.splits
+ WHERE symbol = :symbol
+ ORDER BY date DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 50; min = 1; max = 200
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 200
+
+
+[[read.endpoint]]
+id = "corpactions.market_cap_history"
+method = "GET"
+path = "/market-cap/:symbol/history"
+tables = ["market.market_cap"]
+ttl = "6h"
+shape = "rows"
+strip_lineage = true
+row_cap = 5000
+cache = true
+sql = """
+SELECT date, market_cap::float8 AS market_cap
+  FROM market.market_cap
+ WHERE symbol = :symbol{{start_filter}}{{end_filter}}
+ ORDER BY date ASC
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 1000
+min = 1
+max = 5000
+
+[[read.endpoint.param]]
+name = "start"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+start_filter = " AND date >= :start"
+[read.endpoint.param.absent]
+start_filter = ""
+
+[[read.endpoint.param]]
+name = "end"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+end_filter = " AND date <= :end"
+[read.endpoint.param.absent]
+end_filter = ""
+
 
 [[read.endpoint]]
 id = "valuation.dcf"
@@ -425,18 +974,29 @@ ttl = "6h"
 shape = "rows"
 strip_lineage = true
 row_cap = 60
+cache = true
 sql = """
-  SELECT as_of, variant, dcf_value::float8 AS dcf_value,
-         stock_price::float8 AS stock_price
-    FROM fundamentals.dcf
-   WHERE symbol = :symbol
-   ORDER BY as_of DESC
-   LIMIT :limit
+SELECT as_of, variant, dcf_value::float8 AS dcf_value, stock_price::float8 AS stock_price
+  FROM fundamentals.dcf
+ WHERE symbol = :symbol
+ ORDER BY as_of DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 20; min = 1; max = 60
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 20
+min = 1
+max = 60
+
 
 [[read.endpoint]]
 id = "valuation.enterprise_value"
@@ -447,24 +1007,41 @@ ttl = "6h"
 shape = "rows"
 strip_lineage = true
 row_cap = 200
+cache = true
 sql = """
-  SELECT period_end_date, period_type, enterprise_value::float8 AS enterprise_value,
-         market_cap::float8 AS market_cap, total_debt::float8 AS total_debt,
-         cash_and_short_term::float8 AS cash_and_short_term
-    FROM fundamentals.enterprise_values
-   WHERE symbol = :symbol AND source = 'fmp'{{period_filter}}
-   ORDER BY period_end_date DESC
-   LIMIT :limit
+SELECT period_end_date, period_type, enterprise_value::float8 AS enterprise_value, market_cap::float8 AS market_cap, total_debt::float8 AS total_debt, cash_and_short_term::float8 AS cash_and_short_term
+  FROM fundamentals.enterprise_values
+ WHERE symbol = :symbol AND source = 'fmp'{{period_filter}}
+ ORDER BY period_end_date DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 20; min = 1; max = 200
-  [[read.endpoint.param]]
-  name = "period"; kind = "query"; type = "enum"; default = "quarter"
-  [read.endpoint.param.select.quarter] = { period_filter = " AND period_type IN ('Q1','Q2','Q3','Q4')" }
-  [read.endpoint.param.select.fy]      = { period_filter = " AND period_type = 'FY'" }
-  [read.endpoint.param.select.all]     = { period_filter = "" }
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 20
+min = 1
+max = 200
+
+[[read.endpoint.param]]
+name = "period"
+kind = "query"
+type = "enum"
+default = "quarter"
+[read.endpoint.param.select.quarter]
+period_filter = " AND period_type IN ('Q1','Q2','Q3','Q4')"
+[read.endpoint.param.select.fy]
+period_filter = " AND period_type = 'FY'"
+[read.endpoint.param.select.all]
+period_filter = ""
+
 
 [[read.endpoint]]
 id = "valuation.financial_scores"
@@ -475,21 +1052,29 @@ ttl = "6h"
 shape = "rows"
 strip_lineage = true
 row_cap = 60
+cache = true
 sql = """
-  SELECT as_of, currency, altman_z::float8 AS altman_z, piotroski::float8 AS piotroski,
-         working_capital::float8 AS working_capital, total_assets::float8 AS total_assets,
-         retained_earnings::float8 AS retained_earnings, ebit::float8 AS ebit,
-         market_cap::float8 AS market_cap, total_liabilities::float8 AS total_liabilities,
-         revenue::float8 AS revenue
-    FROM fundamentals.financial_scores
-   WHERE symbol = :symbol
-   ORDER BY as_of DESC
-   LIMIT :limit
+SELECT as_of, currency, altman_z::float8 AS altman_z, piotroski::float8 AS piotroski, working_capital::float8 AS working_capital, total_assets::float8 AS total_assets, retained_earnings::float8 AS retained_earnings, ebit::float8 AS ebit, market_cap::float8 AS market_cap, total_liabilities::float8 AS total_liabilities, revenue::float8 AS revenue
+  FROM fundamentals.financial_scores
+ WHERE symbol = :symbol
+ ORDER BY as_of DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 20; min = 1; max = 60
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 20
+min = 1
+max = 60
+
 
 [[read.endpoint]]
 id = "valuation.owner_earnings"
@@ -500,22 +1085,41 @@ ttl = "6h"
 shape = "rows"
 strip_lineage = true
 row_cap = 200
+cache = true
 sql = """
-  SELECT period_end_date, period_type, owner_earnings::float8 AS owner_earnings
-    FROM fundamentals.owner_earnings
-   WHERE symbol = :symbol{{period_filter}}
-   ORDER BY period_end_date DESC
-   LIMIT :limit
+SELECT period_end_date, period_type, owner_earnings::float8 AS owner_earnings
+  FROM fundamentals.owner_earnings
+ WHERE symbol = :symbol{{period_filter}}
+ ORDER BY period_end_date DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 20; min = 1; max = 200
-  [[read.endpoint.param]]
-  name = "period"; kind = "query"; type = "enum"; default = "quarter"
-  [read.endpoint.param.select.quarter] = { period_filter = " AND period_type IN ('Q1','Q2','Q3','Q4')" }
-  [read.endpoint.param.select.fy]      = { period_filter = " AND period_type = 'FY'" }
-  [read.endpoint.param.select.all]     = { period_filter = "" }
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 20
+min = 1
+max = 200
+
+[[read.endpoint.param]]
+name = "period"
+kind = "query"
+type = "enum"
+default = "quarter"
+[read.endpoint.param.select.quarter]
+period_filter = " AND period_type IN ('Q1','Q2','Q3','Q4')"
+[read.endpoint.param.select.fy]
+period_filter = " AND period_type = 'FY'"
+[read.endpoint.param.select.all]
+period_filter = ""
+
 
 [[read.endpoint]]
 id = "etf.info"
@@ -526,18 +1130,20 @@ ttl = "24h"
 shape = "one"
 strip_lineage = false
 row_cap = 1
+cache = true
 sql = """
-  SELECT symbol, name, description, isin, asset_class, security_cusip, domicile,
-         website, etf_company, expense_ratio::float8 AS expense_ratio,
-         assets_under_management::float8 AS assets_under_management,
-         avg_volume::float8 AS avg_volume, inception_date, nav::float8 AS nav,
-         nav_currency, holdings_count, is_actively_trading, updated_at, sectors
-    FROM reference.etf_info
-   WHERE symbol = :symbol AND source = 'fmp'
-   LIMIT 1
+SELECT symbol, name, description, isin, asset_class, security_cusip, domicile, website, etf_company, expense_ratio::float8 AS expense_ratio, assets_under_management::float8 AS assets_under_management, avg_volume::float8 AS avg_volume, inception_date, nav::float8 AS nav, nav_currency, holdings_count, is_actively_trading, updated_at, sectors
+  FROM reference.etf_info
+ WHERE symbol = :symbol AND source = 'fmp'
+ LIMIT 1
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
 
 [[read.endpoint]]
 id = "etf.sector_weightings"
@@ -547,15 +1153,21 @@ tables = ["reference.etf_sector_weightings"]
 ttl = "24h"
 shape = "rows"
 strip_lineage = false
-row_cap = 1000
+row_cap = 200
+cache = true
 sql = """
-  SELECT sector, NULL::text AS country, weight_percentage::float8 AS weight_pct, as_of
-    FROM reference.etf_sector_weightings
-   WHERE etf_symbol = :symbol
-   ORDER BY weight_percentage DESC NULLS LAST
+SELECT sector, NULL::text AS country, weight_percentage::float8 AS weight_pct, as_of
+  FROM reference.etf_sector_weightings
+ WHERE etf_symbol = :symbol
+ ORDER BY weight_percentage DESC NULLS LAST
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
 
 [[read.endpoint]]
 id = "etf.country_weightings"
@@ -565,15 +1177,21 @@ tables = ["reference.etf_country_weightings"]
 ttl = "24h"
 shape = "rows"
 strip_lineage = false
-row_cap = 1000
+row_cap = 200
+cache = true
 sql = """
-  SELECT NULL::text AS sector, country, weight_percentage::float8 AS weight_pct, as_of
-    FROM reference.etf_country_weightings
-   WHERE etf_symbol = :symbol
-   ORDER BY weight_percentage DESC NULLS LAST
+SELECT NULL::text AS sector, country, weight_percentage::float8 AS weight_pct, as_of
+  FROM reference.etf_country_weightings
+ WHERE etf_symbol = :symbol
+ ORDER BY weight_percentage DESC NULLS LAST
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
 
 [[read.endpoint]]
 id = "etf.symbol_etf_exposure"
@@ -584,22 +1202,86 @@ ttl = "24h"
 shape = "rows"
 strip_lineage = false
 row_cap = 500
+cache = true
 sql = """
-  WITH latest AS (
-    SELECT DISTINCT ON (etf_symbol) etf_symbol, as_of, weight_pct, shares, market_value
-      FROM reference.etf_asset_exposure WHERE holding_symbol = :symbol
-     ORDER BY etf_symbol, as_of DESC)
-  SELECT etf_symbol, as_of, weight_pct::float8 AS weight_pct, shares::float8 AS shares,
-         market_value::float8 AS market_value FROM latest
-   ORDER BY weight_pct DESC NULLS LAST LIMIT :limit
+WITH latest AS (SELECT DISTINCT ON (etf_symbol) etf_symbol, as_of, weight_pct, shares, market_value FROM reference.etf_asset_exposure WHERE holding_symbol = :symbol ORDER BY etf_symbol, as_of DESC) SELECT etf_symbol, as_of, weight_pct::float8 AS weight_pct, shares::float8 AS shares, market_value::float8 AS market_value FROM latest ORDER BY weight_pct DESC NULLS LAST LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 100; min = 1; max = 500
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 100
+min = 1
+max = 500
+
 
 [[read.endpoint]]
-id = "earnings_history.history"
+id = "earnings.calendar"
+method = "GET"
+path = "/earnings"
+tables = ["events.earnings_calendar"]
+ttl = "6h"
+shape = "rows"
+strip_lineage = true
+row_cap = 500
+cache = true
+sql = """
+SELECT symbol, report_date, fiscal_date, time_of_day, eps_estimated, eps_actual, revenue_estimated, revenue_actual
+  FROM events.earnings_calendar
+ WHERE 1=1{{symbol_filter}}{{start_filter}}{{end_filter}}
+ ORDER BY report_date DESC, symbol
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "query"
+type = "symbol"
+transform = "upper"
+required = false
+[read.endpoint.param.present]
+symbol_filter = " AND symbol = :symbol"
+[read.endpoint.param.absent]
+symbol_filter = ""
+
+[[read.endpoint.param]]
+name = "start"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+start_filter = " AND report_date >= :start"
+[read.endpoint.param.absent]
+start_filter = ""
+
+[[read.endpoint.param]]
+name = "end"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+end_filter = " AND report_date <= :end"
+[read.endpoint.param.absent]
+end_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 500
+
+
+[[read.endpoint]]
+id = "earnings.history"
 method = "GET"
 path = "/earnings/:symbol/history"
 tables = ["fundamentals.earnings"]
@@ -607,23 +1289,32 @@ ttl = "6h"
 shape = "rows"
 strip_lineage = true
 row_cap = 200
+cache = true
 sql = """
-  SELECT fiscal_date, report_date, time_of_day, actual_eps::float8 AS actual_eps,
-         estimated_eps::float8 AS estimated_eps, surprise::float8 AS surprise,
-         surprise_pct::float8 AS surprise_pct, actual_revenue::float8 AS actual_revenue,
-         estimated_revenue::float8 AS estimated_revenue
-    FROM fundamentals.earnings
-   WHERE symbol = :symbol
-   ORDER BY fiscal_date DESC NULLS LAST
-   LIMIT :limit
+SELECT fiscal_date, report_date, time_of_day, actual_eps::float8 AS actual_eps, estimated_eps::float8 AS estimated_eps, surprise::float8 AS surprise, surprise_pct::float8 AS surprise_pct, actual_revenue::float8 AS actual_revenue, estimated_revenue::float8 AS estimated_revenue
+  FROM fundamentals.earnings
+ WHERE symbol = :symbol
+ ORDER BY fiscal_date DESC NULLS LAST
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 40; min = 1; max = 200
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 40
+min = 1
+max = 200
+
 
 [[read.endpoint]]
-id = "earnings_history.quality"
+id = "earnings.quality"
 method = "GET"
 path = "/earnings-quality/:symbol"
 tables = ["fundamentals.earnings_quality_score"]
@@ -631,23 +1322,30 @@ ttl = "6h"
 shape = "rows"
 strip_lineage = true
 row_cap = 60
+cache = true
 sql = """
-  SELECT period_end_date, period_type, letter_score, score::float8 AS score,
-         growth::float8 AS growth, leverage::float8 AS leverage,
-         profitability::float8 AS profitability, cash_generation::float8 AS cash_generation
-    FROM fundamentals.earnings_quality_score
-   WHERE symbol = :symbol
-   ORDER BY period_end_date DESC
-   LIMIT :limit
+SELECT period_end_date, period_type, letter_score, score::float8 AS score, growth::float8 AS growth, leverage::float8 AS leverage, profitability::float8 AS profitability, cash_generation::float8 AS cash_generation
+  FROM fundamentals.earnings_quality_score
+ WHERE symbol = :symbol
+ ORDER BY period_end_date DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 20; min = 1; max = 60
 
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
 
-# ===== group: reference+macro+events (6 endpoints) =====
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 20
+min = 1
+max = 60
 
+# ===== reference+macro+events (14) =====
 [[read.endpoint]]
 id = "reference.executives"
 method = "GET"
@@ -656,18 +1354,31 @@ tables = ["reference.executives"]
 ttl = "24h"
 shape = "rows"
 strip_lineage = true
-row_cap = 1000
+row_cap = 200
+cache = true
 sql = """
-  SELECT name, title, since, until, age, gender, pay::float8 AS pay
-    FROM reference.executives WHERE symbol = :symbol {{current_filter}}
-   ORDER BY since DESC NULLS LAST, name
+SELECT name, title, since, until, age, gender, pay::float8 AS pay
+  FROM reference.executives
+ WHERE symbol = :symbol{{current_filter}}
+ ORDER BY since DESC NULLS LAST, name
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "current_only"; kind = "query"; type = "enum"; default = "false"
-  [read.endpoint.param.select.false] = { current_filter = "" }
-  [read.endpoint.param.select.true]  = { current_filter = "AND until IS NULL" }
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "current_only"
+kind = "query"
+type = "bool"
+required = false
+[read.endpoint.param.present]
+current_filter = " AND until IS NULL"
+[read.endpoint.param.absent]
+current_filter = ""
+
 
 [[read.endpoint]]
 id = "reference.compensation"
@@ -678,52 +1389,29 @@ ttl = "24h"
 shape = "rows"
 strip_lineage = true
 row_cap = 200
+cache = true
 sql = """
-  SELECT name, year, compensation_total::float8 AS compensation_total,
-         compensation_breakdown FROM reference.governance_compensation
-   WHERE symbol = :symbol ORDER BY year DESC NULLS LAST, compensation_total DESC NULLS LAST LIMIT :limit
+SELECT name, year, compensation_total::float8 AS compensation_total, compensation_breakdown
+  FROM reference.governance_compensation
+ WHERE symbol = :symbol
+ ORDER BY year DESC NULLS LAST, compensation_total DESC NULLS LAST
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 50; min = 1; max = 200
 
-[[read.endpoint]]
-id = "reference.shares_float"
-method = "GET"
-path = "/shares-float/:symbol"
-tables = ["reference.shares_float"]
-ttl = "24h"
-shape = "rows"
-strip_lineage = true
-row_cap = 60
-sql = """
-  SELECT date, free_float::float8 AS free_float, float_shares::float8 AS float_shares,
-         outstanding_shares::float8 AS outstanding_shares FROM reference.shares_float
-   WHERE symbol = :symbol ORDER BY date DESC NULLS LAST LIMIT :limit
-"""
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 20; min = 1; max = 60
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
 
-[[read.endpoint]]
-id = "reference.employee_count"
-method = "GET"
-path = "/employee-count/:symbol"
-tables = ["reference.historical_employee_count"]
-ttl = "24h"
-shape = "rows"
-strip_lineage = true
-row_cap = 200
-sql = """
-  SELECT as_of, employee_count FROM reference.historical_employee_count
-   WHERE symbol = :symbol ORDER BY as_of DESC LIMIT :limit
-"""
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 30; min = 1; max = 200
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 200
+
 
 [[read.endpoint]]
 id = "reference.supply_chain"
@@ -734,23 +1422,370 @@ ttl = "24h"
 shape = "rows"
 strip_lineage = true
 row_cap = 200
+cache = true
 sql = """
-  SELECT related_symbol, kind, weight::float8 AS weight FROM reference.supply_chain
-   WHERE symbol = :symbol {{kind_filter}} ORDER BY weight DESC NULLS LAST, related_symbol LIMIT :limit
+SELECT related_symbol, kind, weight::float8 AS weight
+  FROM reference.supply_chain
+ WHERE symbol = :symbol{{kind_filter}}
+ ORDER BY weight DESC NULLS LAST, related_symbol
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 50; min = 1; max = 200
-  # NOTE: the live handler's `kind` is a free-text equality filter built dynamically.
-  # Expressed here only for the no-filter case; when `kind` is supplied the handler
-  # binds it as a value ($N) which the declarative layer cannot do for an optional param.
-  [[read.endpoint.param]]
-  name = "kind"; kind = "query"; type = "enum"; default = "all"
-  [read.endpoint.param.select.all] = { kind_filter = "" }
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "kind"
+kind = "query"
+type = "str"
+required = false
+[read.endpoint.param.present]
+kind_filter = " AND kind = :kind"
+[read.endpoint.param.absent]
+kind_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 200
+
 
 [[read.endpoint]]
-id = "macro_data.cot"
+id = "reference.shares_float"
+method = "GET"
+path = "/shares-float/:symbol"
+tables = ["reference.shares_float"]
+ttl = "24h"
+shape = "rows"
+strip_lineage = true
+row_cap = 60
+cache = true
+sql = """
+SELECT date, free_float::float8 AS free_float, float_shares::float8 AS float_shares, outstanding_shares::float8 AS outstanding_shares
+  FROM reference.shares_float
+ WHERE symbol = :symbol
+ ORDER BY date DESC NULLS LAST
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 20
+min = 1
+max = 60
+
+
+[[read.endpoint]]
+id = "reference.employee_count"
+method = "GET"
+path = "/employee-count/:symbol"
+tables = ["reference.historical_employee_count"]
+ttl = "24h"
+shape = "rows"
+strip_lineage = true
+row_cap = 200
+cache = true
+sql = """
+SELECT as_of, employee_count
+  FROM reference.historical_employee_count
+ WHERE symbol = :symbol
+ ORDER BY as_of DESC
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 30
+min = 1
+max = 200
+
+
+[[read.endpoint]]
+id = "reference.symbol_changes"
+method = "GET"
+path = "/symbol-changes"
+tables = ["reference.symbol_change"]
+ttl = "24h"
+shape = "rows"
+strip_lineage = true
+row_cap = 500
+cache = true
+sql = """
+SELECT change_date, symbol, name, old_symbol, new_symbol
+  FROM reference.symbol_change
+ WHERE 1=1{{symbol_filter}}{{since_filter}}
+ ORDER BY change_date DESC
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "query"
+type = "symbol"
+transform = "upper"
+required = false
+[read.endpoint.param.present]
+symbol_filter = " AND (symbol = :symbol OR old_symbol = :symbol OR new_symbol = :symbol)"
+[read.endpoint.param.absent]
+symbol_filter = ""
+
+[[read.endpoint.param]]
+name = "since"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND change_date >= :since"
+[read.endpoint.param.absent]
+since_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 100
+min = 1
+max = 500
+
+
+[[read.endpoint]]
+id = "reference.exchange_holidays"
+method = "GET"
+path = "/exchange/:exchange/holidays"
+tables = ["reference.exchange_holidays"]
+ttl = "24h"
+shape = "rows"
+strip_lineage = true
+row_cap = 500
+cache = true
+sql = """
+SELECT holiday_date, name, is_closed, is_half_day, adj_open_time, adj_close_time
+  FROM reference.exchange_holidays
+ WHERE exchange = :exchange{{since_filter}}{{until_filter}}
+ ORDER BY holiday_date
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "exchange"
+kind = "path"
+type = "str"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "from"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND holiday_date >= :from"
+[read.endpoint.param.absent]
+since_filter = ""
+
+[[read.endpoint.param]]
+name = "to"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+until_filter = " AND holiday_date <= :to"
+[read.endpoint.param.absent]
+until_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 200
+min = 1
+max = 500
+
+
+[[read.endpoint]]
+id = "macro.treasury_rates"
+method = "GET"
+path = "/macro/treasury-rates"
+tables = ["macro.treasury_rates"]
+ttl = "6h"
+shape = "rows"
+strip_lineage = true
+row_cap = 5000
+cache = true
+sql = """
+SELECT date, m1::float8 AS m1, m2::float8 AS m2, m3::float8 AS m3, m6::float8 AS m6, y1::float8 AS y1, y2::float8 AS y2, y3::float8 AS y3, y5::float8 AS y5, y7::float8 AS y7, y10::float8 AS y10, y20::float8 AS y20, y30::float8 AS y30
+  FROM macro.treasury_rates
+ WHERE 1=1{{start_filter}}{{end_filter}}
+ ORDER BY date ASC
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "from"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+start_filter = " AND date >= :from"
+[read.endpoint.param.absent]
+start_filter = ""
+
+[[read.endpoint.param]]
+name = "to"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+end_filter = " AND date <= :to"
+[read.endpoint.param.absent]
+end_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 200
+min = 1
+max = 5000
+
+
+[[read.endpoint]]
+id = "macro.economic_indicators"
+method = "GET"
+path = "/macro/economic-indicators"
+tables = ["macro.economic_indicators"]
+ttl = "6h"
+shape = "rows"
+strip_lineage = true
+row_cap = 5000
+cache = true
+sql = """
+SELECT indicator, date, value::float8 AS value
+  FROM macro.economic_indicators
+ WHERE 1=1{{indicator_filter}}{{since_filter}}
+ ORDER BY indicator, date DESC
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "indicator"
+kind = "query"
+type = "str"
+required = false
+[read.endpoint.param.present]
+indicator_filter = " AND indicator = :indicator"
+[read.endpoint.param.absent]
+indicator_filter = ""
+
+[[read.endpoint.param]]
+name = "since"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND date >= :since"
+[read.endpoint.param.absent]
+since_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 200
+min = 1
+max = 5000
+
+
+[[read.endpoint]]
+id = "macro.economic_calendar"
+method = "GET"
+path = "/macro/economic-calendar"
+tables = ["macro.economic_calendar"]
+ttl = "6h"
+shape = "rows"
+strip_lineage = true
+row_cap = 5000
+cache = true
+sql = """
+SELECT date, event, country, actual, estimate, previous, impact
+  FROM macro.economic_calendar
+ WHERE 1=1{{since_filter}}{{until_filter}}{{country_filter}}{{impact_filter}}
+ ORDER BY date DESC
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "from"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND date >= :from"
+[read.endpoint.param.absent]
+since_filter = ""
+
+[[read.endpoint.param]]
+name = "to"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+until_filter = " AND date <= :to"
+[read.endpoint.param.absent]
+until_filter = ""
+
+[[read.endpoint.param]]
+name = "country"
+kind = "query"
+type = "str"
+required = false
+[read.endpoint.param.present]
+country_filter = " AND country = :country"
+[read.endpoint.param.absent]
+country_filter = ""
+
+[[read.endpoint.param]]
+name = "impact"
+kind = "query"
+type = "str"
+required = false
+[read.endpoint.param.present]
+impact_filter = " AND impact = :impact"
+[read.endpoint.param.absent]
+impact_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 200
+min = 1
+max = 5000
+
+
+[[read.endpoint]]
+id = "macro.cot"
 method = "GET"
 path = "/macro/cot/:symbol"
 tables = ["macro.commitment_of_traders"]
@@ -758,23 +1793,177 @@ ttl = "6h"
 shape = "rows"
 strip_lineage = true
 row_cap = 100
+cache = true
 sql = """
-  SELECT report_date, name, sector, open_interest_all::float8 AS open_interest,
-         noncomm_positions_long_all::float8 AS noncomm_long,
-         noncomm_positions_short_all::float8 AS noncomm_short,
-         comm_positions_long_all::float8 AS comm_long,
-         comm_positions_short_all::float8 AS comm_short,
-         change_in_open_interest_all::float8 AS change_oi
-    FROM macro.commitment_of_traders WHERE symbol = :symbol ORDER BY report_date DESC LIMIT :limit
+SELECT report_date, name, sector, open_interest_all::float8 AS open_interest, noncomm_positions_long_all::float8 AS noncomm_long, noncomm_positions_short_all::float8 AS noncomm_short, comm_positions_long_all::float8 AS comm_long, comm_positions_short_all::float8 AS comm_short, change_in_open_interest_all::float8 AS change_oi
+  FROM macro.commitment_of_traders
+ WHERE symbol = :symbol
+ ORDER BY report_date DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 20; min = 1; max = 100
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 20
+min = 1
+max = 100
 
 
-# ===== group: transcripts+institutional+technical+marketextras+regulatory (19 endpoints) =====
+[[read.endpoint]]
+id = "events.ipos"
+method = "GET"
+path = "/ipos"
+tables = ["events.ipos"]
+ttl = "6h"
+shape = "rows"
+strip_lineage = true
+row_cap = 1000
+cache = true
+sql = """
+SELECT symbol, ipo_date, exchange, name, number_of_shares::float8 AS number_of_shares,
+       CASE WHEN btrim(regexp_replace(price, '&[^;]+;|\\s', '', 'g')) ~ '^-?[0-9.]+$'
+            THEN btrim(regexp_replace(price, '&[^;]+;|\\s', '', 'g'))::float8
+            ELSE NULL END AS price,
+       total_shares_value::float8 AS total_shares_value, status
+  FROM events.ipos
+ WHERE 1=1{{since_filter}}{{until_filter}}
+ ORDER BY ipo_date DESC NULLS LAST
+ LIMIT :limit
+"""
 
+[[read.endpoint.param]]
+name = "from"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND ipo_date >= :from"
+[read.endpoint.param.absent]
+since_filter = ""
+
+[[read.endpoint.param]]
+name = "to"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+until_filter = " AND ipo_date <= :to"
+[read.endpoint.param.absent]
+until_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 100
+min = 1
+max = 1000
+
+
+[[read.endpoint]]
+id = "events.mergers_acquisitions"
+method = "GET"
+path = "/mergers-acquisitions"
+tables = ["events.mergers_acquisitions"]
+ttl = "6h"
+shape = "rows"
+strip_lineage = true
+row_cap = 1000
+cache = true
+sql = """
+SELECT announced_date, accepted_date, accepting_symbol, accepting_name, accepting_cik, target_symbol, target_name, target_cik, expected_close_date, deal_value::float8 AS deal_value, deal_currency, status, link
+  FROM events.mergers_acquisitions
+ WHERE 1=1{{since_filter}}{{accepting_filter}}{{target_filter}}
+ ORDER BY announced_date DESC NULLS LAST
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "from"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND announced_date >= :from"
+[read.endpoint.param.absent]
+since_filter = ""
+
+[[read.endpoint.param]]
+name = "accepting_symbol"
+kind = "query"
+type = "symbol"
+transform = "upper"
+required = false
+[read.endpoint.param.present]
+accepting_filter = " AND accepting_symbol = :accepting_symbol"
+[read.endpoint.param.absent]
+accepting_filter = ""
+
+[[read.endpoint.param]]
+name = "target_symbol"
+kind = "query"
+type = "symbol"
+transform = "upper"
+required = false
+[read.endpoint.param.present]
+target_filter = " AND target_symbol = :target_symbol"
+[read.endpoint.param.absent]
+target_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 100
+min = 1
+max = 1000
+
+
+[[read.endpoint]]
+id = "events.fda_calendar"
+method = "GET"
+path = "/fda-calendar"
+tables = ["events.fda_calendar"]
+ttl = "6h"
+shape = "rows"
+strip_lineage = true
+row_cap = 1000
+cache = true
+sql = """
+SELECT from_date, to_date, event, url
+  FROM events.fda_calendar
+ WHERE 1=1{{since_filter}}
+ ORDER BY from_date DESC NULLS LAST
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "from"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND from_date >= :from"
+[read.endpoint.param.absent]
+since_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 100
+min = 1
+max = 1000
+
+# ===== transcripts+institutional+technical+marketextras+regulatory (26) =====
 [[read.endpoint]]
 id = "transcripts.list"
 method = "GET"
@@ -784,25 +1973,48 @@ ttl = "6h"
 shape = "rows"
 strip_lineage = true
 row_cap = 50
+cache = true
 sql = """
-  SELECT symbol, fiscal_year, quarter, call_date, left(coalesce(transcript,''), 500) AS transcript_excerpt
-    FROM raw.fmp_earning_call_transcripts
-   WHERE symbol = :symbol {{year_filter}} {{quarter_filter}}
-   ORDER BY fiscal_year DESC, quarter DESC
-   LIMIT :limit
+SELECT symbol, fiscal_year, quarter, call_date, left(coalesce(transcript,''), 500) AS transcript_excerpt
+  FROM raw.fmp_earning_call_transcripts
+ WHERE symbol = :symbol{{year_filter}}{{quarter_filter}}
+ ORDER BY fiscal_year DESC, quarter DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 20; min = 1; max = 50
-  [[read.endpoint.param]]
-  name = "year"; kind = "query"; type = "int"; min = -2147483648; max = 2147483647
-  [read.endpoint.param.bind.year] = { year_filter = "AND fiscal_year = :year" }
-  [read.endpoint.param.bind.__absent__] = { year_filter = "" }
-  [[read.endpoint.param]]
-  name = "quarter"; kind = "query"; type = "int"; min = -2147483648; max = 2147483647
-  [read.endpoint.param.bind.quarter] = { quarter_filter = "AND quarter = :quarter" }
-  [read.endpoint.param.bind.__absent__] = { quarter_filter = "" }
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "year"
+kind = "query"
+type = "int"
+required = false
+[read.endpoint.param.present]
+year_filter = " AND fiscal_year = :year"
+[read.endpoint.param.absent]
+year_filter = ""
+
+[[read.endpoint.param]]
+name = "quarter"
+kind = "query"
+type = "int"
+required = false
+[read.endpoint.param.present]
+quarter_filter = " AND quarter = :quarter"
+[read.endpoint.param.absent]
+quarter_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 20
+min = 1
+max = 50
 
 [[read.endpoint]]
 id = "transcripts.one"
@@ -812,19 +2024,92 @@ tables = ["raw.fmp_earning_call_transcripts"]
 ttl = "6h"
 shape = "one"
 strip_lineage = true
-row_cap = 1
+cache = true
 sql = """
-  SELECT symbol, fiscal_year, quarter, call_date, transcript
-    FROM raw.fmp_earning_call_transcripts
-   WHERE symbol = :symbol AND fiscal_year = :year AND quarter = :quarter
-   LIMIT 1
+SELECT symbol, fiscal_year, quarter, call_date, transcript
+  FROM raw.fmp_earning_call_transcripts
+ WHERE symbol = :symbol AND fiscal_year = :year AND quarter = :quarter
+ LIMIT 1
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "year"; kind = "path"; type = "int"; min = -2147483648; max = 2147483647
-  [[read.endpoint.param]]
-  name = "quarter"; kind = "path"; type = "int"; min = -2147483648; max = 2147483647
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "year"
+kind = "path"
+type = "int"
+
+[[read.endpoint.param]]
+name = "quarter"
+kind = "path"
+type = "int"
+
+[[read.endpoint]]
+id = "technical.indicators"
+method = "GET"
+path = "/technical/:symbol"
+tables = ["market.technical_indicators"]
+ttl = "1h"
+shape = "envelope"
+envelope_key = "data"
+strip_lineage = true
+row_cap = 5000
+cache = true
+sql = """
+SELECT ts, indicator, period_length, timeframe, value, open, high, low, close, volume
+  FROM market.technical_indicators
+ WHERE symbol = :symbol AND ts >= :start AND ts <= :end{{indicator_filter}}
+ ORDER BY ts DESC, indicator
+ LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "indicator"
+kind = "query"
+type = "str"
+required = false
+[read.endpoint.param.present]
+indicator_filter = " AND indicator = :indicator"
+[read.endpoint.param.absent]
+indicator_filter = ""
+
+[[read.endpoint.param]]
+name = "start"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+start = ":start"
+[read.endpoint.param.absent]
+start = "now() - interval '365 days'"
+
+[[read.endpoint.param]]
+name = "end"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+end = ":end"
+[read.endpoint.param.absent]
+end = "now()"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 500
+min = 1
+max = 5000
 
 [[read.endpoint]]
 id = "technical.latest"
@@ -833,46 +2118,74 @@ path = "/technical/:symbol/latest"
 tables = ["market.technical_indicators"]
 ttl = "1h"
 shape = "envelope"
+envelope_key = "data"
 strip_lineage = true
-row_cap = 1000
+cache = true
 sql = """
-  SELECT DISTINCT ON (indicator) ts, indicator, period_length, timeframe, value,
-         open, high, low, close, volume FROM market.technical_indicators
-   WHERE symbol = :symbol ORDER BY indicator, ts DESC
+SELECT DISTINCT ON (indicator) ts, indicator, period_length, timeframe, value, open, high, low, close, volume
+  FROM market.technical_indicators
+ WHERE symbol = :symbol
+ ORDER BY indicator, ts DESC
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
 
 [[read.endpoint]]
-id = "institutional.holder_industries"
+id = "institutional.holder_analytics"
 method = "GET"
-path = "/institutional/holder/:cik/industries"
-tables = ["ownership.holder_industry_breakdown"]
+path = "/institutional/:symbol/holders/analytics"
+tables = ["ownership.institutional_holder_analytics"]
 ttl = "6h"
 shape = "envelope"
+envelope_key = "data"
 strip_lineage = true
-row_cap = 500
+row_cap = 1000
+cache = true
 sql = """
-  SELECT date, investor_name, industry_title, weight, last_weight, change_in_weight,
-         change_in_weight_percentage, performance, performance_percentage, last_performance,
-         change_in_performance, number_of_companies, last_number_of_companies
-    FROM ownership.holder_industry_breakdown
-   WHERE cik = :cik {{year_filter}} {{quarter_filter}}
-   ORDER BY date DESC, weight DESC NULLS LAST
-   LIMIT :limit
+SELECT period_end_date, cik, investor_name, industry_title, weight, last_weight, change_in_weight, change_in_weight_percentage, market_value, last_market_value, change_in_market_value, shares_number, last_shares_number, change_in_shares_number, ownership, change_in_ownership, holding_period, first_added, is_new, is_sold_out, performance, performance_percentage, avg_price_paid, quarter_end_price
+  FROM ownership.institutional_holder_analytics
+ WHERE symbol = :symbol{{year_filter}}{{quarter_filter}}
+ ORDER BY period_end_date DESC, market_value DESC NULLS LAST
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "cik"; kind = "path"; type = "str"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 50; min = 1; max = 500
-  [[read.endpoint.param]]
-  name = "year"; kind = "query"; type = "int"; min = -2147483648; max = 2147483647
-  [read.endpoint.param.bind.year] = { year_filter = "AND extract(year from date)::int = :year" }
-  [read.endpoint.param.bind.__absent__] = { year_filter = "" }
-  [[read.endpoint.param]]
-  name = "quarter"; kind = "query"; type = "int"; min = -2147483648; max = 2147483647
-  [read.endpoint.param.bind.quarter] = { quarter_filter = "AND extract(quarter from date)::int = :quarter" }
-  [read.endpoint.param.bind.__absent__] = { quarter_filter = "" }
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "year"
+kind = "query"
+type = "int"
+required = false
+[read.endpoint.param.present]
+year_filter = " AND extract(year from period_end_date)::int = :year"
+[read.endpoint.param.absent]
+year_filter = ""
+
+[[read.endpoint.param]]
+name = "quarter"
+kind = "query"
+type = "int"
+required = false
+[read.endpoint.param.present]
+quarter_filter = " AND extract(quarter from period_end_date)::int = :quarter"
+[read.endpoint.param.absent]
+quarter_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 200
+min = 1
+max = 1000
 
 [[read.endpoint]]
 id = "institutional.holder_performance"
@@ -881,21 +2194,30 @@ path = "/institutional/holder/:cik/performance"
 tables = ["ownership.holder_performance_summary"]
 ttl = "6h"
 shape = "envelope"
+envelope_key = "data"
 strip_lineage = true
 row_cap = 500
+cache = true
 sql = """
-  SELECT date, investor_name, portfolio_size, securities_added, securities_removed,
-         market_value, previous_market_value, change_in_market_value, change_in_market_value_percentage,
-         average_holding_period, average_holding_period_top10, average_holding_period_top20,
-         turnover, performance, performance_percentage, performance1year, performance_percentage1year,
-         performance3year, performance_percentage3year, performance5year, performance_percentage5year,
-         performance_relative_to_sp500_percentage FROM ownership.holder_performance_summary
-   WHERE cik = :cik ORDER BY date DESC LIMIT :limit
+SELECT date, investor_name, portfolio_size, securities_added, securities_removed, market_value, previous_market_value, change_in_market_value, change_in_market_value_percentage, average_holding_period, average_holding_period_top10, average_holding_period_top20, turnover, performance, performance_percentage, performance1year, performance_percentage1year, performance3year, performance_percentage3year, performance5year, performance_percentage5year, performance_relative_to_sp500_percentage
+  FROM ownership.holder_performance_summary
+ WHERE cik = :cik
+ ORDER BY date DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "cik"; kind = "path"; type = "str"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 100; min = 1; max = 500
+
+[[read.endpoint.param]]
+name = "cik"
+kind = "path"
+type = "str"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 100
+min = 1
+max = 500
 
 [[read.endpoint]]
 id = "institutional.holder_dates"
@@ -904,16 +2226,30 @@ path = "/institutional/holder/:cik/dates"
 tables = ["ownership.institutional_dates"]
 ttl = "6h"
 shape = "envelope"
+envelope_key = "data"
 strip_lineage = true
 row_cap = 500
+cache = true
 sql = """
-  SELECT date, filing_date, form_type, quarter, year FROM ownership.institutional_dates
-   WHERE cik = :cik ORDER BY date DESC LIMIT :limit
+SELECT date, filing_date, form_type, quarter, year
+  FROM ownership.institutional_dates
+ WHERE cik = :cik
+ ORDER BY date DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "cik"; kind = "path"; type = "str"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 100; min = 1; max = 500
+
+[[read.endpoint.param]]
+name = "cik"
+kind = "path"
+type = "str"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 100
+min = 1
+max = 500
 
 [[read.endpoint]]
 id = "institutional.industries_summary"
@@ -922,119 +2258,355 @@ path = "/institutional/industries"
 tables = ["ownership.institutional_industry_summary"]
 ttl = "6h"
 shape = "envelope"
+envelope_key = "data"
 strip_lineage = true
 row_cap = 1000
+cache = true
 sql = """
-  SELECT industry_title, date, industry_value FROM ownership.institutional_industry_summary
-   WHERE TRUE {{year_filter}} {{quarter_filter}}
-   ORDER BY date DESC, industry_value DESC NULLS LAST LIMIT 1000
+SELECT industry_title, date, industry_value
+  FROM ownership.institutional_industry_summary
+ WHERE TRUE{{year_filter}}{{quarter_filter}}
+ ORDER BY date DESC, industry_value DESC NULLS LAST
+ LIMIT 1000
 """
-  [[read.endpoint.param]]
-  name = "year"; kind = "query"; type = "int"; min = -2147483648; max = 2147483647
-  [read.endpoint.param.bind.year] = { year_filter = "AND extract(year from date)::int = :year" }
-  [read.endpoint.param.bind.__absent__] = { year_filter = "" }
-  [[read.endpoint.param]]
-  name = "quarter"; kind = "query"; type = "int"; min = -2147483648; max = 2147483647
-  [read.endpoint.param.bind.quarter] = { quarter_filter = "AND extract(quarter from date)::int = :quarter" }
-  [read.endpoint.param.bind.__absent__] = { quarter_filter = "" }
+
+[[read.endpoint.param]]
+name = "year"
+kind = "query"
+type = "int"
+required = false
+[read.endpoint.param.present]
+year_filter = " AND extract(year from date)::int = :year"
+[read.endpoint.param.absent]
+year_filter = ""
+
+[[read.endpoint.param]]
+name = "quarter"
+kind = "query"
+type = "int"
+required = false
+[read.endpoint.param.present]
+quarter_filter = " AND extract(quarter from date)::int = :quarter"
+[read.endpoint.param.absent]
+quarter_filter = ""
 
 [[read.endpoint]]
-id = "market_extras.market_movers"
+id = "marketextras.market_movers"
 method = "GET"
 path = "/market-movers"
 tables = ["market.market_movers"]
-ttl = "6h"
+ttl = "1h"
 shape = "envelope"
+envelope_key = "data"
 strip_lineage = true
 row_cap = 100
+cache = true
 sql = """
-  SELECT snapshot_ts, symbol, name, price, change, changes_percentage
-    FROM market.market_movers WHERE kind = :kind
-   ORDER BY snapshot_ts DESC, changes_percentage DESC NULLS LAST LIMIT :limit
+SELECT snapshot_ts, symbol, name, price, change, changes_percentage
+  FROM market.market_movers
+ WHERE kind = :kind
+ ORDER BY snapshot_ts DESC, changes_percentage DESC NULLS LAST
+ LIMIT :limit
 """
-  # NOTE: envelope here carries an extra top-level "kind" field (= echoed kind). See deferred note below.
-  [[read.endpoint.param]]
-  name = "kind"; kind = "query"; type = "str"; default = "gainer"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 20; min = 1; max = 100
+
+[[read.endpoint.param]]
+name = "kind"
+kind = "query"
+type = "str"
+default = "gainer"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 20
+min = 1
+max = 100
 
 [[read.endpoint]]
-id = "market_extras.dividends_calendar"
+id = "marketextras.dividends_calendar"
 method = "GET"
 path = "/dividends-calendar"
 tables = ["events.dividends_calendar"]
 ttl = "6h"
 shape = "envelope"
+envelope_key = "data"
 strip_lineage = true
 row_cap = 2000
+cache = true
 sql = """
-  SELECT symbol, date, record_date, payment_date, declaration_date,
-         adj_dividend, dividend, "yield", frequency
-    FROM events.dividends_calendar WHERE date >= :from AND date <= :to
-   ORDER BY date, symbol LIMIT :limit
+SELECT symbol, date, record_date, payment_date, declaration_date, adj_dividend, dividend, "yield", frequency
+  FROM events.dividends_calendar
+ WHERE date >= :from AND date <= :to
+ ORDER BY date, symbol
+ LIMIT :limit
 """
-  # NOTE: envelope is {count,data} (no symbol). from/to default to today()-7 / today()+60 computed in handler.
-  [[read.endpoint.param]]
-  name = "from"; kind = "query"; type = "date"
-  [[read.endpoint.param]]
-  name = "to"; kind = "query"; type = "date"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 200; min = 1; max = 2000
+
+[[read.endpoint.param]]
+name = "from"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+from = ":from"
+[read.endpoint.param.absent]
+from = "(current_date - interval '7 days')::date"
+
+[[read.endpoint.param]]
+name = "to"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+to = ":to"
+[read.endpoint.param.absent]
+to = "(current_date + interval '60 days')::date"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 200
+min = 1
+max = 2000
 
 [[read.endpoint]]
-id = "market_extras.splits_calendar"
+id = "marketextras.splits_calendar"
 method = "GET"
 path = "/splits-calendar"
 tables = ["events.splits_calendar"]
 ttl = "6h"
 shape = "envelope"
+envelope_key = "data"
 strip_lineage = true
 row_cap = 2000
+cache = true
 sql = """
-  SELECT symbol, date, numerator, denominator FROM events.splits_calendar
-   WHERE date >= :from AND date <= :to ORDER BY date, symbol LIMIT :limit
+SELECT symbol, date, numerator, denominator
+  FROM events.splits_calendar
+ WHERE date >= :from AND date <= :to
+ ORDER BY date, symbol
+ LIMIT :limit
 """
-  # NOTE: from/to default to today()-30 / today()+90 computed in handler.
-  [[read.endpoint.param]]
-  name = "from"; kind = "query"; type = "date"
-  [[read.endpoint.param]]
-  name = "to"; kind = "query"; type = "date"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 200; min = 1; max = 2000
+
+[[read.endpoint.param]]
+name = "from"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+from = ":from"
+[read.endpoint.param.absent]
+from = "(current_date - interval '30 days')::date"
+
+[[read.endpoint.param]]
+name = "to"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+to = ":to"
+[read.endpoint.param.absent]
+to = "(current_date + interval '90 days')::date"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 200
+min = 1
+max = 2000
 
 [[read.endpoint]]
-id = "market_extras.exec_comp"
+id = "marketextras.sectors_pe"
+method = "GET"
+path = "/sectors/pe"
+tables = ["market.sector_pe_snapshot"]
+ttl = "6h"
+shape = "envelope"
+envelope_key = "data"
+strip_lineage = true
+cache = true
+sql = """
+SELECT snapshot_date, sector, exchange, pe
+  FROM market.sector_pe_snapshot
+ WHERE snapshot_date = (SELECT max(snapshot_date) FROM market.sector_pe_snapshot){{exchange_filter}}
+ ORDER BY sector
+"""
+
+[[read.endpoint.param]]
+name = "exchange"
+kind = "query"
+type = "str"
+required = false
+[read.endpoint.param.present]
+exchange_filter = " AND exchange = :exchange"
+[read.endpoint.param.absent]
+exchange_filter = ""
+
+[[read.endpoint]]
+id = "marketextras.sectors_performance"
+method = "GET"
+path = "/sectors/performance"
+tables = ["market.sector_performance_snapshot"]
+ttl = "6h"
+shape = "envelope"
+envelope_key = "data"
+strip_lineage = true
+cache = true
+sql = """
+SELECT snapshot_date, sector, exchange, average_change
+  FROM market.sector_performance_snapshot
+ WHERE snapshot_date = (SELECT max(snapshot_date) FROM market.sector_performance_snapshot){{exchange_filter}}
+ ORDER BY average_change DESC NULLS LAST
+"""
+
+[[read.endpoint.param]]
+name = "exchange"
+kind = "query"
+type = "str"
+required = false
+[read.endpoint.param.present]
+exchange_filter = " AND exchange = :exchange"
+[read.endpoint.param.absent]
+exchange_filter = ""
+
+[[read.endpoint]]
+id = "marketextras.industries_pe"
+method = "GET"
+path = "/industries/pe"
+tables = ["market.industry_pe_snapshot"]
+ttl = "6h"
+shape = "envelope"
+envelope_key = "data"
+strip_lineage = true
+cache = true
+sql = """
+SELECT snapshot_date, industry, exchange, pe
+  FROM market.industry_pe_snapshot
+ WHERE snapshot_date = (SELECT max(snapshot_date) FROM market.industry_pe_snapshot){{exchange_filter}}
+ ORDER BY industry
+"""
+
+[[read.endpoint.param]]
+name = "exchange"
+kind = "query"
+type = "str"
+required = false
+[read.endpoint.param.present]
+exchange_filter = " AND exchange = :exchange"
+[read.endpoint.param.absent]
+exchange_filter = ""
+
+[[read.endpoint]]
+id = "marketextras.industries_performance"
+method = "GET"
+path = "/industries/performance"
+tables = ["market.industry_performance_snapshot"]
+ttl = "6h"
+shape = "envelope"
+envelope_key = "data"
+strip_lineage = true
+cache = true
+sql = """
+SELECT snapshot_date, industry, exchange, average_change
+  FROM market.industry_performance_snapshot
+ WHERE snapshot_date = (SELECT max(snapshot_date) FROM market.industry_performance_snapshot){{exchange_filter}}
+ ORDER BY average_change DESC NULLS LAST
+"""
+
+[[read.endpoint.param]]
+name = "exchange"
+kind = "query"
+type = "str"
+required = false
+[read.endpoint.param.present]
+exchange_filter = " AND exchange = :exchange"
+[read.endpoint.param.absent]
+exchange_filter = ""
+
+[[read.endpoint]]
+id = "marketextras.exec_comp_benchmark"
 method = "GET"
 path = "/exec-comp-benchmark/:industry"
 tables = ["reference.executive_compensation_benchmark"]
 ttl = "24h"
 shape = "envelope"
+envelope_key = "data"
 strip_lineage = true
-row_cap = 1000
+cache = true
 sql = """
-  SELECT industry_title, year, average_compensation
-    FROM reference.executive_compensation_benchmark
-   WHERE upper(industry_title) = upper(:industry) OR upper(industry_title) LIKE upper(:industry)||'%'
-   ORDER BY year DESC
+SELECT industry_title, year, average_compensation
+  FROM reference.executive_compensation_benchmark
+ WHERE upper(industry_title) = upper(:industry) OR upper(industry_title) LIKE upper(:industry)||'%'
+ ORDER BY year DESC
 """
-  [[read.endpoint.param]]
-  name = "industry"; kind = "path"; type = "str"
+
+[[read.endpoint.param]]
+name = "industry"
+kind = "path"
+type = "str"
 
 [[read.endpoint]]
-id = "market_extras.universe_active"
+id = "marketextras.universe_actively_trading"
 method = "GET"
 path = "/universe/actively-trading"
 tables = ["reference.actively_trading_list"]
 ttl = "24h"
 shape = "envelope"
+envelope_key = "data"
 strip_lineage = true
 row_cap = 70000
+cache = true
 sql = """
-  SELECT DISTINCT ON (symbol) symbol, name, snapshot_date
-    FROM reference.actively_trading_list ORDER BY symbol, snapshot_date DESC LIMIT :limit
+SELECT DISTINCT ON (symbol) symbol, name, snapshot_date
+  FROM reference.actively_trading_list
+ ORDER BY symbol, snapshot_date DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 1000; min = 1; max = 70000
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 1000
+min = 1
+max = 70000
+
+[[read.endpoint]]
+id = "marketextras.index_constituents"
+method = "GET"
+path = "/index/:index_symbol/constituents"
+tables = ["reference.index_constituents"]
+ttl = "24h"
+shape = "envelope"
+envelope_key = "data"
+strip_lineage = true
+cache = true
+sql = """
+SELECT index_symbol, constituent_symbol, name, sector, sub_sector, cik, added_date, removed_date
+  FROM reference.index_constituents
+ WHERE upper(index_symbol) = upper(:index_symbol)
+   AND (added_date IS NULL OR added_date <= :as_of)
+   AND (removed_date IS NULL OR removed_date > :as_of)
+ ORDER BY constituent_symbol
+"""
+
+[[read.endpoint.param]]
+name = "index_symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "as_of"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+as_of = ":as_of"
+[read.endpoint.param.absent]
+as_of = "current_date"
 
 [[read.endpoint]]
 id = "regulatory.filings"
@@ -1045,19 +2617,39 @@ ttl = "3h"
 shape = "rows"
 strip_lineage = true
 row_cap = 200
+cache = true
 sql = """
-  SELECT accession_no, form, filed_date, accepted_date, report_url, filing_url
-    FROM regulatory.sec_filings WHERE symbol = :symbol {{form_filter}}
-   ORDER BY filed_date DESC NULLS LAST LIMIT :limit
+SELECT accession_no, form, filed_date, accepted_date, report_url, filing_url
+  FROM regulatory.sec_filings
+ WHERE symbol = :symbol{{form_filter}}
+ ORDER BY filed_date DESC NULLS LAST
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 50; min = 1; max = 200
-  [[read.endpoint.param]]
-  name = "form"; kind = "query"; type = "str"
-  [read.endpoint.param.bind.form] = { form_filter = "AND upper(form) = upper(:form)" }
-  [read.endpoint.param.bind.__absent__] = { form_filter = "" }
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "form"
+kind = "query"
+type = "str"
+required = false
+transform = "upper"
+[read.endpoint.param.present]
+form_filter = " AND upper(form) = :form"
+[read.endpoint.param.absent]
+form_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 200
 
 [[read.endpoint]]
 id = "regulatory.esg_disclosures"
@@ -1068,18 +2660,38 @@ ttl = "3h"
 shape = "rows"
 strip_lineage = true
 row_cap = 500
+cache = true
 sql = """
-  SELECT year, category, metric, value::float8 AS value, unit FROM regulatory.esg_disclosures
-   WHERE symbol = :symbol {{year_filter}} ORDER BY year DESC NULLS LAST, category, metric LIMIT :limit
+SELECT year, category, metric, value::float8 AS value, unit
+  FROM regulatory.esg_disclosures
+ WHERE symbol = :symbol{{year_filter}}
+ ORDER BY year DESC NULLS LAST, category, metric
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 100; min = 1; max = 500
-  [[read.endpoint.param]]
-  name = "year"; kind = "query"; type = "int"; min = -2147483648; max = 2147483647
-  [read.endpoint.param.bind.year] = { year_filter = "AND year = :year" }
-  [read.endpoint.param.bind.__absent__] = { year_filter = "" }
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "year"
+kind = "query"
+type = "int"
+required = false
+[read.endpoint.param.present]
+year_filter = " AND year = :year"
+[read.endpoint.param.absent]
+year_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 100
+min = 1
+max = 500
 
 [[read.endpoint]]
 id = "regulatory.esg_ratings"
@@ -1090,15 +2702,28 @@ ttl = "3h"
 shape = "rows"
 strip_lineage = true
 row_cap = 60
+cache = true
 sql = """
-  SELECT year, environmental::float8 AS environmental, social::float8 AS social,
-         governance::float8 AS governance, total::float8 AS total, risk_rating, industry_rank
-    FROM regulatory.esg_ratings WHERE symbol = :symbol ORDER BY year DESC NULLS LAST LIMIT :limit
+SELECT year, environmental::float8 AS environmental, social::float8 AS social, governance::float8 AS governance, total::float8 AS total, risk_rating, industry_rank
+  FROM regulatory.esg_ratings
+ WHERE symbol = :symbol
+ ORDER BY year DESC NULLS LAST
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 20; min = 1; max = 60
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 20
+min = 1
+max = 60
 
 [[read.endpoint]]
 id = "regulatory.esg_historical"
@@ -1109,15 +2734,28 @@ ttl = "3h"
 shape = "rows"
 strip_lineage = true
 row_cap = 60
+cache = true
 sql = """
-  SELECT year, environmental::float8 AS environmental, social::float8 AS social,
-         governance::float8 AS governance, total::float8 AS total
-    FROM regulatory.esg_historical WHERE symbol = :symbol ORDER BY year DESC NULLS LAST LIMIT :limit
+SELECT year, environmental::float8 AS environmental, social::float8 AS social, governance::float8 AS governance, total::float8 AS total
+  FROM regulatory.esg_historical
+ WHERE symbol = :symbol
+ ORDER BY year DESC NULLS LAST
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 30; min = 1; max = 60
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 30
+min = 1
+max = 60
 
 [[read.endpoint]]
 id = "regulatory.lobbying"
@@ -1128,19 +2766,38 @@ ttl = "3h"
 shape = "rows"
 strip_lineage = true
 row_cap = 500
+cache = true
 sql = """
-  SELECT filing_date, senate_id, registrant, client, issue, year, amount::float8 AS amount
-    FROM regulatory.lobbying WHERE symbol = :symbol {{year_filter}}
-   ORDER BY filing_date DESC NULLS LAST LIMIT :limit
+SELECT filing_date, senate_id, registrant, client, issue, year, amount::float8 AS amount
+  FROM regulatory.lobbying
+ WHERE symbol = :symbol{{year_filter}}
+ ORDER BY filing_date DESC NULLS LAST
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 100; min = 1; max = 500
-  [[read.endpoint.param]]
-  name = "year"; kind = "query"; type = "int"; min = -2147483648; max = 2147483647
-  [read.endpoint.param.bind.year] = { year_filter = "AND year = :year" }
-  [read.endpoint.param.bind.__absent__] = { year_filter = "" }
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "year"
+kind = "query"
+type = "int"
+required = false
+[read.endpoint.param.present]
+year_filter = " AND year = :year"
+[read.endpoint.param.absent]
+year_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 100
+min = 1
+max = 500
 
 [[read.endpoint]]
 id = "regulatory.usa_spending"
@@ -1151,19 +2808,38 @@ ttl = "3h"
 shape = "rows"
 strip_lineage = true
 row_cap = 500
+cache = true
 sql = """
-  SELECT action_date, recipient, awarding_agency, amount::float8 AS amount, naics_code, description
-    FROM regulatory.usa_spending WHERE symbol = :symbol {{since_filter}}
-   ORDER BY action_date DESC LIMIT :limit
+SELECT action_date, recipient, awarding_agency, amount::float8 AS amount, naics_code, description
+  FROM regulatory.usa_spending
+ WHERE symbol = :symbol{{since_filter}}
+ ORDER BY action_date DESC
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 100; min = 1; max = 500
-  [[read.endpoint.param]]
-  name = "since"; kind = "query"; type = "date"
-  [read.endpoint.param.bind.since] = { since_filter = "AND action_date >= :since" }
-  [read.endpoint.param.bind.__absent__] = { since_filter = "" }
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "since"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND action_date >= :since"
+[read.endpoint.param.absent]
+since_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 100
+min = 1
+max = 500
 
 [[read.endpoint]]
 id = "regulatory.uspto_patents"
@@ -1174,18 +2850,38 @@ ttl = "3h"
 shape = "rows"
 strip_lineage = true
 row_cap = 500
+cache = true
 sql = """
-  SELECT filing_date, granted_date, patent_id, title FROM regulatory.uspto_patents
-   WHERE symbol = :symbol {{since_filter}} ORDER BY filing_date DESC NULLS LAST LIMIT :limit
+SELECT filing_date, granted_date, patent_id, title
+  FROM regulatory.uspto_patents
+ WHERE symbol = :symbol{{since_filter}}
+ ORDER BY filing_date DESC NULLS LAST
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 100; min = 1; max = 500
-  [[read.endpoint.param]]
-  name = "since"; kind = "query"; type = "date"
-  [read.endpoint.param.bind.since] = { since_filter = "AND filing_date >= :since" }
-  [read.endpoint.param.bind.__absent__] = { since_filter = "" }
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "since"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND filing_date >= :since"
+[read.endpoint.param.absent]
+since_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 100
+min = 1
+max = 500
 
 [[read.endpoint]]
 id = "regulatory.visa_applications"
@@ -1196,43 +2892,302 @@ ttl = "3h"
 shape = "rows"
 strip_lineage = true
 row_cap = 500
+cache = true
 sql = """
-  SELECT received_date, case_number, case_status, visa_class, employer_name, job_title,
-         wage_rate::float8 AS wage_rate FROM regulatory.visa_applications
-   WHERE symbol = :symbol {{since_filter}} ORDER BY received_date DESC NULLS LAST LIMIT :limit
+SELECT received_date, case_number, case_status, visa_class, employer_name, job_title, wage_rate::float8 AS wage_rate
+  FROM regulatory.visa_applications
+ WHERE symbol = :symbol{{since_filter}}
+ ORDER BY received_date DESC NULLS LAST
+ LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "symbol"; kind = "path"; type = "symbol"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 100; min = 1; max = 500
-  [[read.endpoint.param]]
-  name = "since"; kind = "query"; type = "date"
-  [read.endpoint.param.bind.since] = { since_filter = "AND received_date >= :since" }
-  [read.endpoint.param.bind.__absent__] = { since_filter = "" }
 
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
 
-# ===== group: predictionmarkets+kols (4 endpoints) =====
+[[read.endpoint.param]]
+name = "since"
+kind = "query"
+type = "date"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND received_date >= :since"
+[read.endpoint.param.absent]
+since_filter = ""
 
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 100
+min = 1
+max = 500
+
+# ===== predictionmarkets+kols (18) =====
 [[read.endpoint]]
-id = "prediction_markets.get_polymarket_market"
+id = "prediction-markets.markets.polymarket"
 method = "GET"
 path = "/prediction-markets/markets/polymarket/:condition_id"
 tables = ["prediction_markets.polymarket_markets"]
 ttl = "30s"
 shape = "one"
 strip_lineage = true
-row_cap = 1
+cache = true
 sql = """
-  SELECT condition_id, id AS market_id, question, slug, outcomes, outcome_prices,
-         clob_token_ids, volume_num AS volume, liquidity_num AS liquidity,
-         start_date, end_date, closed_time, active, closed, archived, enable_order_book
-    FROM prediction_markets.polymarket_markets WHERE condition_id = :condition_id LIMIT 1
+SELECT condition_id, id AS market_id, question, slug, outcomes, outcome_prices, clob_token_ids, volume_num AS volume, liquidity_num AS liquidity, start_date, end_date, closed_time, active, closed, archived, enable_order_book
+  FROM prediction_markets.polymarket_markets WHERE condition_id = :condition_id LIMIT 1
 """
-  [[read.endpoint.param]]
-  name = "condition_id"; kind = "path"; type = "str"
+
+[[read.endpoint.param]]
+name = "condition_id"
+kind = "path"
+type = "str"
 
 [[read.endpoint]]
-id = "prediction_markets.top_holders"
+id = "prediction-markets.markets.kalshi"
+method = "GET"
+path = "/prediction-markets/markets/kalshi/:ticker"
+tables = ["prediction_markets.kalshi_markets"]
+ttl = "30s"
+shape = "one"
+strip_lineage = true
+cache = true
+sql = """
+SELECT ticker, event_ticker, title, market_type, status, result, yes_bid, yes_ask, no_bid, no_ask, last_price, volume, volume_24h, open_interest, open_time, close_time, created_time FROM prediction_markets.kalshi_markets WHERE ticker = :ticker LIMIT 1
+"""
+
+[[read.endpoint.param]]
+name = "ticker"
+kind = "path"
+type = "str"
+transform = "upper"
+
+[[read.endpoint]]
+id = "prediction-markets.trades.polymarket"
+method = "GET"
+path = "/prediction-markets/trades/polymarket/:condition_id"
+tables = ["prediction_markets.polymarket_trades"]
+ttl = "30s"
+shape = "rows"
+strip_lineage = true
+row_cap = 5000
+cache = true
+sql = """
+SELECT trade_id, asset_id AS token_id, side, price, size, taker, ts FROM prediction_markets.polymarket_trades WHERE condition_id = :condition_id{{since_filter}}{{until_filter}} ORDER BY ts DESC LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "condition_id"
+kind = "path"
+type = "str"
+
+[[read.endpoint.param]]
+name = "from"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND ts >= :from"
+[read.endpoint.param.absent]
+since_filter = ""
+
+[[read.endpoint.param]]
+name = "to"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+until_filter = " AND ts <= :to"
+[read.endpoint.param.absent]
+until_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 500
+min = 1
+max = 5000
+
+[[read.endpoint]]
+id = "prediction-markets.trades.kalshi"
+method = "GET"
+path = "/prediction-markets/trades/kalshi/:ticker"
+tables = ["prediction_markets.kalshi_trades"]
+ttl = "30s"
+shape = "rows"
+strip_lineage = true
+row_cap = 5000
+cache = true
+sql = """
+SELECT trade_id, ticker, count, yes_price, no_price, taker_side, created_time FROM prediction_markets.kalshi_trades WHERE ticker = :ticker{{since_filter}}{{until_filter}} ORDER BY created_time DESC LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "ticker"
+kind = "path"
+type = "str"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "from"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND created_time >= :from"
+[read.endpoint.param.absent]
+since_filter = ""
+
+[[read.endpoint.param]]
+name = "to"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+until_filter = " AND created_time <= :to"
+[read.endpoint.param.absent]
+until_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 500
+min = 1
+max = 5000
+
+[[read.endpoint]]
+id = "prediction-markets.orderbook.polymarket"
+method = "GET"
+path = "/prediction-markets/orderbook/polymarket/:asset_id"
+tables = ["prediction_markets.polymarket_orderbook_snapshots"]
+ttl = "30s"
+shape = "rows"
+strip_lineage = true
+row_cap = 500
+cache = true
+sql = """
+SELECT asset_id, condition_id, snapshot_ts, bids, asks, tick_size, min_order_size FROM prediction_markets.polymarket_orderbook_snapshots WHERE asset_id = :asset_id{{since_filter}}{{until_filter}} ORDER BY snapshot_ts DESC LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "asset_id"
+kind = "path"
+type = "str"
+
+[[read.endpoint.param]]
+name = "from"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND snapshot_ts >= :from"
+[read.endpoint.param.absent]
+since_filter = ""
+
+[[read.endpoint.param]]
+name = "to"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+until_filter = " AND snapshot_ts <= :to"
+[read.endpoint.param.absent]
+until_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 100
+min = 1
+max = 500
+
+[[read.endpoint]]
+id = "prediction-markets.orderbook.kalshi"
+method = "GET"
+path = "/prediction-markets/orderbook/kalshi/:ticker"
+tables = ["prediction_markets.kalshi_orderbook_snapshots"]
+ttl = "30s"
+shape = "rows"
+strip_lineage = true
+row_cap = 500
+cache = true
+sql = """
+SELECT ticker, snapshot_ts, yes_levels, no_levels FROM prediction_markets.kalshi_orderbook_snapshots WHERE ticker = :ticker{{since_filter}}{{until_filter}} ORDER BY snapshot_ts DESC LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "ticker"
+kind = "path"
+type = "str"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "from"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+since_filter = " AND snapshot_ts >= :from"
+[read.endpoint.param.absent]
+since_filter = ""
+
+[[read.endpoint.param]]
+name = "to"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+until_filter = " AND snapshot_ts <= :to"
+[read.endpoint.param.absent]
+until_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 100
+min = 1
+max = 500
+
+[[read.endpoint]]
+id = "prediction-markets.open-interest"
+method = "GET"
+path = "/prediction-markets/open-interest/:venue/:market_id"
+tables = ["prediction_markets.open_interest_history"]
+ttl = "30s"
+shape = "rows"
+strip_lineage = true
+row_cap = 5000
+cache = true
+sql = """
+SELECT bucket_ts, open_interest FROM prediction_markets.open_interest_history WHERE venue = :venue AND market_id = :market_id ORDER BY bucket_ts ASC LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "venue"
+kind = "path"
+type = "str"
+
+[[read.endpoint.param]]
+name = "market_id"
+kind = "path"
+type = "str"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 500
+min = 1
+max = 5000
+
+[[read.endpoint]]
+id = "prediction-markets.top-holders"
 method = "GET"
 path = "/prediction-markets/top-holders/:venue/:market_id"
 tables = ["prediction_markets.top_holders"]
@@ -1240,22 +3195,214 @@ ttl = "30s"
 shape = "rows"
 strip_lineage = true
 row_cap = 200
+cache = true
 sql = """
-  WITH latest AS (SELECT max(snapshot_ts) AS ts FROM prediction_markets.top_holders
-                   WHERE venue = :venue AND market_id = :market_id)
-  SELECT th.wallet, th.rank, th.position_size, th.position_value_usd, th.outcome_id, th.snapshot_ts
-    FROM prediction_markets.top_holders th, latest
-   WHERE th.venue = :venue AND th.market_id = :market_id AND th.snapshot_ts = latest.ts ORDER BY th.rank LIMIT :limit
+WITH latest AS (SELECT max(snapshot_ts) AS ts FROM prediction_markets.top_holders WHERE venue = :venue AND market_id = :market_id)
+SELECT th.wallet, th.rank, th.position_size, th.position_value_usd, th.outcome_id, th.snapshot_ts
+  FROM prediction_markets.top_holders th, latest
+ WHERE th.venue = :venue AND th.market_id = :market_id AND th.snapshot_ts = latest.ts ORDER BY th.rank LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "venue"; kind = "path"; type = "str"
-  [[read.endpoint.param]]
-  name = "market_id"; kind = "path"; type = "str"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 50; min = 1; max = 200
+
+[[read.endpoint.param]]
+name = "venue"
+kind = "path"
+type = "str"
+
+[[read.endpoint.param]]
+name = "market_id"
+kind = "path"
+type = "str"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 200
 
 [[read.endpoint]]
-id = "prediction_markets.matched_pairs"
+id = "prediction-markets.wallet.profile"
+method = "GET"
+path = "/prediction-markets/wallet/:address"
+tables = ["prediction_markets.wallet_profiles"]
+ttl = "30s"
+shape = "one"
+strip_lineage = true
+cache = true
+sql = """
+SELECT wallet, primary_style, trading_styles, total_pnl, realized_pnl, volume, trades, win_rate, first_trade_at, last_trade_at FROM prediction_markets.wallet_profiles WHERE wallet = :address LIMIT 1
+"""
+
+[[read.endpoint.param]]
+name = "address"
+kind = "path"
+type = "str"
+transform = "lower"
+
+[[read.endpoint]]
+id = "prediction-markets.wallet.pnl"
+method = "GET"
+path = "/prediction-markets/wallet/:address/pnl"
+tables = ["prediction_markets.wallet_pnl_history"]
+ttl = "30s"
+shape = "rows"
+strip_lineage = true
+row_cap = 3000
+cache = true
+sql = """
+SELECT bucket_ts, realized_pnl FROM prediction_markets.wallet_pnl_history WHERE wallet = :address AND granularity = :granularity ORDER BY bucket_ts ASC LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "address"
+kind = "path"
+type = "str"
+transform = "lower"
+
+[[read.endpoint.param]]
+name = "granularity"
+kind = "query"
+type = "str"
+default = "day"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 365
+min = 1
+max = 3000
+
+[[read.endpoint]]
+id = "prediction-markets.wallet.positions"
+method = "GET"
+path = "/prediction-markets/wallet/:address/positions"
+tables = ["prediction_markets.wallet_positions"]
+ttl = "30s"
+shape = "rows"
+strip_lineage = true
+row_cap = 500
+cache = true
+sql = """
+WITH latest AS (SELECT max(snapshot_ts) AS ts FROM prediction_markets.wallet_positions WHERE wallet = :address)
+SELECT p.condition_id, p.token_id, p.position_size, p.avg_entry_price, p.unrealized_pnl, p.realized_pnl, p.snapshot_ts FROM prediction_markets.wallet_positions p, latest
+ WHERE p.wallet = :address AND p.snapshot_ts = latest.ts ORDER BY p.position_size DESC NULLS LAST LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "address"
+kind = "path"
+type = "str"
+transform = "lower"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 200
+min = 1
+max = 500
+
+[[read.endpoint]]
+id = "prediction-markets.wallet.activity"
+method = "GET"
+path = "/prediction-markets/wallet/:address/activity"
+tables = ["prediction_markets.activity_events"]
+ttl = "30s"
+shape = "rows"
+strip_lineage = true
+row_cap = 1000
+cache = true
+sql = """
+SELECT event_type, condition_id, neg_risk_market_id, amount, tx_hash, ts FROM prediction_markets.activity_events WHERE wallet = :address ORDER BY ts DESC LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "address"
+kind = "path"
+type = "str"
+transform = "lower"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 200
+min = 1
+max = 1000
+
+[[read.endpoint]]
+id = "prediction-markets.leaderboard"
+method = "GET"
+path = "/prediction-markets/leaderboard"
+tables = ["prediction_markets.wallet_leaderboard"]
+ttl = "30s"
+shape = "rows"
+strip_lineage = true
+row_cap = 500
+cache = true
+sql = """
+WITH latest AS (SELECT max(snapshot_ts) AS ts FROM prediction_markets.wallet_leaderboard WHERE window_name = :window AND venue = :venue)
+SELECT lb.rank, lb.wallet, lb.total_pnl, lb.realized_pnl, lb.volume, lb.roi, lb.trades, lb.win_rate, lb.primary_style, lb.is_whale, lb.first_trade_at
+  FROM prediction_markets.wallet_leaderboard lb, latest
+ WHERE lb.window_name = :window AND lb.venue = :venue AND lb.snapshot_ts = latest.ts AND lb.rank <= :limit
+ ORDER BY lb.rank LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "window"
+kind = "query"
+type = "enum"
+default = "all_time"
+[read.endpoint.param.select.all_time]
+window = "all_time"
+[read.endpoint.param.select.all]
+window = "all_time"
+[read.endpoint.param.select.alltime]
+window = "all_time"
+[read.endpoint.param.select.thirty_day]
+window = "thirty_day"
+[read.endpoint.param.select.30d]
+window = "thirty_day"
+[read.endpoint.param.select.month]
+window = "thirty_day"
+[read.endpoint.param.select.seven_day]
+window = "seven_day"
+[read.endpoint.param.select.7d]
+window = "seven_day"
+[read.endpoint.param.select.week]
+window = "seven_day"
+[read.endpoint.param.select.one_day]
+window = "one_day"
+[read.endpoint.param.select.24h]
+window = "one_day"
+[read.endpoint.param.select.1d]
+window = "one_day"
+[read.endpoint.param.select.day]
+window = "one_day"
+
+[[read.endpoint.param]]
+name = "venue"
+kind = "query"
+type = "enum"
+default = "polymarket"
+transform = "lower"
+[read.endpoint.param.select.polymarket]
+venue = "polymarket"
+[read.endpoint.param.select.kalshi]
+venue = "kalshi"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 500
+
+[[read.endpoint]]
+id = "prediction-markets.matched-pairs"
 method = "GET"
 path = "/prediction-markets/matched-pairs/:venue/:venue_id"
 tables = ["prediction_markets.matched_pairs"]
@@ -1263,33 +3410,277 @@ ttl = "30s"
 shape = "rows"
 strip_lineage = true
 row_cap = 100
+cache = true
 sql = """
-  SELECT venue_b AS other_venue, venue_b_id AS other_id, similarity, match_kind
-    FROM prediction_markets.matched_pairs WHERE venue_a = :venue AND venue_a_id = :venue_id
-   UNION ALL
-  SELECT venue_a, venue_a_id, similarity, match_kind FROM prediction_markets.matched_pairs
-   WHERE venue_b = :venue AND venue_b_id = :venue_id ORDER BY similarity DESC NULLS LAST LIMIT :limit
+SELECT venue_b AS other_venue, venue_b_id AS other_id, similarity, match_kind
+  FROM prediction_markets.matched_pairs WHERE venue_a = :venue AND venue_a_id = :venue_id
+ UNION ALL
+SELECT venue_a, venue_a_id, similarity, match_kind FROM prediction_markets.matched_pairs
+ WHERE venue_b = :venue AND venue_b_id = :venue_id ORDER BY similarity DESC NULLS LAST LIMIT :limit
 """
-  [[read.endpoint.param]]
-  name = "venue"; kind = "path"; type = "str"
-  [[read.endpoint.param]]
-  name = "venue_id"; kind = "path"; type = "str"
-  [[read.endpoint.param]]
-  name = "limit"; kind = "query"; type = "int"; default = 20; min = 1; max = 100
+
+[[read.endpoint.param]]
+name = "venue"
+kind = "path"
+type = "str"
+
+[[read.endpoint.param]]
+name = "venue_id"
+kind = "path"
+type = "str"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 20
+min = 1
+max = 100
 
 [[read.endpoint]]
-id = "kols.list_kols"
+id = "prediction-markets.events"
+method = "GET"
+path = "/prediction-markets/events"
+tables = ["prediction_markets.polymarket_events"]
+ttl = "30s"
+shape = "rows"
+strip_lineage = true
+row_cap = 200
+cache = true
+sql = """
+SELECT event_id, slug, title, category, total_volume, active, closed, start_date, end_date
+  FROM prediction_markets.polymarket_events{{q_filter}}{{status_filter}}
+ ORDER BY COALESCE(closed, FALSE) ASC, end_date DESC NULLS LAST, total_volume DESC NULLS LAST LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "q"
+kind = "query"
+type = "str"
+required = false
+[read.endpoint.param.present]
+q_filter = " WHERE (title ILIKE '%' || :q || '%' OR slug ILIKE '%' || :q || '%')"
+[read.endpoint.param.absent]
+q_filter = ""
+
+[[read.endpoint.param]]
+name = "status"
+kind = "query"
+type = "enum"
+default = "all"
+[read.endpoint.param.select.all]
+status_filter = ""
+[read.endpoint.param.select.open]
+status_filter = " AND active = true"
+[read.endpoint.param.select.closed]
+status_filter = " AND closed = true"
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 200
+
+[[read.endpoint]]
+id = "kols.list"
 method = "GET"
 path = "/kols"
 tables = ["news.kol_roster"]
 ttl = "60s"
 shape = "rows"
 strip_lineage = true
-row_cap = 2000
+row_cap = 5000
+cache = true
 sql = """
-  SELECT handle, display_name, twitter_id, follower_tier, notes, active, added_at,
-         added_by, updated_at FROM news.kol_roster WHERE (:include_inactive::boolean OR active)
-   ORDER BY follower_tier NULLS LAST, handle
+SELECT handle, display_name, twitter_id, follower_tier, notes, active, added_at, added_by, updated_at FROM news.kol_roster WHERE (:include_inactive::boolean OR active)
+ ORDER BY follower_tier NULLS LAST, handle
 """
-  [[read.endpoint.param]]
-  name = "include_inactive"; kind = "query"; type = "bool"; default = false
+
+[[read.endpoint.param]]
+name = "include_inactive"
+kind = "query"
+type = "bool"
+default = false
+
+[[read.endpoint]]
+id = "kols.tweets.search"
+method = "GET"
+path = "/kols/tweets/search"
+tables = ["news.kol_tweets"]
+ttl = "60s"
+shape = "rows"
+strip_lineage = true
+row_cap = 200
+cache = true
+sql = """
+SELECT tweet_id, created_at, kol_username, author_username, author_name, author_verified, tweet_type, lang, text, url, cashtags, hashtags, media_urls, retweet_count, like_count, view_count FROM news.kol_tweets WHERE to_tsvector('english', coalesce(text,'')) @@ websearch_to_tsquery('english', :q) AND created_at >= :since{{until_filter}}
+ ORDER BY created_at DESC LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "q"
+kind = "query"
+type = "str"
+
+[[read.endpoint.param]]
+name = "since"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+since = ":since"
+[read.endpoint.param.absent]
+since = "now() - interval '30 days'"
+
+[[read.endpoint.param]]
+name = "until"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+until_filter = " AND created_at <= :until"
+[read.endpoint.param.absent]
+until_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 200
+
+[[read.endpoint]]
+id = "kols.tweets.by-symbol.history"
+method = "GET"
+path = "/kols/tweets/by-symbol/:symbol/history"
+tables = ["news.kol_tweets"]
+ttl = "60s"
+shape = "rows"
+strip_lineage = true
+row_cap = 500
+cache = true
+sql = """
+SELECT tweet_id, created_at, kol_username, author_username, author_name, author_followers, author_verified, tweet_type, lang, text, url, cashtags, hashtags, media_urls, retweet_count, like_count, quote_count, view_count
+   FROM news.kol_tweets WHERE cashtags @> ARRAY[:symbol]::text[] AND created_at >= :since{{until_filter}}{{handle_filter}} ORDER BY created_at DESC LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "symbol"
+kind = "path"
+type = "symbol"
+transform = "upper"
+
+[[read.endpoint.param]]
+name = "since"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+since = ":since"
+[read.endpoint.param.absent]
+since = "now() - interval '30 days'"
+
+[[read.endpoint.param]]
+name = "until"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+until_filter = " AND created_at <= :until"
+[read.endpoint.param.absent]
+until_filter = ""
+
+[[read.endpoint.param]]
+name = "handle"
+kind = "query"
+type = "str"
+required = false
+transform = "lower"
+[read.endpoint.param.present]
+handle_filter = " AND kol_username = :handle"
+[read.endpoint.param.absent]
+handle_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 500
+
+[[read.endpoint]]
+id = "kols.handle.tweets.history"
+method = "GET"
+path = "/kols/:handle/tweets/history"
+tables = ["news.kol_tweets"]
+ttl = "60s"
+shape = "rows"
+strip_lineage = true
+row_cap = 500
+cache = true
+sql = """
+SELECT tweet_id, created_at, kol_username, author_username, author_name, author_followers, author_verified, tweet_type, lang, text, url, cashtags, hashtags, mentioned_users, media_urls, retweet_count, reply_count, like_count, quote_count, bookmark_count, view_count
+   FROM news.kol_tweets WHERE kol_username = :handle AND created_at >= :since{{until_filter}}{{cashtag_filter}} ORDER BY created_at DESC LIMIT :limit
+"""
+
+[[read.endpoint.param]]
+name = "handle"
+kind = "path"
+type = "str"
+transform = "lower"
+
+[[read.endpoint.param]]
+name = "since"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+since = ":since"
+[read.endpoint.param.absent]
+since = "now() - interval '30 days'"
+
+[[read.endpoint.param]]
+name = "until"
+kind = "query"
+type = "timestamp"
+required = false
+[read.endpoint.param.present]
+until_filter = " AND created_at <= :until"
+[read.endpoint.param.absent]
+until_filter = ""
+
+[[read.endpoint.param]]
+name = "cashtag"
+kind = "query"
+type = "str"
+required = false
+transform = "upper"
+[read.endpoint.param.present]
+cashtag_filter = " AND cashtags @> ARRAY[:cashtag]::text[]"
+[read.endpoint.param.absent]
+cashtag_filter = ""
+
+[[read.endpoint.param]]
+name = "limit"
+kind = "query"
+type = "int"
+default = 50
+min = 1
+max = 500
+
+[[read.endpoint]]
+id = "kols.archive.stats"
+method = "GET"
+path = "/kols/archive/stats"
+tables = ["news.kol_tweets"]
+ttl = "60s"
+shape = "one"
+strip_lineage = true
+cache = true
+sql = """
+SELECT (SELECT count(*) FROM news.kol_tweets) AS total_rows, (SELECT count(*) FROM (SELECT DISTINCT kol_username FROM news.kol_tweets) k) AS distinct_kols, (SELECT created_at FROM news.kol_tweets ORDER BY created_at ASC LIMIT 1) AS earliest, (SELECT created_at FROM news.kol_tweets ORDER BY created_at DESC LIMIT 1) AS latest, NULL AS last_ingest
+"""
