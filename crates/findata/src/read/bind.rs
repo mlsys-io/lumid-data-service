@@ -166,7 +166,10 @@ pub fn resolve(
                         )));
                     }
                     enum_choice.insert(p.name.clone(), choice.clone());
-                    canon_parts.push((p.name.clone(), choice));
+                    canon_parts.push((p.name.clone(), choice.clone()));
+                    // An enum's value also drives fragment selection, but may
+                    // ALSO be bound directly (`:name`) — make it available.
+                    values.insert(p.name.clone(), Bv::Text(choice));
                 } else {
                     let v = coerce(p, &r)?;
                     canon_parts.push((p.name.clone(), v.canon()));
@@ -262,6 +265,14 @@ fn lower_binds(
                 params.push(v.boxed());
                 out.push('$');
                 out.push_str(&params.len().to_string());
+                // Cast numeric binds so a single Rust width matches any column
+                // width (i64 vs int4 / numeric): `$N::int8` / `$N::float8`.
+                // Postgres implicitly promotes in comparisons (int4 = int8 etc).
+                match v {
+                    Bv::Int(_) => out.push_str("::int8"),
+                    Bv::Float(_) => out.push_str("::float8"),
+                    _ => {}
+                }
                 i = j;
                 continue;
             }

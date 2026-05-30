@@ -31,7 +31,6 @@ kind = "path"
 type = "symbol"
 transform = "upper"
 
-
 [[read.endpoint]]
 id = "fundamentals.history"
 method = "GET"
@@ -90,7 +89,6 @@ type = "int"
 default = 40
 min = 1
 max = 200
-
 
 [[read.endpoint]]
 id = "analysis.key_metrics"
@@ -431,95 +429,6 @@ since_filter = " AND date >= :since"
 since_filter = ""
 
 [[read.endpoint]]
-id = "investors.holders_top"
-method = "GET"
-path = "/holders/:symbol/top"
-tables = ["ownership.institutional_positions"]
-ttl = "6h"
-shape = "envelope"
-envelope_key = "holders"
-strip_lineage = false
-row_cap = 100
-cache = true
-sql = """
-SELECT institution_name, shares::float8 AS shares,
-       market_value::float8 AS market_value
-  FROM ownership.institutional_positions
- WHERE symbol = :symbol AND source = 'finnhub'
-   AND report_period = {{asof_value}}
- ORDER BY market_value DESC NULLS LAST
- LIMIT :limit
-"""
-
-[[read.endpoint.param]]
-name = "symbol"
-kind = "path"
-type = "symbol"
-transform = "upper"
-
-[[read.endpoint.param]]
-name = "limit"
-kind = "query"
-type = "int"
-default = 25
-min = 1
-max = 100
-
-[[read.endpoint.param]]
-name = "asof"
-kind = "query"
-type = "date"
-required = false
-[read.endpoint.param.present]
-asof_value = ":asof"
-[read.endpoint.param.absent]
-asof_value = "(SELECT max(report_period) FROM ownership.institutional_positions WHERE symbol = :symbol AND source = 'finnhub')"
-
-[[read.endpoint]]
-id = "investors.fund_ownership"
-method = "GET"
-path = "/fund-ownership/:symbol"
-tables = ["ownership.fund_ownership"]
-ttl = "6h"
-shape = "envelope"
-envelope_key = "funds"
-strip_lineage = false
-row_cap = 200
-cache = true
-sql = """
-SELECT fund_name, shares::float8 AS shares, market_value::float8 AS market_value,
-       weight_pct::float8 AS weight_pct
-  FROM ownership.fund_ownership
- WHERE symbol = :symbol AND as_of = {{asof_value}}
- ORDER BY market_value DESC NULLS LAST
- LIMIT :limit
-"""
-
-[[read.endpoint.param]]
-name = "symbol"
-kind = "path"
-type = "symbol"
-transform = "upper"
-
-[[read.endpoint.param]]
-name = "limit"
-kind = "query"
-type = "int"
-default = 50
-min = 1
-max = 200
-
-[[read.endpoint.param]]
-name = "asof"
-kind = "query"
-type = "date"
-required = false
-[read.endpoint.param.present]
-asof_value = ":asof"
-[read.endpoint.param.absent]
-asof_value = "(SELECT max(as_of) FROM ownership.fund_ownership WHERE symbol = :symbol)"
-
-[[read.endpoint]]
 id = "investors.funds_disclosure"
 method = "GET"
 path = "/funds-disclosure/:symbol"
@@ -609,7 +518,6 @@ default = 50
 min = 1
 max = 200
 
-
 [[read.endpoint]]
 id = "news.latest"
 method = "GET"
@@ -668,7 +576,6 @@ default = 50
 min = 1
 max = 200
 
-
 [[read.endpoint]]
 id = "news.search"
 method = "GET"
@@ -691,6 +598,7 @@ SELECT published_at, publisher, headline, summary, url, category, symbol
 name = "q"
 kind = "query"
 type = "str"
+required = true
 
 [[read.endpoint.param]]
 name = "since"
@@ -732,7 +640,6 @@ default = 50
 min = 1
 max = 200
 
-
 [[read.endpoint]]
 id = "news.stats"
 method = "GET"
@@ -754,7 +661,6 @@ SELECT category,
  GROUP BY category
  ORDER BY rows_last_30d DESC NULLS LAST
 """
-
 
 [[read.endpoint]]
 id = "news.social_sentiment"
@@ -799,7 +705,6 @@ type = "int"
 default = 200
 min = 1
 max = 1000
-
 
 [[read.endpoint]]
 id = "news.symbol_sentiment"
@@ -878,7 +783,6 @@ since_filter = " AND date >= :since"
 [read.endpoint.param.absent]
 since_filter = ""
 
-
 [[read.endpoint]]
 id = "corpactions.splits"
 method = "GET"
@@ -911,7 +815,6 @@ default = 50
 min = 1
 max = 200
 
-
 [[read.endpoint]]
 id = "corpactions.market_cap_history"
 method = "GET"
@@ -923,11 +826,14 @@ strip_lineage = true
 row_cap = 5000
 cache = true
 sql = """
-SELECT date, market_cap::float8 AS market_cap
-  FROM market.market_cap
- WHERE symbol = :symbol{{start_filter}}{{end_filter}}
+SELECT * FROM (
+  SELECT date, market_cap::float8 AS market_cap
+    FROM market.market_cap
+   WHERE symbol = :symbol{{start_filter}}{{end_filter}}
+   ORDER BY date DESC
+   LIMIT :limit
+) sub
  ORDER BY date ASC
- LIMIT :limit
 """
 
 [[read.endpoint.param]]
@@ -964,7 +870,6 @@ end_filter = " AND date <= :end"
 [read.endpoint.param.absent]
 end_filter = ""
 
-
 [[read.endpoint]]
 id = "valuation.dcf"
 method = "GET"
@@ -996,7 +901,6 @@ type = "int"
 default = 20
 min = 1
 max = 60
-
 
 [[read.endpoint]]
 id = "valuation.enterprise_value"
@@ -1042,7 +946,6 @@ period_filter = " AND period_type = 'FY'"
 [read.endpoint.param.select.all]
 period_filter = ""
 
-
 [[read.endpoint]]
 id = "valuation.financial_scores"
 method = "GET"
@@ -1074,7 +977,6 @@ type = "int"
 default = 20
 min = 1
 max = 60
-
 
 [[read.endpoint]]
 id = "valuation.owner_earnings"
@@ -1120,7 +1022,6 @@ period_filter = " AND period_type = 'FY'"
 [read.endpoint.param.select.all]
 period_filter = ""
 
-
 [[read.endpoint]]
 id = "etf.info"
 method = "GET"
@@ -1143,7 +1044,6 @@ name = "symbol"
 kind = "path"
 type = "symbol"
 transform = "upper"
-
 
 [[read.endpoint]]
 id = "etf.sector_weightings"
@@ -1168,7 +1068,6 @@ kind = "path"
 type = "symbol"
 transform = "upper"
 
-
 [[read.endpoint]]
 id = "etf.country_weightings"
 method = "GET"
@@ -1191,7 +1090,6 @@ name = "symbol"
 kind = "path"
 type = "symbol"
 transform = "upper"
-
 
 [[read.endpoint]]
 id = "etf.symbol_etf_exposure"
@@ -1220,7 +1118,6 @@ type = "int"
 default = 100
 min = 1
 max = 500
-
 
 [[read.endpoint]]
 id = "earnings.calendar"
@@ -1279,7 +1176,6 @@ default = 50
 min = 1
 max = 500
 
-
 [[read.endpoint]]
 id = "earnings.history"
 method = "GET"
@@ -1311,7 +1207,6 @@ type = "int"
 default = 40
 min = 1
 max = 200
-
 
 [[read.endpoint]]
 id = "earnings.quality"
@@ -1379,7 +1274,6 @@ current_filter = " AND until IS NULL"
 [read.endpoint.param.absent]
 current_filter = ""
 
-
 [[read.endpoint]]
 id = "reference.compensation"
 method = "GET"
@@ -1411,7 +1305,6 @@ type = "int"
 default = 50
 min = 1
 max = 200
-
 
 [[read.endpoint]]
 id = "reference.supply_chain"
@@ -1455,7 +1348,6 @@ default = 50
 min = 1
 max = 200
 
-
 [[read.endpoint]]
 id = "reference.shares_float"
 method = "GET"
@@ -1488,7 +1380,6 @@ default = 20
 min = 1
 max = 60
 
-
 [[read.endpoint]]
 id = "reference.employee_count"
 method = "GET"
@@ -1520,7 +1411,6 @@ type = "int"
 default = 30
 min = 1
 max = 200
-
 
 [[read.endpoint]]
 id = "reference.symbol_changes"
@@ -1568,7 +1458,6 @@ type = "int"
 default = 100
 min = 1
 max = 500
-
 
 [[read.endpoint]]
 id = "reference.exchange_holidays"
@@ -1622,7 +1511,6 @@ default = 200
 min = 1
 max = 500
 
-
 [[read.endpoint]]
 id = "macro.treasury_rates"
 method = "GET"
@@ -1669,7 +1557,6 @@ default = 200
 min = 1
 max = 5000
 
-
 [[read.endpoint]]
 id = "macro.economic_indicators"
 method = "GET"
@@ -1715,7 +1602,6 @@ type = "int"
 default = 200
 min = 1
 max = 5000
-
 
 [[read.endpoint]]
 id = "macro.economic_calendar"
@@ -1783,7 +1669,6 @@ default = 200
 min = 1
 max = 5000
 
-
 [[read.endpoint]]
 id = "macro.cot"
 method = "GET"
@@ -1815,7 +1700,6 @@ type = "int"
 default = 20
 min = 1
 max = 100
-
 
 [[read.endpoint]]
 id = "events.ipos"
@@ -1866,7 +1750,6 @@ type = "int"
 default = 100
 min = 1
 max = 1000
-
 
 [[read.endpoint]]
 id = "events.mergers_acquisitions"
@@ -1925,7 +1808,6 @@ type = "int"
 default = 100
 min = 1
 max = 1000
-
 
 [[read.endpoint]]
 id = "events.fda_calendar"
@@ -2062,7 +1944,7 @@ cache = true
 sql = """
 SELECT ts, indicator, period_length, timeframe, value, open, high, low, close, volume
   FROM market.technical_indicators
- WHERE symbol = :symbol AND ts >= :start AND ts <= :end{{indicator_filter}}
+ WHERE symbol = :symbol{{start_filter}}{{end_filter}}{{indicator_filter}}
  ORDER BY ts DESC, indicator
  LIMIT :limit
 """
@@ -2089,9 +1971,9 @@ kind = "query"
 type = "timestamp"
 required = false
 [read.endpoint.param.present]
-start = ":start"
+start_filter = " AND ts >= :start"
 [read.endpoint.param.absent]
-start = "now() - interval '365 days'"
+start_filter = " AND ts >= now() - interval '365 days'"
 
 [[read.endpoint.param]]
 name = "end"
@@ -2099,9 +1981,9 @@ kind = "query"
 type = "timestamp"
 required = false
 [read.endpoint.param.present]
-end = ":end"
+end_filter = " AND ts <= :end"
 [read.endpoint.param.absent]
-end = "now()"
+end_filter = " AND ts <= now()"
 
 [[read.endpoint.param]]
 name = "limit"
@@ -2337,7 +2219,7 @@ cache = true
 sql = """
 SELECT symbol, date, record_date, payment_date, declaration_date, adj_dividend, dividend, "yield", frequency
   FROM events.dividends_calendar
- WHERE date >= :from AND date <= :to
+ WHERE 1=1{{from_filter}}{{to_filter}}
  ORDER BY date, symbol
  LIMIT :limit
 """
@@ -2348,9 +2230,9 @@ kind = "query"
 type = "date"
 required = false
 [read.endpoint.param.present]
-from = ":from"
+from_filter = " AND date >= :from"
 [read.endpoint.param.absent]
-from = "(current_date - interval '7 days')::date"
+from_filter = " AND date >= (current_date - interval '7 days')::date"
 
 [[read.endpoint.param]]
 name = "to"
@@ -2358,9 +2240,9 @@ kind = "query"
 type = "date"
 required = false
 [read.endpoint.param.present]
-to = ":to"
+to_filter = " AND date <= :to"
 [read.endpoint.param.absent]
-to = "(current_date + interval '60 days')::date"
+to_filter = " AND date <= (current_date + interval '60 days')::date"
 
 [[read.endpoint.param]]
 name = "limit"
@@ -2384,7 +2266,7 @@ cache = true
 sql = """
 SELECT symbol, date, numerator, denominator
   FROM events.splits_calendar
- WHERE date >= :from AND date <= :to
+ WHERE 1=1{{from_filter}}{{to_filter}}
  ORDER BY date, symbol
  LIMIT :limit
 """
@@ -2395,9 +2277,9 @@ kind = "query"
 type = "date"
 required = false
 [read.endpoint.param.present]
-from = ":from"
+from_filter = " AND date >= :from"
 [read.endpoint.param.absent]
-from = "(current_date - interval '30 days')::date"
+from_filter = " AND date >= (current_date - interval '30 days')::date"
 
 [[read.endpoint.param]]
 name = "to"
@@ -2405,9 +2287,9 @@ kind = "query"
 type = "date"
 required = false
 [read.endpoint.param.present]
-to = ":to"
+to_filter = " AND date <= :to"
 [read.endpoint.param.absent]
-to = "(current_date + interval '90 days')::date"
+to_filter = " AND date <= (current_date + interval '90 days')::date"
 
 [[read.endpoint.param]]
 name = "limit"
@@ -2586,9 +2468,7 @@ cache = true
 sql = """
 SELECT index_symbol, constituent_symbol, name, sector, sub_sector, cik, added_date, removed_date
   FROM reference.index_constituents
- WHERE upper(index_symbol) = upper(:index_symbol)
-   AND (added_date IS NULL OR added_date <= :as_of)
-   AND (removed_date IS NULL OR removed_date > :as_of)
+ WHERE upper(index_symbol) = upper(:index_symbol){{as_of_filter}}
  ORDER BY constituent_symbol
 """
 
@@ -2604,9 +2484,9 @@ kind = "query"
 type = "date"
 required = false
 [read.endpoint.param.present]
-as_of = ":as_of"
+as_of_filter = " AND (added_date IS NULL OR added_date <= :as_of) AND (removed_date IS NULL OR removed_date > :as_of)"
 [read.endpoint.param.absent]
-as_of = "current_date"
+as_of_filter = " AND (added_date IS NULL OR added_date <= current_date) AND (removed_date IS NULL OR removed_date > current_date)"
 
 [[read.endpoint]]
 id = "regulatory.filings"
@@ -3165,7 +3045,14 @@ strip_lineage = true
 row_cap = 5000
 cache = true
 sql = """
-SELECT bucket_ts, open_interest FROM prediction_markets.open_interest_history WHERE venue = :venue AND market_id = :market_id ORDER BY bucket_ts ASC LIMIT :limit
+SELECT * FROM (
+  SELECT bucket_ts, open_interest
+    FROM prediction_markets.open_interest_history
+   WHERE venue = :venue AND market_id = :market_id
+   ORDER BY bucket_ts DESC
+   LIMIT :limit
+) sub
+ ORDER BY bucket_ts ASC
 """
 
 [[read.endpoint.param]]
@@ -3251,7 +3138,14 @@ strip_lineage = true
 row_cap = 3000
 cache = true
 sql = """
-SELECT bucket_ts, realized_pnl FROM prediction_markets.wallet_pnl_history WHERE wallet = :address AND granularity = :granularity ORDER BY bucket_ts ASC LIMIT :limit
+SELECT * FROM (
+  SELECT bucket_ts, realized_pnl
+    FROM prediction_markets.wallet_pnl_history
+   WHERE wallet = :address AND granularity = :granularity
+   ORDER BY bucket_ts DESC
+   LIMIT :limit
+) sub
+ ORDER BY bucket_ts ASC
 """
 
 [[read.endpoint.param]]
@@ -3515,7 +3409,7 @@ strip_lineage = true
 row_cap = 200
 cache = true
 sql = """
-SELECT tweet_id, created_at, kol_username, author_username, author_name, author_verified, tweet_type, lang, text, url, cashtags, hashtags, media_urls, retweet_count, like_count, view_count FROM news.kol_tweets WHERE to_tsvector('english', coalesce(text,'')) @@ websearch_to_tsquery('english', :q) AND created_at >= :since{{until_filter}}
+SELECT tweet_id, created_at, kol_username, author_username, author_name, author_verified, tweet_type, lang, text, url, cashtags, hashtags, media_urls, retweet_count, like_count, view_count FROM news.kol_tweets WHERE to_tsvector('english', coalesce(text,'')) @@ websearch_to_tsquery('english', :q) AND created_at >= {{since_value}}{{until_filter}}
  ORDER BY created_at DESC LIMIT :limit
 """
 
@@ -3523,6 +3417,7 @@ SELECT tweet_id, created_at, kol_username, author_username, author_name, author_
 name = "q"
 kind = "query"
 type = "str"
+required = true
 
 [[read.endpoint.param]]
 name = "since"
@@ -3530,9 +3425,9 @@ kind = "query"
 type = "timestamp"
 required = false
 [read.endpoint.param.present]
-since = ":since"
+since_value = ":since"
 [read.endpoint.param.absent]
-since = "now() - interval '30 days'"
+since_value = "now() - interval '30 days'"
 
 [[read.endpoint.param]]
 name = "until"
@@ -3564,7 +3459,7 @@ row_cap = 500
 cache = true
 sql = """
 SELECT tweet_id, created_at, kol_username, author_username, author_name, author_followers, author_verified, tweet_type, lang, text, url, cashtags, hashtags, media_urls, retweet_count, like_count, quote_count, view_count
-   FROM news.kol_tweets WHERE cashtags @> ARRAY[:symbol]::text[] AND created_at >= :since{{until_filter}}{{handle_filter}} ORDER BY created_at DESC LIMIT :limit
+   FROM news.kol_tweets WHERE cashtags @> ARRAY[:symbol]::text[] AND created_at >= {{since_value}}{{until_filter}}{{handle_filter}} ORDER BY created_at DESC LIMIT :limit
 """
 
 [[read.endpoint.param]]
@@ -3579,9 +3474,9 @@ kind = "query"
 type = "timestamp"
 required = false
 [read.endpoint.param.present]
-since = ":since"
+since_value = ":since"
 [read.endpoint.param.absent]
-since = "now() - interval '30 days'"
+since_value = "now() - interval '30 days'"
 
 [[read.endpoint.param]]
 name = "until"
@@ -3624,7 +3519,7 @@ row_cap = 500
 cache = true
 sql = """
 SELECT tweet_id, created_at, kol_username, author_username, author_name, author_followers, author_verified, tweet_type, lang, text, url, cashtags, hashtags, mentioned_users, media_urls, retweet_count, reply_count, like_count, quote_count, bookmark_count, view_count
-   FROM news.kol_tweets WHERE kol_username = :handle AND created_at >= :since{{until_filter}}{{cashtag_filter}} ORDER BY created_at DESC LIMIT :limit
+   FROM news.kol_tweets WHERE kol_username = :handle AND created_at >= {{since_value}}{{until_filter}}{{cashtag_filter}} ORDER BY created_at DESC LIMIT :limit
 """
 
 [[read.endpoint.param]]
@@ -3639,9 +3534,9 @@ kind = "query"
 type = "timestamp"
 required = false
 [read.endpoint.param.present]
-since = ":since"
+since_value = ":since"
 [read.endpoint.param.absent]
-since = "now() - interval '30 days'"
+since_value = "now() - interval '30 days'"
 
 [[read.endpoint.param]]
 name = "until"

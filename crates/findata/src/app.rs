@@ -42,7 +42,9 @@ pub fn build_router(state: AppState, read_router: Router<AppState>) -> Router {
         .route("/income-statement-growth/:symbol", get(handlers::analysis::income_statement_growth))
         .route("/balance-sheet-growth/:symbol", get(handlers::analysis::balance_sheet_growth))
         .route("/cash-flow-growth/:symbol", get(handlers::analysis::cash_flow_growth))
-        // Investors
+        // Investors — deferred to compiled handlers (computed `as_of` envelope field).
+        .route("/holders/:symbol/top", get(handlers::investors::holders_top))
+        .route("/fund-ownership/:symbol", get(handlers::investors::fund_ownership))
         // Earnings
         // Corp actions
         // Valuation
