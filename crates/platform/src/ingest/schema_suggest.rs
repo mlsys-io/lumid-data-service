@@ -17,8 +17,14 @@ use serde_json::{json, Map, Value};
 
 use crate::config::Settings;
 
-/// Provenance columns the platform always adds — never proposed/countered.
-pub const PROVENANCE_COLS: &[&str] = &["source", "source_endpoint", "source_run_id", "ingest_ts", "raw"];
+/// Reserved columns the platform manages itself — never created from a
+/// proposal/counter. The provenance columns are stamped on write, and `id` is
+/// the auto-generated surrogate PK (validation + the write engine both treat a
+/// supplied `id` as server-side). A user identifier must be named something
+/// else (e.g. `widget_id`); a bare `id` in the records is dropped here so the
+/// created table stays consistent with the ingest engine.
+pub const PROVENANCE_COLS: &[&str] =
+    &["source", "source_endpoint", "source_run_id", "ingest_ts", "raw", "id"];
 
 /// Postgres types a proposed column may use (everything else → text).
 pub const ALLOWED_TYPES: &[&str] = &[
@@ -69,7 +75,9 @@ pub fn rules_suggest(records: &[Value]) -> (Map<String, Value>, Vec<String>, Vec
     let columns: Map<String, Value> =
         cols.iter().map(|(c, vs)| (c.clone(), Value::String(infer_type(vs).into()))).collect();
     // Heuristic natural key: identity-ish + a time column when present.
-    let key: Vec<String> = ["symbol", "id", "date", "ts", "timestamp"]
+    // (`id` is reserved for the surrogate PK — excluded above — so it's not a
+    // candidate here; key-less proposals get the auto `id` at apply time.)
+    let key: Vec<String> = ["symbol", "date", "ts", "timestamp"]
         .iter().filter(|k| cols.contains_key(**k)).map(|k| k.to_string()).collect();
     // Time-series hint: a timestamp/date column → candidate hypertable axis.
     let time_col = ["ts", "timestamp", "time", "date", "created_at"]
