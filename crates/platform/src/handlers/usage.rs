@@ -89,6 +89,79 @@ async fn get_i64(conn: &mut redis::aio::MultiplexedConnection, key: &str) -> i64
     v.unwrap_or(0)
 }
 
+/// Fire-and-forget per-request recording (called from the auth gate). Writes the
+/// global counters the dashboard reads + per-`sub` counters for `/usage/me`.
+/// Swallows all errors — metrics must never affect the response.
+pub async fn record(
+    mut conn: redis::aio::MultiplexedConnection,
+    sub: String,
+    method: String,
+    tmpl: String,
+    status: u16,
+    bytes: i64,
+) {
+    let now = chrono::Utc::now();
+    let ts = now.timestamp();
+    let (minute, hour, day) = (ts / 60, ts / 3600, ts / 86400);
+    let cls = match status {
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        _ => "5xx",
+    };
+    let mut p = redis::pipe();
+    p.cmd("INCR").arg(format!("{PREFIX}total")).ignore();
+    p.cmd("INCRBY").arg(format!("{PREFIX}bytes_out")).arg(bytes).ignore();
+    p.cmd("HINCRBY").arg(format!("{PREFIX}status")).arg(cls).arg(1).ignore();
+    p.cmd("HINCRBY").arg(format!("{PREFIX}endpoint")).arg(&tmpl).arg(1).ignore();
+    p.cmd("HINCRBY").arg(format!("{PREFIX}method")).arg(&method).arg(1).ignore();
+    p.cmd("ZINCRBY").arg(format!("{PREFIX}principals")).arg(1).arg(&sub).ignore();
+    p.cmd("INCR").arg(format!("{PREFIX}min:{minute}")).ignore();
+    p.cmd("EXPIRE").arg(format!("{PREFIX}min:{minute}")).arg(21600).ignore();
+    p.cmd("INCR").arg(format!("{PREFIX}hr:{hour}")).ignore();
+    p.cmd("EXPIRE").arg(format!("{PREFIX}hr:{hour}")).arg(3024000).ignore();
+    p.cmd("INCR").arg(format!("{PREFIX}day:{day}")).ignore();
+    p.cmd("EXPIRE").arg(format!("{PREFIX}day:{day}")).arg(34560000).ignore();
+    p.cmd("INCRBY").arg(format!("{PREFIX}bytes_hr:{hour}")).arg(bytes).ignore();
+    p.cmd("EXPIRE").arg(format!("{PREFIX}bytes_hr:{hour}")).arg(3024000).ignore();
+    if status == 429 {
+        p.cmd("INCR").arg(format!("{PREFIX}429")).ignore();
+    }
+    p.cmd("SETNX").arg(format!("{PREFIX}since")).arg(now.to_rfc3339()).ignore();
+    // Per-sub (for /usage/me).
+    p.cmd("INCR").arg(format!("{PREFIX}sub:{sub}:total")).ignore();
+    p.cmd("INCRBY").arg(format!("{PREFIX}sub:{sub}:bytes")).arg(bytes).ignore();
+    p.cmd("INCR").arg(format!("{PREFIX}sub:{sub}:hr:{hour}")).ignore();
+    p.cmd("EXPIRE").arg(format!("{PREFIX}sub:{sub}:hr:{hour}")).arg(3024000).ignore();
+    let _: Result<(), _> = p.query_async(&mut conn).await;
+}
+
+/// `GET /usage/me` — the calling identity's own usage (authed). Reads the
+/// per-`sub` counters written by `record`.
+pub async fn usage_me(
+    State(st): State<AppState>,
+    axum::Extension(identity): axum::Extension<crate::auth::Identity>,
+) -> axum::response::Json<serde_json::Value> {
+    let sub = identity.sub.clone();
+    let Some(mut conn) = st.redis.clone() else {
+        return axum::response::Json(serde_json::json!({"sub": sub, "metrics": "unavailable"}));
+    };
+    let total = get_i64(&mut conn, &format!("{PREFIX}sub:{sub}:total")).await;
+    let bytes = get_i64(&mut conn, &format!("{PREFIX}sub:{sub}:bytes")).await;
+    let hour = chrono::Utc::now().timestamp() / 3600;
+    let mut last24: Vec<i64> = Vec::with_capacity(24);
+    for h in (0..24).rev() {
+        last24.push(get_i64(&mut conn, &format!("{PREFIX}sub:{sub}:hr:{}", hour - h)).await);
+    }
+    axum::response::Json(serde_json::json!({
+        "sub": sub,
+        "total_calls": total,
+        "bytes_out": bytes,
+        "calls_last_24h": last24.iter().sum::<i64>(),
+        "hourly_last_24h": last24,
+    }))
+}
+
 async fn gather(conn: &mut redis::aio::MultiplexedConnection, win_secs: Option<i64>) -> Metrics {
     let total = get_i64(conn, &format!("{PREFIX}total")).await;
     let bytes_out = get_i64(conn, &format!("{PREFIX}bytes_out")).await;

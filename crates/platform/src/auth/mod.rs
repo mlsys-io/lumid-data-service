@@ -134,6 +134,12 @@ pub async fn gate(
     next: Next,
 ) -> Result<Response, ApiError> {
     let headers = req.headers().clone();
+    let method = req.method().to_string();
+    let tmpl = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
     let ident = resolve_identity(&st, &headers).await?;
 
     // Rate-limit key + tier (mirrors _rate_limit_key / _dynamic_limit).
@@ -149,6 +155,10 @@ pub async fn gate(
     };
     let decision = st.rate.check(&key);
     if !decision.allowed {
+        if let Some(c) = st.redis.clone() {
+            let sub = ident.as_ref().map(|i| i.sub.clone()).unwrap_or_else(|| "anon".into());
+            tokio::spawn(crate::handlers::usage::record(c, sub, method, tmpl, 429, 0));
+        }
         return Err(ApiError::RateLimited {
             retry_after_s: decision.retry_after_s,
             limit: decision.limit_spec,
@@ -161,6 +171,18 @@ pub async fn gate(
             "authentication required — present a Lumid PAT as 'Authorization: Bearer <token>'".into(),
         )
     })?;
+    let sub = ident.sub.clone();
     req.extensions_mut().insert(ident);
-    Ok(next.run(req).await)
+    let resp = next.run(req).await;
+    // Fire-and-forget usage recording (per-request global + per-sub counters).
+    if let Some(c) = st.redis.clone() {
+        let bytes = resp
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0);
+        tokio::spawn(crate::handlers::usage::record(c, sub, method, tmpl, resp.status().as_u16(), bytes));
+    }
+    Ok(resp)
 }

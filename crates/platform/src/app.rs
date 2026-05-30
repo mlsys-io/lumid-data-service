@@ -61,6 +61,8 @@ pub fn build_router(
         .route("/ingest/:schema/:table/file", post(handlers::ingest::post_file))
         .route("/ingest/blob", post(handlers::ingest::post_blob))
 
+        // Caller's own usage (authed; the public /usage is the global board).
+        .route("/usage/me", get(handlers::usage::usage_me))
         // Ingress proposals: write to an unknown table → infer schema + stage a
         // proposal; admin lists/approves (creates the table + grants ACL).
         .route("/catalog/ingress/proposals", get(handlers::ingest::list_proposals))
