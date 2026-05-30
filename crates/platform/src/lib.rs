@@ -16,6 +16,7 @@ pub mod handlers;
 pub mod ingest;
 pub mod llm;
 pub mod mcp;
+pub mod openapi;
 pub mod parsers;
 pub mod queries;
 pub mod read;

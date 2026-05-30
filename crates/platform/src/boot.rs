@@ -128,7 +128,8 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     }
 
     let read_router = read::exec::build_router(&specs);
-    let router = app::build_router(state, read_router, ext_router);
+    let openapi_router = crate::openapi::build_router(&specs);
+    let router = app::build_router(state, read_router, ext_router, openapi_router);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!("listening on {bind_addr}");
     axum::serve(listener, router).await?;

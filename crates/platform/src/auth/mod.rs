@@ -154,6 +154,7 @@ pub async fn gate(
         }
     };
     let decision = st.rate.check(&key);
+    let (rl_limit, rl_remaining, rl_reset) = (decision.limit, decision.remaining, decision.reset_s);
     if !decision.allowed {
         if let Some(c) = st.redis.clone() {
             let sub = ident.as_ref().map(|i| i.sub.clone()).unwrap_or_else(|| "anon".into());
@@ -173,7 +174,18 @@ pub async fn gate(
     })?;
     let sub = ident.sub.clone();
     req.extensions_mut().insert(ident);
-    let resp = next.run(req).await;
+    let mut resp = next.run(req).await;
+    // Rate-limit headers so consumers can track headroom.
+    let h = resp.headers_mut();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&rl_limit.to_string()) {
+        h.insert("x-ratelimit-limit", v);
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(&rl_remaining.to_string()) {
+        h.insert("x-ratelimit-remaining", v);
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(&rl_reset.to_string()) {
+        h.insert("x-ratelimit-reset", v);
+    }
     // Fire-and-forget usage recording (per-request global + per-sub counters).
     if let Some(c) = st.redis.clone() {
         let bytes = resp

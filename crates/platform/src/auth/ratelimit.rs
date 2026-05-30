@@ -38,6 +38,9 @@ pub struct Decision {
     pub allowed: bool,
     pub retry_after_s: u64,
     pub limit_spec: String,
+    pub limit: u64,
+    pub remaining: u64,
+    pub reset_s: u64,
 }
 
 impl RateLimiter {
@@ -66,11 +69,15 @@ impl RateLimiter {
         entry.1 += 1;
         let count = entry.1;
         let allowed = count <= limit;
-        let retry_after_s = if allowed { 0 } else { (window_id + 1) * window - now };
+        let reset_s = (window_id + 1) * window - now;
+        let retry_after_s = if allowed { 0 } else { reset_s };
         Decision {
             allowed,
             retry_after_s,
             limit_spec: spec.clone(),
+            limit: limit as u64,
+            remaining: (limit as u64).saturating_sub(count as u64),
+            reset_s,
         }
     }
 }
