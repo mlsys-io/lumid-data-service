@@ -41,7 +41,13 @@ pub async fn status(State(st): State<AppState>) -> Html<String> {
         Ok(m) => (g(&m, "green"), g(&m, "amber"), g(&m, "red"), g(&m, "gray")),
         Err(_) => (0, 0, 0, 0),
     };
-    let overall_ok = db_ok && redis_state != "fail";
+    // Realtime upstream health (reported into Redis by the WS/poll workers).
+    let rt = match st.redis.clone() {
+        Some(mut c) => crate::realtime::health::read_all(&mut c).await,
+        None => Vec::new(),
+    };
+    let rt_any_down = rt.iter().any(|h| h.state == "down");
+    let overall_ok = db_ok && redis_state != "fail" && !rt_any_down;
 
     fn pill(name: &str, state: &str, descr: &str) -> String {
         let cls = match state {
@@ -54,6 +60,31 @@ pub async fn status(State(st): State<AppState>) -> Html<String> {
              <span class=dim>{descr}</span></div>"
         )
     }
+
+    // Realtime section: one pill per reported upstream. Absent → a hint that
+    // no worker has reported yet (e.g. just restarted, or Redis off).
+    let realtime_html = if rt.is_empty() {
+        "<div class=row><span class='pill off'>realtime: n/a</span>\
+         <span class=dim>no upstream has reported health yet</span></div>"
+            .to_string()
+    } else {
+        rt.iter()
+            .map(|h| {
+                let state = match h.state.as_str() {
+                    "up" => "ok",
+                    "degraded" => "info",
+                    "down" => "fail",
+                    _ => "off",
+                };
+                let detail = if h.detail.is_empty() {
+                    format!("as of {}", h.ts)
+                } else {
+                    format!("{} · as of {}", h.detail, h.ts)
+                };
+                pill(&h.name, state, &detail)
+            })
+            .collect::<String>()
+    };
 
     let body = format!(
         "<!doctype html><html><head><meta charset=utf-8>\
@@ -71,6 +102,7 @@ h1{{font-size:1.4rem;font-weight:600}}h2{{font-size:.95rem;color:#0f766e;margin-
 a{{color:#0f766e}}</style></head><body>\
 <h1>System status &nbsp;{}</h1>\
 <h2>Services</h2>{}{}{}\
+<h2>Realtime feeds</h2>{}\
 <h2>Endpoint freshness (SLA)</h2>\
 <div class=sla><span class='box green'>{} green</span><span class='box amber'>{} amber</span>\
 <span class='box red'>{} red</span><span class='box gray'>{} gray</span></div>\
@@ -80,6 +112,7 @@ a{{color:#0f766e}}</style></head><body>\
         pill("postgres", if db_ok { "ok" } else { "fail" }, "warehouse DB"),
         pill("redis", redis_state, "realtime broker · Tier-C cache"),
         pill("pool", "info", &format!("{in_use} in use / {} idle (size {})", ps.available, ps.size)),
+        realtime_html,
         green, amber, red, gray,
     );
     Html(body)

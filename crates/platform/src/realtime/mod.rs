@@ -4,6 +4,7 @@
 //! - `synthetic` — dev-only test publisher
 //! - `upstream`  — provider workers (finnhub_ws, fmp_ws, news, kol, polling)
 
+pub mod health;
 pub mod hub;
 pub mod synthetic;
 pub mod upstream;
