@@ -2,6 +2,7 @@
 //! parameterized SQL and returns JSON objects via `db::rows`.
 
 pub mod analysis;
+pub mod catalog;
 pub mod corp_actions;
 pub mod earnings;
 pub mod earnings_history;

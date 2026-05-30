@@ -1,6 +1,7 @@
 //! HTTP handlers — one module per route group, mirroring `api/routes/`.
 
 pub mod analysis;
+pub mod catalog;
 pub mod corp_actions;
 pub mod earnings;
 pub mod earnings_history;
@@ -10,9 +11,12 @@ pub mod events_extra;
 pub mod freshness;
 pub mod fundamentals;
 pub mod health;
+pub mod ingest;
 pub mod institutional;
 pub mod investors;
 pub mod kols;
+pub mod landing;
+pub mod llm;
 pub mod macro_data;
 pub mod market_extras;
 pub mod news;
@@ -25,5 +29,6 @@ pub mod screener;
 pub mod symbols;
 pub mod technical;
 pub mod transcripts;
+pub mod usage;
 pub mod valuation;
 pub mod xbrl;

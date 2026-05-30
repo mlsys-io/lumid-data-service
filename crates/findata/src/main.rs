@@ -10,8 +10,12 @@ mod config;
 mod db;
 mod error;
 mod handlers;
+mod ingest;
+mod parsers;
 mod queries;
 mod state;
+mod validation;
+mod write;
 
 use std::sync::Arc;
 
@@ -60,6 +64,10 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let http = reqwest::Client::builder()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
     let state = state::AppState {
         pool,
         settings: Arc::new(settings),
@@ -67,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         local_keys,
         rate,
         redis,
+        http,
     };
 
     let router = app::build_router(state);

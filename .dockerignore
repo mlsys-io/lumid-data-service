@@ -1,0 +1,11 @@
+# Keep the Docker build context small + the dep-cache layer stable.
+target/
+.git/
+.cargo-docker-home/
+**/*.log
+logs_rust_build.txt
+
+# Python sidecar artifacts — not part of the Rust build.
+__pycache__/
+*.pyc
+.venv/

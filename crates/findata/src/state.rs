@@ -18,4 +18,6 @@ pub struct AppState {
     pub rate: Arc<RateLimiter>,
     /// Read-only Redis (quote-snapshot last-tick). None when unconfigured.
     pub redis: Option<redis::aio::MultiplexedConnection>,
+    /// Shared HTTP client for the LLM reverse proxy (and any outbound calls).
+    pub http: reqwest::Client,
 }

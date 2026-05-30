@@ -11,6 +11,10 @@ fn env_u32(key: &str, default: u32) -> u32 {
     env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+fn env_u64(key: &str, default: u64) -> u64 {
+    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub db_host: String,
@@ -40,6 +44,16 @@ pub struct Settings {
     pub redis_url: String,
     /// Max symbols per /quotes request (mirrors rt_sse_request_syms).
     pub quotes_max_symbols: usize,
+
+    // Blob plane (ingest). Empty `blob_root` disables local-FS blob storage.
+    pub blob_root: String,
+    pub blob_max_bytes: u64,
+    /// Public base URL prefix for served blobs (empty → relative `/blobs/...`).
+    pub blob_public_base_url: String,
+
+    // LLM reverse proxy. Empty `llm_backend_url` disables the /v1/* routes (503).
+    pub llm_backend_url: String,
+    pub llm_default_model: String,
 }
 
 impl Settings {
@@ -66,6 +80,11 @@ impl Settings {
             rate_limit_authed: env_str("FINDATA_RATE_LIMIT_AUTHED", "600/minute"),
             redis_url: env_str("FINDATA_REDIS_URL", ""),
             quotes_max_symbols: env_u32("FINDATA_RT_SSE_REQUEST_SYMS", 100) as usize,
+            blob_root: env_str("FINDATA_BLOB_ROOT", "/app/blobs"),
+            blob_max_bytes: env_u64("FINDATA_BLOB_MAX_BYTES", 100 * 1024 * 1024),
+            blob_public_base_url: env_str("FINDATA_BLOB_PUBLIC_BASE_URL", ""),
+            llm_backend_url: env_str("FINDATA_LLM_BACKEND_URL", ""),
+            llm_default_model: env_str("FINDATA_LLM_DEFAULT_MODEL", ""),
         }
     }
 }
