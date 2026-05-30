@@ -27,6 +27,27 @@ pub fn build_router(state: AppState) -> Router {
         .route("/fundamentals/:symbol/history", get(handlers::fundamentals::history))
         .route("/news/:symbol", get(handlers::news::for_symbol))
         .route("/freshness", get(handlers::freshness::freshness))
+        // Estimates
+        .route("/estimates/:symbol/price-target", get(handlers::estimates::price_target))
+        .route("/grades/:symbol", get(handlers::estimates::grades))
+        .route("/recommendation/:symbol", get(handlers::estimates::recommendation))
+        .route("/analyst-estimates/:symbol", get(handlers::estimates::analyst_estimates))
+        // Analysis
+        .route("/ratios/:symbol", get(handlers::analysis::ratios))
+        .route("/key-metrics/:symbol", get(handlers::analysis::key_metrics))
+        .route("/financial-growth/:symbol", get(handlers::analysis::financial_growth))
+        .route("/income-statement-growth/:symbol", get(handlers::analysis::income_statement_growth))
+        .route("/balance-sheet-growth/:symbol", get(handlers::analysis::balance_sheet_growth))
+        .route("/cash-flow-growth/:symbol", get(handlers::analysis::cash_flow_growth))
+        // Investors
+        .route("/holders/:symbol/top", get(handlers::investors::holders_top))
+        .route("/insider/:symbol/transactions", get(handlers::investors::insider_transactions))
+        .route("/insider/:symbol/sentiment", get(handlers::investors::insider_sentiment))
+        .route("/insider/:symbol/statistics", get(handlers::investors::insider_statistics))
+        .route("/fund-ownership/:symbol", get(handlers::investors::fund_ownership))
+        .route("/funds-disclosure/:symbol", get(handlers::investors::funds_disclosure))
+        // Earnings
+        .route("/earnings", get(handlers::earnings::earnings_calendar))
         .layer(from_fn_with_state(state.clone(), crate::auth::gate));
 
     public
