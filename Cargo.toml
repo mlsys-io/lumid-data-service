@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/findata"]
+members = ["crates/platform"]
 resolver = "2"
 
 [workspace.package]

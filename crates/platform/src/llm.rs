@@ -1,5 +1,5 @@
 //! LLM reverse-proxy **plugin**. Optional: an app opts in by merging `routes()`
-//! into its router (e.g. `findata_ext::routes().merge(findata::llm::routes())`).
+//! into its router (e.g. `findata_ext::routes().merge(lumid_platform::llm::routes())`).
 //! Apps that don't serve an LLM (e.g. mint) simply omit it — no `/v1/*` surface.
 //!
 //! OpenAI- + Anthropic-compatible; proxies to `FINDATA_LLM_BACKEND_URL`

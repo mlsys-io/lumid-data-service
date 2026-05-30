@@ -67,7 +67,7 @@ pub fn build_router(
         .route("/admin/ingress/refresh-acl", post(handlers::ingest::refresh_acl))
 
         // LLM reverse proxy is now an opt-in plugin — apps merge
-        // `findata::llm::routes()` (src/llm.rs). Not mounted by the platform.
+        // `lumid_platform::llm::routes()` (src/llm.rs). Not mounted by the platform.
 
         // Government trades — port of api/routes/gov_trades.py.
 

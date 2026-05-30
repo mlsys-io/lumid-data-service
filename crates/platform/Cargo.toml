@@ -1,5 +1,5 @@
 [package]
-name = "findata"
+name = "lumid-platform"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
