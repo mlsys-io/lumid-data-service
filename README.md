@@ -36,8 +36,11 @@ A new app therefore = **a config file + a ~6-line `main` + a DB schema**:
 See the `mint` app (in the `findata` repo) for a complete platform-only example.
 
 ## What the platform provides (no app code)
-- **Auth gate** — Lumid PAT + local-key bypass, tiered rate limit. Public surfaces:
-  `/health`, `/`, `/reference`, `/llm`, `/status`, `/usage`, `/freshness`, `/docs`→`/reference`.
+- **Auth gate** — Lumid PAT + local-key bypass, tiered rate limit (emits
+  `x-ratelimit-{limit,remaining,reset}` headers). Public surfaces: `/health`, `/`,
+  `/reference`, `/openapi.json` (generated OpenAPI 3.1), `/llm`, `/status`, `/usage`,
+  `/freshness`, `/docs`→`/reference`. Apps add their own public routes via
+  `ServeParts.public_routes` (findata serves `/usage.md`, `/skill.md` this way).
 - **Write/ingest plane** — `POST /ingest/:schema/:table` (+ `/stream`, `/file`, `/blob`):
   table introspection, JSON-Schema validation, newest-wins upsert, full provenance, read-cache
   invalidation. Role-based ACL (`provenance.ingress_acl`, 3-tier wildcard).
@@ -50,6 +53,11 @@ See the `mint` app (in the `findata` repo) for a complete platform-only example.
   generation-based invalidation (inline on write + `cache:invalidate` pub/sub across replicas).
 - **Realtime hub** — SSE/WS fan-out; `UpstreamWorker` trait (`start(hub, mux, settings, pool)`)
   is the IoC seam for domain feeds (the worker gets `pool`, so it can persist as well as publish).
+  `Hub::warm(symbols)` (`FINDATA_RT_WARM_SYMBOLS`) keeps a baseline subscribed so quote
+  caches stay hot without an open client stream.
+- **Realtime health board** — workers report via `realtime::health::report` (WS link) /
+  `report_feed` (data feed); `/status` renders feeds **measured by tick freshness + latency**
+  (up / degraded / fail), and `/freshness` the per-endpoint SLA + per-source lag.
 - **MCP** — `POST /mcp` (JSON-RPC 2.0); `mcp::registry_from_specs` auto-generates one tool per
   declarative read endpoint. `serverInfo.name` ← `FINDATA_SERVICE_NAME` (default `lumid`).
 - **LLM proxy (optional)** — enable via `ServeParts.enable_llm`; mounts the OpenAI/Anthropic-
