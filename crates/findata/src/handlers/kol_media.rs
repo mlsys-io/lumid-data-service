@@ -16,7 +16,7 @@ use std::path::{Component, Path as FsPath, PathBuf};
 
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
@@ -72,8 +72,10 @@ fn url_to_local_path(twitter_url: &str) -> Option<String> {
     if base.is_empty() {
         return None;
     }
-    let prefix = if base.len() >= 2 { &base[..2] } else { "x_" };
-    let prefix = prefix.to_lowercase();
+    // First up-to-2 chars, char-safe (byte slicing panics on multi-byte) —
+    // mirrors Python `(base[:2] or "x_").lower()`.
+    let prefix: String = base.chars().take(2).collect();
+    let prefix = if prefix.is_empty() { "x_".to_string() } else { prefix.to_lowercase() };
     Some(format!("img/{prefix}/{tail}"))
 }
 
@@ -85,18 +87,23 @@ pub struct ByUrlParams {
 
 /// `GET /kols/media/by-url` — 302 to the local mirror if present, else 302 back
 /// to the original CDN URL.
-pub async fn by_url(State(st): State<AppState>, Query(p): Query<ByUrlParams>) -> Redirect {
+pub async fn by_url(State(st): State<AppState>, Query(p): Query<ByUrlParams>) -> Response {
     let root = &st.settings.kol_media_root;
     if !root.is_empty() {
         if let Some(rel) = url_to_local_path(&p.u) {
             let full = FsPath::new(root).join(&rel);
             if full.exists() {
-                return Redirect::temporary(&format!("/kols/media/{rel}"));
+                return found_302(&format!("/kols/media/{rel}"));
             }
         }
     }
     // Fallback: send the caller back to the original CDN.
-    Redirect::temporary(&p.u)
+    found_302(&p.u)
+}
+
+/// 302 Found redirect (Python uses 302, not 307) to `location`.
+fn found_302(location: &str) -> Response {
+    (StatusCode::FOUND, [(header::LOCATION, location.to_string())]).into_response()
 }
 
 /// Reject any relative path that escapes the mirror root (`..`, absolute, or
@@ -140,17 +147,19 @@ pub async fn serve(State(st): State<AppState>, Path(rel): Path<String>) -> ApiRe
         Ok(m) if m.is_file() => m,
         _ => return Err(ApiError::NotFound("not found".into())),
     };
-    let bytes = tokio::fs::read(&full)
+    let file = tokio::fs::File::open(&full)
         .await
         .map_err(|_| ApiError::NotFound("not found".into()))?;
     let ct = content_type_for(&full);
+    // Stream from disk rather than buffering (media files can be large).
+    let stream = tokio_util::io::ReaderStream::new(file);
     let resp = (
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, ct.to_string()),
             (header::CONTENT_LENGTH, meta.len().to_string()),
         ],
-        bytes,
+        axum::body::Body::from_stream(stream),
     )
         .into_response();
     Ok(resp)

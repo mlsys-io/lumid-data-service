@@ -172,6 +172,9 @@ async fn controller(
             let handle = tasks.lock().await.remove(&d.symbol);
             if let Some(h) = handle {
                 h.abort();
+                // Release the Tier-B label so the map doesn't grow unbounded
+                // (clear only if we still own it).
+                hub.clear_tier_if(&d.symbol, TIER_LABEL).await;
                 tracing::info!("Tier B: stopped polling for {}", d.symbol);
             }
         }
@@ -235,7 +238,8 @@ async fn fetch_once(
             _ => return None,
         };
         let obj = row.as_object()?;
-        let price = as_f64(obj.get("price")).or_else(|| as_f64(obj.get("close")))?;
+        // Match Python's falsy-`or`: a 0/absent price falls through to close.
+        let price = truthy_f64(obj.get("price")).or_else(|| as_f64(obj.get("close")))?;
         let latency_ms = t0.elapsed().as_millis() as i64;
         return Some(json!({
             "symbol": symbol,

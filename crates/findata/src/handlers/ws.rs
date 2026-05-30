@@ -166,7 +166,8 @@ async fn serve(
                     continue;
                 }
                 let tiers = hub.subscribe(&conn, &syms).await;
-                let syms_out: Vec<&String> = tiers.keys().collect();
+                // Preserve request order (HashMap key order is nondeterministic).
+                let syms_out: Vec<&String> = syms.iter().filter(|s| tiers.contains_key(*s)).collect();
                 if news_only {
                     conn.push(json!({"type": "subscribed", "symbols": syms_out})).await;
                 } else {

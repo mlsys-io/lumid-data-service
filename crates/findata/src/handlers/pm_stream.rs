@@ -49,6 +49,7 @@ struct PmState {
     aids: Option<HashSet<String>>,
     cids: Option<HashSet<String>>,
     last_hb: Instant,
+    buf: std::collections::VecDeque<Event>,
 }
 
 pub async fn stream(
@@ -85,44 +86,47 @@ pub async fn stream(
         aids,
         cids,
         last_hb: Instant::now(),
+        buf: std::collections::VecDeque::new(),
     };
 
     let body = stream::unfold(state, |mut s| async move {
         loop {
+            // Drain any buffered events first.
+            if let Some(ev) = s.buf.pop_front() {
+                return Some((Ok::<Event, Infallible>(ev), s));
+            }
             let tick = tokio::time::sleep(Duration::from_secs(1));
             tokio::select! {
                 maybe = s.stream.next() => {
                     match maybe {
                         None => return None,
                         Some(msg) => {
-                            let raw: String = match msg.get_payload() { Ok(v) => v, Err(_) => continue };
-                            let d: serde_json::Value = match serde_json::from_str(&raw) {
-                                Ok(v) => v, Err(_) => continue,
-                            };
-                            if let Some(f) = &s.aids {
-                                if !d.get("asset_id").and_then(|v| v.as_str()).map(|x| f.contains(x)).unwrap_or(false) {
-                                    continue;
+                            if let Ok(raw) = msg.get_payload::<String>() {
+                                if let Ok(d) = serde_json::from_str::<serde_json::Value>(&raw) {
+                                    let pass_a = s.aids.as_ref().map_or(true, |f|
+                                        d.get("asset_id").and_then(|v| v.as_str()).map(|x| f.contains(x)).unwrap_or(false));
+                                    let pass_c = s.cids.as_ref().map_or(true, |f|
+                                        d.get("condition_id").and_then(|v| v.as_str()).map(|x| f.contains(x)).unwrap_or(false));
+                                    if pass_a && pass_c {
+                                        let ev = Event::default().event("tick").json_data(d)
+                                            .unwrap_or_else(|_| Event::default().event("tick").data("{}"));
+                                        s.buf.push_back(ev);
+                                    }
                                 }
                             }
-                            if let Some(f) = &s.cids {
-                                if !d.get("condition_id").and_then(|v| v.as_str()).map(|x| f.contains(x)).unwrap_or(false) {
-                                    continue;
-                                }
-                            }
-                            let ev = Event::default().event("tick").json_data(d)
-                                .unwrap_or_else(|_| Event::default().event("tick").data("{}"));
-                            return Some((Ok::<Event, Infallible>(ev), s));
                         }
                     }
                 }
                 _ = tick => {}
             }
+            // Evaluate the heartbeat every iteration (so continuous message flow
+            // can't starve it), matching the Python loop.
             if s.last_hb.elapsed() > Duration::from_secs(30) {
                 s.last_hb = Instant::now();
                 let ev = Event::default().event("heartbeat")
                     .json_data(json!({"ts": chrono::Utc::now().timestamp()}))
                     .unwrap_or_else(|_| Event::default().event("heartbeat").data("{}"));
-                return Some((Ok(ev), s));
+                s.buf.push_back(ev);
             }
         }
     });

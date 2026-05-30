@@ -405,11 +405,8 @@ pub async fn start(
                     return;
                 }
                 // KOL never claims a hub tier slot — it's an additive overlay
-                // alongside whatever tick tier serves the symbol. We only set a
-                // tier when the symbol has no claimant yet, to surface coverage.
-                if st.hub.get_tier(&symbol).await == "B" {
-                    st.hub.set_tier(&symbol, "B").await;
-                }
+                // alongside whatever tick tier serves the symbol (matches the
+                // Python, which never touches hub tiers here).
                 let sym2 = symbol.clone();
                 let handle = tokio::spawn(st.clone().poll_loop(symbol.clone()));
                 tasks.insert(sym2, handle);

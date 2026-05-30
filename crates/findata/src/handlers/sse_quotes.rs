@@ -97,8 +97,9 @@ pub async fn quotes_stream(
     let tiers = hub.subscribe(&conn, &sym_list).await;
     tracing::info!("sse opened sub={} id={} symbols={}", ident.sub, conn.id, sym_list.len());
 
-    // Initial `subscribed` frame.
-    let syms_out: Vec<&String> = tiers.keys().collect();
+    // Initial `subscribed` frame — preserve request order (HashMap key order
+    // is nondeterministic).
+    let syms_out: Vec<&String> = sym_list.iter().filter(|s| tiers.contains_key(*s)).collect();
     let initial = Event::default()
         .event("subscribed")
         .json_data(json!({"symbols": syms_out, "tier": tiers}))
@@ -144,10 +145,13 @@ pub async fn quotes_stream(
 fn frame_to_event(frame: Value) -> Event {
     let kind = frame.get("type").and_then(|v| v.as_str()).unwrap_or("message").to_string();
     match kind.as_str() {
-        "tick" | "news" | "kol" => Event::default()
-            .event(kind)
-            .json_data(frame.get("data").cloned().unwrap_or(json!({})))
-            .unwrap_or_else(|_| Event::default().data("{}")),
+        "tick" | "news" | "kol" => {
+            let k = kind.clone();
+            Event::default()
+                .event(kind)
+                .json_data(frame.get("data").cloned().unwrap_or(json!({})))
+                .unwrap_or_else(|_| Event::default().event(k).data("{}"))
+        }
         "heartbeat" => {
             let ts = frame.get("ts").cloned().unwrap_or_else(|| json!(now_iso()));
             Event::default()

@@ -99,13 +99,14 @@ impl Connection {
             let due = warn.map(|t| now.duration_since(t) > DROP_WARN_INTERVAL).unwrap_or(true);
             if due {
                 *warn = Some(now);
-                if q.len() >= self.max_queue {
-                    q.pop_front();
+                // Best-effort insert (matches Python): never evict another
+                // un-counted data frame just to fit the warning.
+                if q.len() < self.max_queue {
+                    q.push_back(json!({
+                        "type": "error", "code": "slow_client_dropped",
+                        "message": format!("dropped {dropped} frames so far"),
+                    }));
                 }
-                q.push_back(json!({
-                    "type": "error", "code": "slow_client_dropped",
-                    "message": format!("dropped {dropped} frames so far"),
-                }));
             }
         } else {
             q.push_back(frame);
@@ -301,7 +302,7 @@ impl Hub {
             }
         }
         for sym in ended {
-            self.fire_demand(sym, false);
+            self.fire_demand(sym, false).await;
         }
         tracing::info!(
             "hub: connection unregistered id={} dropped={}",
@@ -349,11 +350,23 @@ impl Hub {
             .unwrap_or_else(|| "B".to_string())
     }
 
-    fn fire_demand(&self, symbol: String, active: bool) {
-        // Snapshot listeners and run them in registration order in a detached
-        // task so a slow upstream doesn't block the hub.
-        let listeners = self.demand_listeners.try_lock().map(|g| g.clone());
-        if let Ok(listeners) = listeners {
+    /// Remove a symbol's tier label IFF it currently equals `expect` — used by
+    /// upstreams to release a tier on unsubscribe. Mirrors Python's
+    /// `tier_by_symbol.pop(sym, None)`: removes the key WITHOUT emitting a
+    /// `tier_change` frame, and won't clobber a label another upstream took.
+    pub async fn clear_tier_if(&self, symbol: &str, expect: &str) {
+        let mut st = self.state.lock().await;
+        if st.tier_by_symbol.get(symbol).map(|v| v == expect).unwrap_or(false) {
+            st.tier_by_symbol.remove(symbol);
+        }
+    }
+
+    async fn fire_demand(&self, symbol: String, active: bool) {
+        // Snapshot listeners (infallible lock — try_lock could silently drop a
+        // demand event under concurrent subscribes) and run them in
+        // registration order in a detached task so a slow upstream can't block.
+        let listeners = self.demand_listeners.lock().await.clone();
+        {
             if listeners.is_empty() {
                 return;
             }
@@ -396,7 +409,7 @@ impl Hub {
             self.replay_last(conn, sym).await;
         }
         for sym in new_demand {
-            self.fire_demand(sym, true);
+            self.fire_demand(sym, true).await;
         }
         out
     }
@@ -419,7 +432,7 @@ impl Hub {
             }
         }
         for sym in ended {
-            self.fire_demand(sym, false);
+            self.fire_demand(sym, false).await;
         }
         removed
     }

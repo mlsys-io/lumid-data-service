@@ -15,13 +15,15 @@ pub async fn open_run(
     args: &Value,
     credential_label: Option<&str>,
 ) -> Result<Uuid, tokio_postgres::Error> {
-    let args_str = serde_json::to_string(args).unwrap_or_else(|_| "{}".into());
+    // Bind the JSON value directly (tokio-postgres `with-serde_json` maps
+    // `Value` -> jsonb). Binding a String to the `$3::jsonb`-typed param fails
+    // with "cannot convert String and jsonb".
     let row = client
         .query_one(
             "INSERT INTO provenance.runs (endpoint_id, credential_label, status, args) \
-             VALUES ($1, $2, 'running', $3::jsonb) \
+             VALUES ($1, $2, 'running', $3) \
              RETURNING run_id",
-            &[&endpoint_id, &credential_label, &args_str],
+            &[&endpoint_id, &credential_label, &args],
         )
         .await?;
     Ok(row.get("run_id"))

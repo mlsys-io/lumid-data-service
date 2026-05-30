@@ -18,7 +18,9 @@ use crate::state::AppState;
 /// super_admin (or local-key) gate — mirrors `_require_super_admin` plus the
 /// `require_admin` local-key bypass used across the ingress admin routes.
 fn require_super_admin(identity: &Identity) -> ApiResult<()> {
-    if identity.role == "super_admin" || identity.role == "local" {
+    // Case-insensitive, mirroring the Python role check.
+    let role = identity.role.to_ascii_lowercase();
+    if role == "super_admin" || role == "local" {
         Ok(())
     } else {
         Err(ApiError::Forbidden("super_admin role required".into()))

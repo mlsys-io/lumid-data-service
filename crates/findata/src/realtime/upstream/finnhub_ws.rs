@@ -317,6 +317,12 @@ impl Worker {
                              re-sending {} subscribes", self.subscribed.len());
                         let held: Vec<String> = self.subscribed.iter().cloned().collect();
                         for sym in held {
+                            // Re-apply the cross-tier guard: don't re-subscribe
+                            // a symbol another Tier-A upstream now owns.
+                            let tier = self.hub.get_tier(&sym).await;
+                            if tier.starts_with("A:") && !tier.starts_with("A:finnhub") {
+                                continue;
+                            }
                             send_sub(&mut write, "subscribe", &sym).await?;
                         }
                         resubbed_at = Some(Instant::now());
@@ -377,6 +383,9 @@ impl Worker {
             }
             send_sub(write, "unsubscribe", &symbol).await?;
             self.subscribed.remove(&symbol);
+            // Relinquish the tier label if we still own it (no tier_change
+            // frame), mirroring Python's tier_by_symbol.pop().
+            self.hub.clear_tier_if(&symbol, TIER_LABEL).await;
         }
         Ok(())
     }

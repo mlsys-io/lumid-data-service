@@ -129,6 +129,7 @@ fn spawn_feed(
                 slot_cap,
                 &mut desired,
                 &mut rx,
+                &mut backoff,
             )
             .await
             {
@@ -175,6 +176,7 @@ async fn connect_and_run(
     slot_cap: usize,
     desired: &mut HashSet<String>,
     rx: &mut mpsc::UnboundedReceiver<Demand>,
+    backoff: &mut f64,
 ) -> anyhow::Result<()> {
     let (ws_stream, _) = timeout(Duration::from_secs(10), tokio_tungstenite::connect_async(url))
         .await
@@ -194,6 +196,9 @@ async fn connect_and_run(
                 && msg.get("status").and_then(|v| v.as_i64()) == Some(200);
             if ok {
                 tracing::info!("FMP {name} authenticated");
+                // Reset backoff after a healthy authenticated connection so a
+                // later transient drop reconnects fast (mirrors Python).
+                *backoff = BACKOFF_INITIAL;
             } else {
                 tracing::error!("FMP {name} login failed: {msg}");
                 sleep(Duration::from_secs(5)).await;
@@ -243,11 +248,14 @@ async fn connect_and_run(
                     return Ok(());
                 };
                 if cmd.active {
-                    desired.insert(cmd.symbol.clone());
                     if subscribed.contains(&cmd.symbol) {
+                        desired.insert(cmd.symbol.clone());
                         continue;
                     }
                     if subscribed.len() >= slot_cap {
+                        // Over-cap demand is NOT recorded (matches Python): do
+                        // not let `desired` grow past slot_cap, else the
+                        // reconnect re-subscribe picks an arbitrary subset.
                         tracing::debug!(
                             "FMP {name}: slot full ({}/{slot_cap}), skipping {}",
                             subscribed.len(), cmd.symbol
@@ -261,6 +269,9 @@ async fn connect_and_run(
                         tracing::warn!("FMP {name} subscribe send failed for {}: {e}", cmd.symbol);
                         return Err(anyhow::anyhow!("subscribe send failed"));
                     }
+                    // Record in `desired` only once actually subscribed, so the
+                    // set mirrors the live subscription (always <= slot_cap).
+                    desired.insert(cmd.symbol.clone());
                     subscribed.insert(cmd.symbol.clone());
                     hub.set_tier(&cmd.symbol, tier).await;
                     tracing::info!(
@@ -277,10 +288,10 @@ async fn connect_and_run(
                         json!({"event": "unsubscribe", "data": {"ticker": wire}}).to_string(),
                     )).await;
                     subscribed.remove(&cmd.symbol);
-                    // Only relinquish the tier label if we still own it.
-                    if hub.get_tier(&cmd.symbol).await == tier {
-                        hub.set_tier(&cmd.symbol, "B").await;
-                    }
+                    // Relinquish the tier label if we still own it — clear the
+                    // key (no spurious tier_change frame), mirroring Python's
+                    // tier_by_symbol.pop().
+                    hub.clear_tier_if(&cmd.symbol, tier).await;
                 }
             }
             // Inbound frames.

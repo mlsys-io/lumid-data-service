@@ -217,14 +217,14 @@ pub async fn ingest_blob(
     let run_id = run::open_run(&client, "ingress:generic", &args, None).await?;
     run::set_submitted_by(&client, &run_id, submitted_by).await?;
 
-    let md_str = serde_json::to_string(&metadata.unwrap_or_else(|| json!({}))).unwrap();
+    let md = metadata.unwrap_or_else(|| json!({}));
     let insert_res = client
         .execute(
             "INSERT INTO raw.blobs ( \
                  blob_sha256, storage_url, content_type, size_bytes, \
                  suggested_name, metadata, source, source_endpoint, \
                  source_run_id, submitted_by \
-             ) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10) \
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) \
              ON CONFLICT (blob_sha256) DO NOTHING",
             &[
                 &sha,
@@ -232,7 +232,7 @@ pub async fn ingest_blob(
                 &ct,
                 &size,
                 &suggested_name,
-                &md_str,
+                &md,
                 &source,
                 &source_endpoint,
                 &run_id,

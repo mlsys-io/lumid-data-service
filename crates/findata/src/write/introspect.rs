@@ -137,10 +137,17 @@ pub async fn generated_columns(
     schema: &str,
     table: &str,
 ) -> Result<Vec<String>, tokio_postgres::Error> {
+    // Columns that can't be COPY/INSERT-ed into and must be dropped from the
+    // staging temp: GENERATED ALWAYS AS (expr) STORED, AND identity columns.
+    // `LIKE ... INCLUDING DEFAULTS` copies a serial's nextval default (fine) but
+    // NOT an identity generator, leaving an identity `id` NOT-NULL-without-
+    // default → COPY would fail. The merge never inserts `id`, so dropping it
+    // from the temp is safe for serial + identity alike.
     let rows = client
         .query(
             "SELECT column_name FROM information_schema.columns \
-              WHERE table_schema=$1 AND table_name=$2 AND is_generated='ALWAYS'",
+              WHERE table_schema=$1 AND table_name=$2 \
+                AND (is_generated='ALWAYS' OR identity_generation IS NOT NULL)",
             &[&schema, &table],
         )
         .await?;

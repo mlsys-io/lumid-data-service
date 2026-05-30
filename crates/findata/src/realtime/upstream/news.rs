@@ -262,7 +262,11 @@ async fn fetch_once(
 /// Coerce a Finnhub article `id` (number or string) into a stable string key.
 fn value_to_id(v: &Value) -> Option<String> {
     match v {
-        Value::Number(n) => Some(n.to_string()),
+        // Match Python's `str(id or url or "")`: a falsy 0 id falls through to
+        // the url, so treat numeric zero as absent.
+        Value::Number(n) if n.as_i64() != Some(0) && n.as_f64() != Some(0.0) => {
+            Some(n.to_string())
+        }
         Value::String(s) if !s.is_empty() => Some(s.clone()),
         _ => None,
     }

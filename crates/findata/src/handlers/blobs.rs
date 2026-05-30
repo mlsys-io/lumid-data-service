@@ -53,23 +53,36 @@ pub async fn serve_blob(
     let abs_path = safe_join(&st.settings.blob_root, &key)
         .ok_or_else(|| ApiError::BadRequest("invalid key".into()))?;
 
-    let meta = tokio::fs::metadata(&abs_path).await;
-    let is_file = matches!(meta, Ok(m) if m.is_file());
-    if !is_file {
-        return Err(ApiError::NotFound("blob not found".into()));
+    // Resolve symlinks and re-verify containment (matches Python's realpath
+    // guard) — a symlink inside blob_root could otherwise escape it.
+    let real = tokio::fs::canonicalize(&abs_path)
+        .await
+        .map_err(|_| ApiError::NotFound("blob not found".into()))?;
+    let real_root = tokio::fs::canonicalize(&st.settings.blob_root)
+        .await
+        .map_err(|_| ApiError::Unavailable("blob storage not configured".into()))?;
+    if !real.starts_with(&real_root) {
+        return Err(ApiError::BadRequest("invalid key".into()));
     }
 
-    let bytes = tokio::fs::read(&abs_path)
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
+    let file = match tokio::fs::File::open(&real).await {
+        Ok(f) => f,
+        Err(_) => return Err(ApiError::NotFound("blob not found".into())),
+    };
+    match file.metadata().await {
+        Ok(m) if m.is_file() => {}
+        _ => return Err(ApiError::NotFound("blob not found".into())),
+    }
 
     let ct = q::content_type_for_key(&st.pool, &key)
         .await?
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
+    // Stream the file rather than buffering it (blobs can be up to 100 MB).
+    let stream = tokio_util::io::ReaderStream::new(file);
     let resp = (
         [(header::CONTENT_TYPE, ct)],
-        Body::from(bytes),
+        Body::from_stream(stream),
     )
         .into_response();
     Ok(resp)
