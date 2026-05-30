@@ -6,4 +6,5 @@ pub mod blob;
 pub mod core;
 pub mod lumilake;
 pub mod proposals;
+pub mod schema_suggest;
 pub mod webhook;

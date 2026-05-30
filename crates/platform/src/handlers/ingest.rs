@@ -588,6 +588,75 @@ pub async fn reject_proposal(
     Ok(Json(crate::ingest::proposals::reject(&st.pool, &proposal_id, &identity.sub, None).await?))
 }
 
+/// Allow if the caller is an admin/local key OR the original proposer — so a
+/// builder can drive the negotiation on their own proposal.
+async fn allow_proposer_or_admin(st: &AppState, identity: &Identity, id: &str) -> ApiResult<()> {
+    if identity.role == "super_admin" || identity.role == "local" {
+        return Ok(());
+    }
+    if crate::ingest::proposals::is_proposer(&st.pool, id, &identity.sub).await? {
+        return Ok(());
+    }
+    Err(ApiError::Forbidden("not the proposer (or an admin) of this proposal".into()))
+}
+
+/// `GET /catalog/ingress/proposals/{id}` — current schema + round history.
+pub async fn get_proposal(
+    State(st): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(proposal_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    allow_proposer_or_admin(&st, &identity, &proposal_id).await?;
+    Ok(Json(crate::ingest::proposals::get_detail(&st.pool, &proposal_id).await?))
+}
+
+#[derive(Deserialize)]
+pub struct CounterBody {
+    /// Suggested columns as `{name: pgtype}`.
+    pub columns: Value,
+    #[serde(default)]
+    pub key: Vec<String>,
+    /// Optional sample records to ground the (optional) LLM refine.
+    #[serde(default)]
+    pub sample_records: Vec<Value>,
+}
+
+/// `POST /ingress/proposals/{id}/counter` — builder counter-proposes a schema;
+/// platform validates (+ optional LLM refine) and loops back to pending.
+pub async fn counter_proposal(
+    State(st): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(proposal_id): Path<String>,
+    Json(body): Json<CounterBody>,
+) -> ApiResult<Json<Value>> {
+    allow_proposer_or_admin(&st, &identity, &proposal_id).await?;
+    Ok(Json(crate::ingest::proposals::counter(
+        &st.pool, &st.settings, &st.http, &proposal_id, &identity.sub,
+        &body.columns, &body.key, &body.sample_records,
+    ).await?))
+}
+
+/// `POST /ingress/proposals/{id}/approve` — builder (or admin) applies the
+/// current negotiated schema (CREATE table + grant ACL).
+pub async fn builder_approve_proposal(
+    State(st): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(proposal_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    allow_proposer_or_admin(&st, &identity, &proposal_id).await?;
+    Ok(Json(crate::ingest::proposals::approve(&st.pool, &proposal_id, &identity.sub).await?))
+}
+
+/// `POST /ingress/proposals/{id}/reject` — builder (or admin) abandons it.
+pub async fn builder_reject_proposal(
+    State(st): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(proposal_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    allow_proposer_or_admin(&st, &identity, &proposal_id).await?;
+    Ok(Json(crate::ingest::proposals::reject(&st.pool, &proposal_id, &identity.sub, None).await?))
+}
+
 #[derive(Deserialize)]
 pub struct GrantAclBody {
     pub role: String,

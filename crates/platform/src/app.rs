@@ -71,6 +71,11 @@ pub fn build_router(
         // Ingress proposals: write to an unknown table → infer schema + stage a
         // proposal; admin lists/approves (creates the table + grants ACL).
         .route("/catalog/ingress/proposals", get(handlers::ingest::list_proposals))
+        .route("/catalog/ingress/proposals/:id", get(handlers::ingest::get_proposal))
+        // Builder-driven negotiation (proposer or admin): counter / approve / reject.
+        .route("/ingress/proposals/:id/counter", post(handlers::ingest::counter_proposal))
+        .route("/ingress/proposals/:id/approve", post(handlers::ingest::builder_approve_proposal))
+        .route("/ingress/proposals/:id/reject", post(handlers::ingest::builder_reject_proposal))
         .route("/admin/ingress/proposals/:id/approve", post(handlers::ingest::approve_proposal))
         .route("/admin/ingress/proposals/:id/reject", post(handlers::ingest::reject_proposal))
         // Ingress admin (super_admin / local key) — port of injection/routes/ingest_admin.py.
