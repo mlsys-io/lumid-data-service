@@ -5,7 +5,8 @@
 //! maps NULLs to `Value::Null`. Numeric/Decimal is preserved without f64
 //! lossiness via serde_json's `arbitrary_precision`.
 
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, SecondsFormat, Utc};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde_json::{Map, Value};
 use tokio_postgres::Row;
@@ -37,7 +38,10 @@ fn cell_to_json(row: &Row, idx: usize) -> Value {
         "timestamp" => row.try_get::<_, Option<NaiveDateTime>>(idx).ok().flatten()
             .map(naive_ts_to_json).unwrap_or(Value::Null),
         "timestamptz" => row.try_get::<_, Option<DateTime<Utc>>>(idx).ok().flatten()
-            .map(|t| Value::String(t.to_rfc3339())).unwrap_or(Value::Null),
+            // 'Z' suffix + auto subsecond precision — matches FastAPI/pydantic
+            // datetime serialization on the Python side.
+            .map(|t| Value::String(t.to_rfc3339_opts(SecondsFormat::AutoSi, true)))
+            .unwrap_or(Value::Null),
         "json" | "jsonb" => row.try_get::<_, Option<Value>>(idx).ok().flatten()
             .unwrap_or(Value::Null),
         "uuid" => row.try_get::<_, Option<Uuid>>(idx).ok().flatten()
@@ -69,9 +73,21 @@ fn json_num_f64(v: f64) -> Value {
     serde_json::Number::from_f64(v).map(Value::Number).unwrap_or(Value::Null)
 }
 
-/// Decimal → JSON number preserving exact digits (requires arbitrary_precision).
+/// Decimal → JSON, rendered canonically by value: whole numbers become JSON
+/// integers, fractional values keep their exact digits (arbitrary_precision).
+///
+/// The Python API is internally inconsistent here — the same logical field is
+/// an int on one endpoint and a float on another, depending on that endpoint's
+/// response-model field type. We render by value instead; consumers parse the
+/// same number either way, and the parity harness compares numbers by value.
 fn decimal_to_json(d: Decimal) -> Value {
-    serde_json::from_str::<Value>(&d.normalize().to_string()).unwrap_or(Value::Null)
+    if d.fract() == Decimal::ZERO {
+        if let Some(i) = d.to_i64() {
+            return Value::from(i);
+        }
+    }
+    serde_json::from_str::<Value>(&d.normalize().to_string())
+        .unwrap_or_else(|_| d.to_f64().map(json_num_f64).unwrap_or(Value::Null))
 }
 
 /// Naive timestamp → ISO-8601 with 'T', omitting microseconds when zero (Python

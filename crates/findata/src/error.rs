@@ -11,6 +11,10 @@ use serde_json::json;
 pub enum ApiError {
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+    #[error("rate limited")]
+    RateLimited { retry_after_s: u64, limit: String },
     #[error("not found: {0}")]
     NotFound(String),
     #[error("validation failed")]
@@ -27,6 +31,8 @@ impl ApiError {
     fn status(&self) -> StatusCode {
         match self {
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
+            ApiError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::Forbidden(_) => StatusCode::FORBIDDEN,
@@ -52,6 +58,16 @@ impl From<deadpool_postgres::PoolError> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status();
+        // Rate-limit responses carry Retry-After + X-RateLimit-Limit, mirroring
+        // the Python _rate_limit_handler.
+        if let ApiError::RateLimited { retry_after_s, limit } = &self {
+            let body = json!({"detail": format!("Rate limit exceeded: {limit}")});
+            let mut resp = (status, Json(body)).into_response();
+            let h = resp.headers_mut();
+            h.insert("Retry-After", retry_after_s.to_string().parse().unwrap());
+            h.insert("X-RateLimit-Limit", limit.parse().unwrap());
+            return resp;
+        }
         let body = match &self {
             ApiError::Validation(v) => json!({"detail": v}),
             ApiError::Internal(e) => {
