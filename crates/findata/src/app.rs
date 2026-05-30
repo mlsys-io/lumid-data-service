@@ -13,7 +13,11 @@ use tower_http::trace::TraceLayer;
 use crate::handlers;
 use crate::state::AppState;
 
-pub fn build_router(state: AppState, read_router: Router<AppState>) -> Router {
+pub fn build_router(
+    state: AppState,
+    read_router: Router<AppState>,
+    ext_router: Router<AppState>,
+) -> Router {
     let public = Router::new()
         .route("/health", get(handlers::health::health))
         .route("/health/db", get(handlers::health::health_db))
@@ -29,57 +33,8 @@ pub fn build_router(state: AppState, read_router: Router<AppState>) -> Router {
         .route("/ws/news", get(handlers::ws::news));
 
     let gated = Router::new()
-        .route("/symbols/search", get(handlers::symbols::search))
-        .route("/symbols/:symbol", get(handlers::symbols::get_one))
-        .route("/universe", get(handlers::symbols::universe))
-        .route("/ohlc/:symbol", get(handlers::ohlc::ohlc))
+        // Generic provenance freshness (platform).
         .route("/freshness", get(handlers::freshness::freshness))
-        // Estimates
-        .route("/analyst-estimates/:symbol", get(handlers::estimates::analyst_estimates))
-        // Analysis
-        .route("/ratios/:symbol", get(handlers::analysis::ratios))
-        .route("/financial-growth/:symbol", get(handlers::analysis::financial_growth))
-        .route("/income-statement-growth/:symbol", get(handlers::analysis::income_statement_growth))
-        .route("/balance-sheet-growth/:symbol", get(handlers::analysis::balance_sheet_growth))
-        .route("/cash-flow-growth/:symbol", get(handlers::analysis::cash_flow_growth))
-        // Investors — deferred to compiled handlers (computed `as_of` envelope field).
-        .route("/holders/:symbol/top", get(handlers::investors::holders_top))
-        .route("/fund-ownership/:symbol", get(handlers::investors::fund_ownership))
-        // Earnings
-        // Corp actions
-        // Valuation
-        // ETF
-        .route("/etf/:symbol/holdings", get(handlers::etf::holdings))
-        // Investors (acquisitions)
-        // Regulatory + ESG + filings
-        // Reference depth + misc
-        .route("/peers/:symbol", get(handlers::reference::peers))
-        .route("/exchange-market-hours", get(handlers::reference::exchange_market_hours))
-        // Macro
-        // Events extras
-        // Transcripts
-        // News meta
-        // News global feeds
-        // Screener
-        .route("/screener", get(handlers::screener::screener))
-        // Quotes snapshot + stats + metrics
-        .route("/quotes", get(handlers::quotes::quotes_snapshot))
-        .route("/quote-stats/:symbol", get(handlers::quotes::quote_stats))
-        .route("/metrics-snapshot/:symbol", get(handlers::quotes::metrics_snapshot))
-        // Technical
-        // Institutional 13-F
-        .route("/institutional/holder/:cik/industries", get(handlers::institutional::holder_industries))
-        // XBRL
-        .route("/xbrl/:symbol/filings", get(handlers::xbrl::xbrl_index))
-        .route("/xbrl/:symbol/filing/:accession", get(handlers::xbrl::xbrl_filing))
-        // Market extras
-        // Prediction markets
-        .route("/prediction-markets/markets/search", get(handlers::prediction_markets::search_markets))
-        .route("/prediction-markets/candles/:venue/:market_id", get(handlers::prediction_markets::candles))
-        // KOL
-        .route("/kols/tweets", get(handlers::kols::recent_tweets))
-        .route("/kols/tweets/by-symbol/:symbol", get(handlers::kols::tweets_for_symbol))
-        .route("/kols/:handle/tweets", get(handlers::kols::tweets_for_handle))
 
         // Catalog read plane (provenance-exposing) — port of api/routes/catalog.py.
         .route("/catalog/schemas", get(handlers::catalog::get_schemas))
@@ -135,6 +90,7 @@ pub fn build_router(state: AppState, read_router: Router<AppState>) -> Router {
         .route("/prediction-markets/stream", get(handlers::pm_stream::stream))
 
         .merge(read_router)
+        .merge(ext_router)
         .layer(from_fn_with_state(state.clone(), crate::auth::gate));
 
     public

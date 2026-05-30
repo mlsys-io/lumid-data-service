@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tracing_subscriber::EnvFilter;
 
-use findata::{app, auth, config, db, read, realtime, state};
+use findata::{app, auth, config, db, financial, read, realtime, state};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -113,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
     // Build the config-driven read router (validates every spec path) and
     // merge it into the app behind the same auth gate.
     let read_router = read::exec::build_router(&specs);
-    let router = app::build_router(state, read_router);
+    let router = app::build_router(state, read_router, financial::routes());
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!("lumid-data-service listening on {bind_addr}");
     axum::serve(listener, router).await?;
