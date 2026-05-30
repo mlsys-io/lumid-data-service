@@ -1,75 +1,71 @@
-# findata Injection
+# lumid-platform
 
-The **write plane** of findata — a portable, self-contained service for pushing
-data into the warehouse with full provenance. It is deliberately decoupled from
-the read API: it runs as its own process/container, shares only the Postgres
-database, and carries no read, realtime, or MCP surface.
+A portable, domain-agnostic **data service platform** — read + write/ingest + realtime +
+catalog/lineage + auth + MCP + an optional LLM reverse-proxy — packaged as one Rust library
+crate (`lumid-platform`, in `crates/platform`). Applications embed it and add only their
+domain: declarative read endpoints (config), any bespoke routes, and any realtime workers.
 
-## What it does
+It is a **library, not a separate service**: an app statically links it into one binary/process.
+(`findata` is one such app; `mint` is a minimal reference app.)
 
-Accept data in any of six shapes and land it in a target table, stamping every
-row with its run, submitter, and source endpoint. A per-target role ACL governs
-who can write where.
-
-| Mode | Endpoint | Body |
-|---|---|---|
-| typed | `POST /ingest/{schema}/{table}` | JSON records in target-column shape |
-| adapter | `POST /ingest/adapter/{adapter_id}` | upstream-shape records, flattened server-side *(optional — see below)* |
-| stream | `POST /ingest/{schema}/{table}/stream` | chunked NDJSON (gzip/zstd ok) |
-| file | `POST /ingest/{schema}/{table}/file` | multipart upload (JSON/CSV/TSV/XML/YAML/Parquet/Arrow) |
-| blob | `POST /ingest/blob` | raw binary (images / PDFs / octet-stream) |
-| webhook | `POST /webhook/{webhook_id}` | HMAC-signed body (no PAT) |
-
-Discovery: `GET /catalog/ingress` (overview), `GET /catalog/tables/{s}/{t}/schema.json`
-(JSON Schema for typed writes), `GET /catalog/ingress/adapters`,
-`GET /catalog/ingress/proposals`. Admin self-service (webhooks, ACL grants,
-schema/ACL cache refresh) lives under `/admin/ingress/*`.
-
-## Portability
-
-The write engine — the COPY-staging + idempotent merge — is **vendored** in
-`injection/writeengine.py`. So typed / stream / file / blob / webhook run
-standalone against any Postgres with the findata schema, with no external
-dependencies beyond the Python packages in `pyproject.toml`.
-
-**Adapter mode is the one optional feature.** It flattens upstream-shaped JSON
-using per-table normalizers from a separate `loaders/` tree. Mount that tree at
-`/app/loaders` (plus a `CLAUDE.md` marker, or set `FINAI_ROOT`) and adapter mode
-activates; omit it and adapter mode returns `503` while every other mode keeps
-working. `GET /catalog/ingress/adapters` returns `[]` when it's off.
-
-## Auth
-
-Every route except `GET /health` requires a Lumid PAT
-(`Authorization: Bearer <token>` or `X-API-Key`). The webhook route is the
-exception — it authenticates by HMAC signature. A local-key bypass
-(`FINDATA_API_KEYS=key:label,...`) is available for internal callers. The
-service runs its **own** auth + ACL on every request — it never trusts an
-upstream caller's say-so.
-
-## Run
-
-```bash
-cp .env.example .env          # fill in FINDATA_DB_PASSWORD (+ keys as needed)
-docker compose -f docker-compose.injection.yml up -d --build
-curl -s localhost:5011/health
-# Scalar API reference at  http://localhost:5011/
+## Build an app on it
+A whole app's `main.rs`:
+```rust
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    lumid_platform::serve(lumid_platform::ServeParts {
+        ext_routes: my_ext::routes(),     // or axum::Router::new()
+        workers:    my_ext::workers(),    // or vec![]
+        enable_llm: false,                // platform LLM proxy, opt-in per app
+    }).await
+}
 ```
+`serve()` wires settings, DB pool, auth, Redis, the realtime hub + workers, the config-driven
+read layer, the cache (+ cross-replica invalidation), auto-MCP, and the listener.
 
-It joins the external `findata-net` network and talks to the same Postgres and
-blob volume as the read service. Provenance (`provenance.runs`, the ingress ACL,
-sandbox proposals, blob registry) is shared in that one database, so lineage
-stays unified no matter which service wrote a row.
+A new app therefore = **a config file + a ~6-line `main` + a DB schema**:
+1. **Database/schema** — set `FINDATA_DB_*` (defaults to the shared warehouse); a new app
+   typically uses its own Postgres **schema** (referenced by `schema.table` in its config + the
+   tables it creates). No schema declaration in code — tables are introspected at write time.
+2. **Reads** — a TOML of `[[read.endpoint]]` specs (`id`, `path`, `params`, `sql`, `ttl`,
+   `shape`). Values bind as `:name` (always parameterized); `{{fragment}}` switches come only
+   from author-controlled enum/presence maps. Pointed to via `FINDATA_FINANCIAL_CONFIG`.
+3. **Bespoke** — anything SQL-in-config can't express: a compiled handler (merged via
+   `ext_routes`) or a realtime `UpstreamWorker` (added via `workers`).
 
-## Layout
+See the `mint` app (in the `findata` repo) for a complete platform-only example.
 
+## What the platform provides (no app code)
+- **Auth gate** — Lumid PAT + local-key bypass, tiered rate limit. Public surfaces:
+  `/health`, `/`, `/reference`, `/llm`, `/status`, `/usage`, `/freshness`, `/docs`→`/reference`.
+- **Write/ingest plane** — `POST /ingest/:schema/:table` (+ `/stream`, `/file`, `/blob`):
+  table introspection, JSON-Schema validation, newest-wins upsert, full provenance, read-cache
+  invalidation. Role-based ACL (`provenance.ingress_acl`, 3-tier wildcard).
+- **Ingress proposals** — write to an unknown table (with propose rights) → schema inferred
+  from the records → staged in `provenance.ingress_proposals`; admin `/catalog/ingress/proposals`
+  + `/admin/ingress/proposals/:id/{approve,reject}` (approve CREATEs the table + grants ACL).
+- **Catalog / lineage** — `/catalog/{schemas, tables/:s/:t, tables/:s/:t/schema.json, sources,
+  submitters, ingress/writable, lineage/*}`.
+- **Read cache** — L1 (moka, byte-weighted, single-flight) + L2 (Redis) + strong ETag/`304`,
+  generation-based invalidation (inline on write + `cache:invalidate` pub/sub across replicas).
+- **Realtime hub** — SSE/WS fan-out; `UpstreamWorker` trait (`start(hub, mux, settings, pool)`)
+  is the IoC seam for domain feeds (the worker gets `pool`, so it can persist as well as publish).
+- **MCP** — `POST /mcp` (JSON-RPC 2.0); `mcp::registry_from_specs` auto-generates one tool per
+  declarative read endpoint. `serverInfo.name` ← `FINDATA_SERVICE_NAME` (default `lumid`).
+- **LLM proxy (optional)** — enable via `ServeParts.enable_llm`; mounts the OpenAI/Anthropic-
+  compatible `/v1/*` surface proxying to `FINDATA_LLM_BACKEND_URL`.
+
+## Config (env, all `FINDATA_*`)
+DB: `FINDATA_DB_{HOST,PORT,USER,PASSWORD,NAME}`, `FINDATA_POOL_MAX`, `FINDATA_STATEMENT_TIMEOUT_MS`.
+Service: `FINDATA_BIND_ADDR`, `FINDATA_FINANCIAL_CONFIG`, `FINDATA_SERVICE_NAME`,
+`FINDATA_API_KEYS`, `FINDATA_RATE_LIMIT_{ANON,AUTHED}`, `FINDATA_REDIS_URL`,
+`FINDATA_LUMID_{ENABLED,URL}`, `FINDATA_BLOB_ROOT`, `FINDATA_LLM_BACKEND_URL`.
+Provider keys/caps for an app's workers live in the **app** (e.g. `findata-ext::cfg`), not here.
+
+## Dev layout
+Two repos, one binary. Clone as siblings:
 ```
-injection/
-  server.py            FastAPI app (ingest + ingress-catalog + blobs only)
-  writeengine.py       vendored COPY-staging + merge (the portability core)
-  config.py auth.py lumid.py
-  ingest/              core write fn, validation, ACL, pool, adapters bridge,
-                       sandbox, proposals, blob, webhook, parsers, decompress, …
-  routes/              ingest_{typed,adapter,stream,file,blob,webhook,admin},
-                       ingress_catalog, blobs
+/parent/lumid-data-service   (this repo — crates/platform → crate `lumid-platform`)
+/parent/findata              (the financial app — depends on ../lumid-data-service via path dep)
 ```
+The platform stays generic and names no domain provider; financial naming lives only in `findata`.
