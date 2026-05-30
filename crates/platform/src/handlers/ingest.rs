@@ -100,7 +100,17 @@ pub async fn post_typed(
     if body.records.is_empty() {
         return Err(ApiError::BadRequest("`records` must be non-empty".into()));
     }
-    gate_target(&st, &identity, &schema, &table).await?;
+    let exists = gate_target(&st, &identity, &schema, &table).await?;
+    if !exists {
+        // Unknown table + propose rights (gate_target enforced) → infer a schema
+        // from the records and stage a proposal for admin approval.
+        return Ok(Json(
+            crate::ingest::proposals::create(
+                &st.pool, &schema, &table, &identity.role, &identity.sub, &body.records,
+            )
+            .await?,
+        ));
+    }
 
     let src = format!("ingress:{}", identity.sub);
     let declared = body.source_endpoint.clone();
@@ -544,6 +554,37 @@ fn require_admin(identity: &Identity) -> ApiResult<()> {
     } else {
         Err(ApiError::Forbidden("super_admin or local-key required".into()))
     }
+}
+
+// ---- Ingress proposals (net-new shapes: propose → review → approve) ----
+pub async fn list_proposals(
+    State(st): State<AppState>,
+    Extension(_identity): Extension<Identity>,
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
+) -> ApiResult<Json<Value>> {
+    let status = q
+        .as_deref()
+        .and_then(|qs| qs.split('&').find_map(|kv| kv.strip_prefix("status=")))
+        .map(|s| s.to_string());
+    Ok(Json(crate::ingest::proposals::list(&st.pool, status.as_deref()).await?))
+}
+
+pub async fn approve_proposal(
+    State(st): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(proposal_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&identity)?;
+    Ok(Json(crate::ingest::proposals::approve(&st.pool, &proposal_id, &identity.sub).await?))
+}
+
+pub async fn reject_proposal(
+    State(st): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(proposal_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&identity)?;
+    Ok(Json(crate::ingest::proposals::reject(&st.pool, &proposal_id, &identity.sub, None).await?))
 }
 
 #[derive(Deserialize)]

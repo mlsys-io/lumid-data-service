@@ -5,4 +5,5 @@ pub mod acl;
 pub mod blob;
 pub mod core;
 pub mod lumilake;
+pub mod proposals;
 pub mod webhook;

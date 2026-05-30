@@ -61,6 +61,11 @@ pub fn build_router(
         .route("/ingest/:schema/:table/file", post(handlers::ingest::post_file))
         .route("/ingest/blob", post(handlers::ingest::post_blob))
 
+        // Ingress proposals: write to an unknown table → infer schema + stage a
+        // proposal; admin lists/approves (creates the table + grants ACL).
+        .route("/catalog/ingress/proposals", get(handlers::ingest::list_proposals))
+        .route("/admin/ingress/proposals/:id/approve", post(handlers::ingest::approve_proposal))
+        .route("/admin/ingress/proposals/:id/reject", post(handlers::ingest::reject_proposal))
         // Ingress admin (super_admin / local key) — port of injection/routes/ingest_admin.py.
         .route("/admin/ingress/acl", post(handlers::ingest::grant_acl).delete(handlers::ingest::revoke_acl))
         .route("/admin/ingress/refresh-schemas", post(handlers::ingest::refresh_schemas))
