@@ -116,9 +116,21 @@ fn coerce(p: &ParamSpec, raw: &str) -> Result<Bv, ApiError> {
             Ok(Bv::Date(d))
         }
         "timestamp" => {
-            let t = DateTime::parse_from_rfc3339(raw.trim())
-                .map_err(|_| bad(format!("'{}' must be RFC3339", p.name)))?
-                .with_timezone(&Utc);
+            // Accept a full RFC3339 timestamp, or a bare `YYYY-MM-DD` date
+            // (interpreted as 00:00:00 UTC) — clients routinely pass a date
+            // for `since`-style filters.
+            let s = raw.trim();
+            let t = DateTime::parse_from_rfc3339(s)
+                .map(|d| d.with_timezone(&Utc))
+                .or_else(|_| {
+                    NaiveDate::parse_from_str(s, "%Y-%m-%d").map(|nd| {
+                        DateTime::from_naive_utc_and_offset(
+                            nd.and_hms_opt(0, 0, 0).unwrap_or_default(),
+                            Utc,
+                        )
+                    })
+                })
+                .map_err(|_| bad(format!("'{}' must be RFC3339 or YYYY-MM-DD", p.name)))?;
             Ok(Bv::Ts(t))
         }
         "bool" => {
