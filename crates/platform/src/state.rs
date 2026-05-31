@@ -26,4 +26,8 @@ pub struct AppState {
     pub read_cache: std::sync::Arc<crate::read::cache::CacheManager>,
     /// Shared HTTP client for the LLM reverse proxy (and any outbound calls).
     pub http: reqwest::Client,
+    /// Storage-backend registry — resolves `schema.table → Backend`. Phase A is
+    /// Postgres-only (default-to-PG when no `provenance.table_backend` row), so
+    /// every existing table resolves to PG with no behavior change.
+    pub backends: Arc<crate::backend::Registry>,
 }
