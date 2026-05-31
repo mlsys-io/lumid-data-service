@@ -244,8 +244,8 @@ const LANDING_HTML: &str = r##"<!DOCTYPE html>
       <div class="stat"><div class="v">4.7 M</div><div class="l">tweet images</div></div>
       <div class="stat"><div class="v">17.2 M</div><div class="l">news articles</div></div>
       <div class="stat"><div class="v">7,851</div><div class="l">symbols</div></div>
-      <div class="stat"><div class="v">9.7 M+</div><div class="l">prediction markets</div></div>
-      <div class="stat"><div class="v">89 M+</div><div class="l">PM trades</div></div>
+      <div class="stat"><div class="v">10.3 M+</div><div class="l">prediction markets</div></div>
+      <div class="stat"><div class="v">95 M+</div><div class="l">PM trades</div></div>
       <div class="stat"><div class="v">1.3 TB</div><div class="l">total dataset</div></div>
     </div>
   </header>
