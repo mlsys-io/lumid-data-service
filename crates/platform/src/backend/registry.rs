@@ -17,7 +17,7 @@ use std::sync::Arc;
 use deadpool_postgres::Pool;
 use moka::future::Cache;
 
-use super::{Backend, BackendKind, PostgresBackend};
+use super::{Backend, BackendKind, ClickHouseBackend, PostgresBackend};
 use crate::error::ApiResult;
 
 /// Resolves `(schema, table) → Backend`. Cheap to clone (everything inside is an
@@ -25,8 +25,9 @@ use crate::error::ApiResult;
 pub struct Registry {
     pool: Pool,
     postgres: PostgresBackend,
-    /// Reserved for Phase B. `None` until ClickHouse lands; the CH variant in
-    /// [`BackendKind`] is otherwise unreachable.
+    /// The ClickHouse backend, present only when the deployment configured
+    /// `FINDATA_CLICKHOUSE_URL` (+ user/pass/db). `None` ⇒ Phase A behavior
+    /// (every table resolves to Postgres; a CH approve/route is rejected).
     clickhouse: Option<Arc<dyn Backend>>,
     /// `schema.table -> BackendKind`, mirroring the introspect metadata cache
     /// (256 entries, cleared by `refresh-schemas`).
@@ -43,6 +44,38 @@ impl Registry {
             clickhouse: None,
             cache: Cache::new(256),
         }
+    }
+
+    /// Build a registry with ClickHouse enabled (Phase B). `boot` calls this
+    /// when `FINDATA_CLICKHOUSE_URL` is configured; otherwise it stays on
+    /// [`Self::new_postgres_only`].
+    pub fn new_with_clickhouse(pool: Pool, ch: ClickHouseBackend) -> Self {
+        let postgres = PostgresBackend::new(pool.clone());
+        Self {
+            pool,
+            postgres,
+            clickhouse: Some(Arc::new(ch)),
+            cache: Cache::new(256),
+        }
+    }
+
+    /// Whether a working ClickHouse backend is configured. The approve path
+    /// rejects a `clickhouse` choice with a clear 503 when this is `false`.
+    pub fn clickhouse_configured(&self) -> bool {
+        self.clickhouse.is_some()
+    }
+
+    /// The ClickHouse backend handle, if configured. Used by the approve path to
+    /// dispatch `create_table` to CH before the PG bookkeeping tx.
+    pub fn clickhouse_backend(&self) -> Option<&dyn Backend> {
+        self.clickhouse.as_deref()
+    }
+
+    /// Seed the resolve cache with a freshly-recorded backend so the next
+    /// ingest/read routes correctly without a DB round-trip (called by the
+    /// approve path right after it commits the `table_backend` row).
+    pub async fn note_backend_cached(&self, schema: &str, table: &str, kind: BackendKind) {
+        self.cache.insert(Self::key(schema, table), kind).await;
     }
 
     fn key(schema: &str, table: &str) -> String {
@@ -78,10 +111,12 @@ impl Registry {
         Ok(kind)
     }
 
-    /// Backend handle for `schema.table`. Phase A always returns Postgres (the
-    /// CH slot is `None`); if a `table_backend` row somehow names ClickHouse
-    /// before Phase B wires the backend, fall back to Postgres so the path stays
-    /// safe rather than panicking.
+    /// Backend handle for `schema.table`. Resolves the table's backend kind and
+    /// hands back the matching impl. If a `table_backend` row names ClickHouse
+    /// but no CH backend is configured (slot `None`), fall back to Postgres so
+    /// the path stays safe rather than panicking — the approve path is what
+    /// gates CH selection on `clickhouse_configured()`, so this is defence in
+    /// depth for a row that predates the config.
     pub async fn get(&self, schema: &str, table: &str) -> ApiResult<&dyn Backend> {
         match self.resolve(schema, table).await? {
             BackendKind::ClickHouse => {

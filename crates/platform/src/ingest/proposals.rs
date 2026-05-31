@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use deadpool_postgres::Pool;
 use serde_json::{json, Map, Value};
 
-use crate::backend::CreateTablePlan;
+use crate::backend::{BackendKind, CreateTablePlan, Registry};
 use crate::error::{ApiError, ApiResult};
 
 fn norm_ident(s: &str) -> Option<String> {
@@ -103,6 +103,31 @@ fn infer_natural_key(cols: &BTreeMap<String, Vec<&Value>>) -> Vec<String> {
     cols.keys().cloned().collect()
 }
 
+/// Suggest a storage backend for an inferred shape (multi-backend Phase B).
+///
+/// Heuristic (documented in the canonical contract): high-frequency / append
+/// heavy shapes go to ClickHouse, everything else to Postgres. "High frequency"
+/// is recognised as either
+///   * the declared schema being `md` (the market-data convention), or
+///   * the inferred natural key carrying a time column (`ts*` prefix, or one of
+///     `timestamp` / `date` / `time`) — a per-event time-series key.
+///
+/// Returns the wire form stored in `ingress_proposals.suggested_backend`.
+fn suggest_backend(schema: &str, key: &[String]) -> BackendKind {
+    if schema.eq_ignore_ascii_case("md") {
+        return BackendKind::ClickHouse;
+    }
+    let has_time_col = key.iter().any(|k| {
+        let k = k.to_ascii_lowercase();
+        k.starts_with("ts") || k == "timestamp" || k == "date" || k == "time"
+    });
+    if has_time_col {
+        BackendKind::ClickHouse
+    } else {
+        BackendKind::Postgres
+    }
+}
+
 /// Create a pending proposal from the records. Returns the response body.
 pub async fn create(
     pool: &Pool,
@@ -142,17 +167,21 @@ pub async fn create(
     // ever return empty when there are genuinely no columns (guarded above).
     let key = infer_natural_key(&cols);
 
+    // Suggest a storage backend for the shape (admin can override at approve).
+    let suggested = suggest_backend(&schema_n, &key);
+
     let sample: Vec<Value> = records.iter().take(3).cloned().collect();
     let client = pool.get().await?;
     let row = client
         .query_one(
             "INSERT INTO provenance.ingress_proposals \
                (declared_schema, declared_table, proposer_sub, proposer_role, \
-                inferred_schema, inferred_key, sample_records, drop_count, status) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending') \
+                inferred_schema, inferred_key, sample_records, drop_count, \
+                suggested_backend, status) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending') \
              RETURNING proposal_id::text",
             &[&schema_n, &table_n, &sub, &role, &Value::Object(inferred.clone()),
-              &key, &Value::Array(sample), &(skipped.len() as i64)],
+              &key, &Value::Array(sample), &(skipped.len() as i64), &suggested.as_str()],
         )
         .await?;
     let pid: String = row.get(0);
@@ -163,6 +192,7 @@ pub async fn create(
         "inferred_columns": inferred,
         "inferred_key": key,
         "skipped_keys": skipped,
+        "suggested_backend": suggested.as_str(),
         "note": "net-new table — pending admin approval (GET /catalog/ingress/proposals)"
     }))
 }
@@ -172,11 +202,13 @@ pub async fn list(pool: &Pool, status: Option<&str>) -> ApiResult<Value> {
     let client = pool.get().await?;
     let rows = if let Some(s) = status {
         client.query("SELECT proposal_id::text, declared_schema, declared_table, proposer_role, \
-            inferred_schema, inferred_key, drop_count, status, applied_table, created_at \
+            inferred_schema, inferred_key, drop_count, status, applied_table, created_at, \
+            suggested_backend \
             FROM provenance.ingress_proposals WHERE status=$1 ORDER BY created_at DESC LIMIT 200", &[&s]).await?
     } else {
         client.query("SELECT proposal_id::text, declared_schema, declared_table, proposer_role, \
-            inferred_schema, inferred_key, drop_count, status, applied_table, created_at \
+            inferred_schema, inferred_key, drop_count, status, applied_table, created_at, \
+            suggested_backend \
             FROM provenance.ingress_proposals ORDER BY created_at DESC LIMIT 200", &[]).await?
     };
     let items: Vec<Value> = rows.iter().map(|r| json!({
@@ -188,17 +220,39 @@ pub async fn list(pool: &Pool, status: Option<&str>) -> ApiResult<Value> {
         "inferred_key": r.get::<_, Vec<String>>(5),
         "status": r.get::<_, String>(7),
         "applied_table": r.get::<_, Option<String>>(8),
+        "suggested_backend": r.get::<_, String>(10),
     })).collect();
     Ok(json!({"count": items.len(), "proposals": items}))
 }
 
-/// Approve a proposal: CREATE the table (inferred + provenance cols + PK) and
-/// grant the proposer's role write ACL. Idempotent-ish (CREATE IF NOT EXISTS).
-pub async fn approve(pool: &Pool, proposal_id: &str, reviewer: &str) -> ApiResult<Value> {
+/// Approve a proposal: CREATE the table on the chosen backend (inferred +
+/// provenance cols + key) and grant the proposer's role write ACL.
+/// Idempotent-ish (CREATE IF NOT EXISTS).
+///
+/// `backend_override` (the optional `{ "backend": "postgres"|"clickhouse" }`
+/// approve body) overrides the stored `suggested_backend`. A `clickhouse`
+/// choice is rejected with a 503 when no CH backend is configured.
+///
+/// Atomicity:
+///   * **Postgres** path is unchanged — the CREATE + table_backend row + ACL +
+///     status flip all run in one PG transaction (byte-equivalent to before).
+///   * **ClickHouse** path runs the (idempotent) CH `create_table` FIRST, then
+///     the PG bookkeeping tx (table_backend='clickhouse' + ACL + status). If the
+///     PG tx fails after the CH table was created, the CH table is harmless
+///     (no backend row ⇒ unreachable until a future approve records it; CREATE
+///     IF NOT EXISTS makes a retry a no-op).
+pub async fn approve(
+    reg: &Registry,
+    proposal_id: &str,
+    reviewer: &str,
+    backend_override: Option<BackendKind>,
+) -> ApiResult<Value> {
+    let pool = reg.pool();
     let mut client = pool.get().await?;
     let row = client
         .query_opt(
-            "SELECT declared_schema, declared_table, proposer_role, inferred_schema, inferred_key \
+            "SELECT declared_schema, declared_table, proposer_role, inferred_schema, \
+                    inferred_key, suggested_backend \
              FROM provenance.ingress_proposals WHERE proposal_id::text=$1 AND status='pending'",
             &[&proposal_id],
         )
@@ -209,44 +263,117 @@ pub async fn approve(pool: &Pool, proposal_id: &str, reviewer: &str) -> ApiResul
     let role: String = row.get(2);
     let inferred: Value = row.get(3);
     let key: Vec<String> = row.get(4);
+    let suggested = BackendKind::from_str_or_pg(&row.get::<_, String>(5));
 
-    // Re-validate identifiers (defence in depth) + build the CREATE TABLE DDL via
-    // the shared builder (same fn the PostgresBackend uses — single source of DDL).
-    let obj = inferred.as_object().ok_or_else(|| ApiError::Internal(anyhow::anyhow!("bad inferred_schema")))?;
-    let (schema_n, table_n, ddl) = crate::backend::postgres::build_create_table_ddl(&CreateTablePlan {
-        schema: &schema,
-        table: &table,
-        inferred: obj,
-        key: &key,
-    })?;
+    // Chosen backend: explicit override wins, else the stored suggestion.
+    let chosen = backend_override.unwrap_or(suggested);
+    if chosen == BackendKind::ClickHouse && !reg.clickhouse_configured() {
+        return Err(ApiError::Unavailable(
+            "ClickHouse backend is not configured on this deployment \
+             (set FINDATA_CLICKHOUSE_URL); cannot approve onto ClickHouse"
+                .into(),
+        ));
+    }
 
-    let tx = client.transaction().await?;
-    tx.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema_n}\"")).await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("create schema: {e}")))?;
-    tx.batch_execute(&ddl).await.map_err(|e| ApiError::Internal(anyhow::anyhow!("create table: {e}")))?;
-    // Record the storage backend for this table (Phase A: always 'postgres'),
-    // in the same transaction as the CREATE so the registry never sees a created
-    // table without a backend row.
+    let obj = inferred
+        .as_object()
+        .ok_or_else(|| ApiError::Internal(anyhow::anyhow!("bad inferred_schema")))?;
+    let plan = CreateTablePlan { schema: &schema, table: &table, inferred: obj, key: &key };
+
+    // Build the PG DDL once — it also re-validates + normalises the identifiers
+    // we need for the bookkeeping rows + the applied_table string regardless of
+    // backend. (For the CH path `pg_ddl` itself is unused; the string build is
+    // cheap and keeps identifier normalisation single-sourced in one builder.)
+    let (schema_n, table_n, pg_ddl) = crate::backend::postgres::build_create_table_ddl(&plan)?;
+
+    match chosen {
+        BackendKind::ClickHouse => {
+            // Create the CH table FIRST (idempotent), outside the PG tx.
+            reg.clickhouse_backend()
+                .expect("clickhouse_configured() checked above")
+                .create_table(&plan)
+                .await?;
+            // Then the PG bookkeeping tx (atomic among themselves).
+            let tx = client.transaction().await?;
+            record_backend_acl_status(
+                &tx,
+                &schema_n,
+                &table_n,
+                &role,
+                "clickhouse",
+                proposal_id,
+                reviewer,
+            )
+            .await?;
+            tx.commit().await?;
+            // Keep the resolve cache consistent so the next ingest routes to CH.
+            reg.note_backend_cached(&schema_n, &table_n, BackendKind::ClickHouse).await;
+        }
+        BackendKind::Postgres => {
+            // Unchanged PG path: CREATE + bookkeeping in one transaction.
+            let tx = client.transaction().await?;
+            tx.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema_n}\""))
+                .await
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!("create schema: {e}")))?;
+            tx.batch_execute(&pg_ddl)
+                .await
+                .map_err(|e| ApiError::Internal(anyhow::anyhow!("create table: {e}")))?;
+            record_backend_acl_status(
+                &tx,
+                &schema_n,
+                &table_n,
+                &role,
+                "postgres",
+                proposal_id,
+                reviewer,
+            )
+            .await?;
+            tx.commit().await?;
+            reg.note_backend_cached(&schema_n, &table_n, BackendKind::Postgres).await;
+        }
+    }
+
+    super::acl::invalidate();
+    Ok(json!({
+        "status": "applied",
+        "table": format!("{schema_n}.{table_n}"),
+        "granted_role": role,
+        "backend": chosen.as_str(),
+    }))
+}
+
+/// The three bookkeeping writes shared by both backend paths: record the table's
+/// backend, grant the proposer's role write ACL, flip the proposal to applied.
+async fn record_backend_acl_status(
+    tx: &deadpool_postgres::Transaction<'_>,
+    schema_n: &str,
+    table_n: &str,
+    role: &str,
+    backend: &str,
+    proposal_id: &str,
+    reviewer: &str,
+) -> ApiResult<()> {
     tx.execute(
         "INSERT INTO provenance.table_backend (target_schema, target_table, backend) \
-         VALUES ($1,$2,'postgres') \
+         VALUES ($1,$2,$3) \
          ON CONFLICT (target_schema, target_table) DO UPDATE SET backend=EXCLUDED.backend",
-        &[&schema_n, &table_n],
-    ).await?;
+        &[&schema_n, &table_n, &backend],
+    )
+    .await?;
     tx.execute(
         "INSERT INTO provenance.ingress_acl (role, target_schema, target_table, can_write, notes) \
          VALUES ($1,$2,$3,true,'auto-granted on proposal approval') \
          ON CONFLICT (role, target_schema, target_table) DO UPDATE SET can_write=true",
         &[&role, &schema_n, &table_n],
-    ).await?;
+    )
+    .await?;
     tx.execute(
         "UPDATE provenance.ingress_proposals SET status='applied', applied_table=$2, \
          reviewer_sub=$3, reviewed_at=now(), updated_at=now() WHERE proposal_id::text=$1",
         &[&proposal_id, &format!("{schema_n}.{table_n}"), &reviewer],
-    ).await?;
-    tx.commit().await?;
-    super::acl::invalidate();
-    Ok(json!({"status": "applied", "table": format!("{schema_n}.{table_n}"), "granted_role": role}))
+    )
+    .await?;
+    Ok(())
 }
 
 /// Reject a pending proposal.
@@ -300,6 +427,42 @@ mod tests {
     fn legacy_single_column_key_still_works() {
         let cols = cols_of(&["symbol", "open", "close"]);
         assert_eq!(infer_natural_key(&cols), vec!["symbol"]);
+    }
+
+    #[test]
+    fn suggest_backend_md_schema_is_clickhouse() {
+        // schema 'md' → clickhouse regardless of key.
+        assert_eq!(suggest_backend("md", &["symbol".into()]), BackendKind::ClickHouse);
+        assert_eq!(suggest_backend("md", &[]), BackendKind::ClickHouse);
+        // case-insensitive.
+        assert_eq!(suggest_backend("MD", &["foo".into()]), BackendKind::ClickHouse);
+    }
+
+    #[test]
+    fn suggest_backend_time_key_is_clickhouse() {
+        // ts*-prefixed or named time columns in the key → clickhouse.
+        assert_eq!(
+            suggest_backend("obs", &["venue".into(), "ts_event_ns".into()]),
+            BackendKind::ClickHouse
+        );
+        assert_eq!(suggest_backend("obs", &["ts".into()]), BackendKind::ClickHouse);
+        assert_eq!(
+            suggest_backend("obs", &["sym".into(), "timestamp".into()]),
+            BackendKind::ClickHouse
+        );
+        assert_eq!(suggest_backend("obs", &["date".into()]), BackendKind::ClickHouse);
+    }
+
+    #[test]
+    fn suggest_backend_entity_key_non_md_is_postgres() {
+        // No md schema, no time column → postgres.
+        assert_eq!(
+            suggest_backend("ref", &["tenant_id".into(), "venue".into(), "instrument_id".into()]),
+            BackendKind::Postgres
+        );
+        assert_eq!(suggest_backend("obs", &["symbol".into()]), BackendKind::Postgres);
+        // 'description' starts with neither — must NOT false-match on substring.
+        assert_eq!(suggest_backend("obs", &["description".into()]), BackendKind::Postgres);
     }
 
     #[test]
