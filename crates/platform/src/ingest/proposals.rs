@@ -57,6 +57,51 @@ fn infer_type(values: &[&Value]) -> &'static str {
     "text"
 }
 
+/// Infer a natural upsert key from the proposed columns.
+///
+/// Returns a **composite** entity-dimension key (most-significant first) plus the
+/// finest event-time column when present — e.g. market-data
+/// `(tenant_id, venue, instrument_id, ts_event_ns)` gives correct newest-wins
+/// dedup; reference data `(tenant_id, venue, class_id, instrument_id)` keys on the
+/// entity. Falls back to legacy single identity-ish names, then — as a last
+/// resort — to ALL columns, so the result is **never empty** for a non-empty
+/// column set. Empty key ⇒ a generated-identity PK, which the COPY+merge upsert
+/// cannot target; this function exists to avoid that (see `create`).
+fn infer_natural_key(cols: &BTreeMap<String, Vec<&Value>>) -> Vec<String> {
+    let has = |c: &str| cols.contains_key(c);
+    // Entity dimensions in key order (coarse → fine).
+    let entity: Vec<&str> = [
+        "tenant_id", "venue", "class_id", "instrument_id", "symbol", "event_id",
+        "market_id", "asset_id", "ticker",
+    ]
+    .into_iter()
+    .filter(|c| has(c))
+    .collect();
+    if !entity.is_empty() {
+        let mut key: Vec<String> = entity.iter().map(|s| (*s).to_string()).collect();
+        // Append the finest event-time column, if any (first match wins).
+        if let Some(t) = ["ts_event_ns", "ts_event", "ts", "timestamp", "date"]
+            .into_iter()
+            .find(|c| has(c))
+        {
+            key.push(t.to_string());
+        }
+        return key;
+    }
+    // Legacy single identity-ish column.
+    let legacy: Vec<String> = ["symbol", "id", "date", "ts", "timestamp"]
+        .into_iter()
+        .filter(|c| has(c))
+        .map(String::from)
+        .collect();
+    if !legacy.is_empty() {
+        return legacy;
+    }
+    // Last resort: all columns (guarantees a valid ON CONFLICT target; at worst
+    // dedups exact-duplicate rows). Never returns empty for a non-empty `cols`.
+    cols.keys().cloned().collect()
+}
+
 /// Create a pending proposal from the records. Returns the response body.
 pub async fn create(
     pool: &Pool,
@@ -88,12 +133,13 @@ pub async fn create(
     let inferred: Map<String, Value> =
         cols.iter().map(|(c, vs)| (c.clone(), Value::String(infer_type(vs).into()))).collect();
 
-    // Heuristic natural key: prefer common identity-ish columns present.
-    let key: Vec<String> = ["symbol", "id", "date", "ts", "timestamp"]
-        .iter()
-        .filter(|k| cols.contains_key(**k))
-        .map(|k| k.to_string())
-        .collect();
+    // Natural key for the upsert. MUST be non-empty for any table the COPY+merge
+    // engine will upsert into: a keyless table falls back to a generated-identity
+    // `id` PK, and the merge's `ON CONFLICT (id)` then references a GENERATED
+    // ALWAYS column absent from the payload → "column id does not exist". So we
+    // infer a real composite key (entity dimensions + finest event-time) and only
+    // ever return empty when there are genuinely no columns (guarded above).
+    let key = infer_natural_key(&cols);
 
     let sample: Vec<Value> = records.iter().take(3).cloned().collect();
     let client = pool.get().await?;
@@ -230,4 +276,55 @@ pub async fn reject(pool: &Pool, proposal_id: &str, reviewer: &str, notes: Optio
     ).await?;
     if n == 0 { return Err(ApiError::NotFound("no pending proposal with that id".into())); }
     Ok(json!({"status": "rejected", "proposal_id": proposal_id}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Helper: build a column map with the given names (values irrelevant to keying).
+    fn cols_of(names: &[&str]) -> BTreeMap<String, Vec<&'static Value>> {
+        const NULL: Value = Value::Null;
+        names
+            .iter()
+            .map(|n| ((*n).to_string(), vec![&NULL]))
+            .collect()
+    }
+
+    #[test]
+    fn market_data_gets_composite_entity_plus_time_key() {
+        let cols = cols_of(&[
+            "tenant_id", "venue", "instrument_id", "bid_price_ticks", "ask_price_ticks",
+            "ts_event_ns", "ts_recv_ns",
+        ]);
+        assert_eq!(
+            infer_natural_key(&cols),
+            vec!["tenant_id", "venue", "instrument_id", "ts_event_ns"]
+        );
+    }
+
+    #[test]
+    fn reference_data_without_time_gets_entity_key() {
+        let cols = cols_of(&["tenant_id", "venue", "instrument_id", "class_id"]);
+        // entity order: tenant_id, venue, class_id, instrument_id; no time col appended.
+        assert_eq!(
+            infer_natural_key(&cols),
+            vec!["tenant_id", "venue", "class_id", "instrument_id"]
+        );
+    }
+
+    #[test]
+    fn legacy_single_column_key_still_works() {
+        let cols = cols_of(&["symbol", "open", "close"]);
+        assert_eq!(infer_natural_key(&cols), vec!["symbol"]);
+    }
+
+    #[test]
+    fn keyless_table_falls_back_to_all_columns_never_empty() {
+        let cols = cols_of(&["foo", "bar", "baz"]);
+        // BTreeMap-sorted; non-empty guarantees a valid ON CONFLICT target (no identity-PK).
+        let key = infer_natural_key(&cols);
+        assert_eq!(key, vec!["bar", "baz", "foo"]);
+        assert!(!key.is_empty());
+    }
 }
