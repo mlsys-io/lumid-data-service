@@ -26,15 +26,18 @@ use serde_json::{Map, Value};
 use crate::error::ApiResult;
 use crate::write::introspect::TableMeta;
 
+pub mod clickhouse;
 pub mod postgres;
 pub mod registry;
 
+pub use clickhouse::ClickHouseBackend;
 pub use postgres::PostgresBackend;
 pub use registry::Registry;
 
-/// Which storage engine a table lives on. The `ClickHouse` variant is defined
-/// now for the registry/approve plumbing but is not yet constructible as a
-/// working backend (Phase B).
+/// Which storage engine a table lives on. As of Phase B the `ClickHouse`
+/// variant is a working backend ([`ClickHouseBackend`]) when the deployment has
+/// `FINDATA_CLICKHOUSE_URL` configured; otherwise the registry leaves the slot
+/// `None` and falls back to Postgres.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
     Postgres,

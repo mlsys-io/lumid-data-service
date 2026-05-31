@@ -28,6 +28,15 @@ pub struct Settings {
     /// host:port the HTTP server binds to.
     pub bind_addr: String,
 
+    // ClickHouse backend (multi-backend Phase B). Empty `ch_url` disables the
+    // CH backend entirely (Phase A behavior — every table resolves to Postgres,
+    // a CH approve is rejected 503). When set, the backend registry registers a
+    // ClickHouseBackend and tables can be approved onto CH.
+    pub ch_url: String,
+    pub ch_user: String,
+    pub ch_password: String,
+    pub ch_database: String,
+
     // Auth.
     pub lumid_url: String,
     pub lumid_enabled: bool,
@@ -89,6 +98,10 @@ impl Settings {
             statement_timeout_ms: env_u32("FINDATA_STATEMENT_TIMEOUT_MS", 30000),
             ohlc_row_cap: env_u32("FINDATA_OHLC_ROW_CAP", 200_000) as i64,
             bind_addr: env_str("FINDATA_BIND_ADDR", "0.0.0.0:8088"),
+            ch_url: env_str("FINDATA_CLICKHOUSE_URL", ""),
+            ch_user: env_str("FINDATA_CLICKHOUSE_USER", "default"),
+            ch_password: env_str("FINDATA_CLICKHOUSE_PASSWORD", ""),
+            ch_database: env_str("FINDATA_CLICKHOUSE_DB", "default"),
             lumid_url: env_str("FINDATA_LUMID_URL", "https://lum.id"),
             lumid_enabled: matches!(
                 env_str("FINDATA_LUMID_ENABLED", "true").to_lowercase().as_str(),

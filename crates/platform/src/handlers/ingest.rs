@@ -569,13 +569,43 @@ pub async fn list_proposals(
     Ok(Json(crate::ingest::proposals::list(&st.pool, status.as_deref()).await?))
 }
 
+/// Optional approve body: `{ "backend": "postgres" | "clickhouse" }`. Overrides
+/// the proposal's stored `suggested_backend`. Absent ⇒ use the suggestion.
+#[derive(Deserialize, Default)]
+pub struct ApproveBody {
+    #[serde(default)]
+    pub backend: Option<String>,
+}
+
 pub async fn approve_proposal(
     State(st): State<AppState>,
     Extension(identity): Extension<Identity>,
     Path(proposal_id): Path<String>,
+    body: Option<Json<ApproveBody>>,
 ) -> ApiResult<Json<Value>> {
     require_admin(&identity)?;
-    Ok(Json(crate::ingest::proposals::approve(&st.pool, &proposal_id, &identity.sub).await?))
+    // Parse the optional backend override. An explicitly-supplied unknown value
+    // is rejected rather than silently defaulting to Postgres, so a typo can't
+    // quietly route a table to the wrong engine.
+    let override_kind = match body.and_then(|Json(b)| b.backend) {
+        Some(s) => {
+            let want = s.trim().to_ascii_lowercase();
+            match want.as_str() {
+                "postgres" => Some(crate::backend::BackendKind::Postgres),
+                "clickhouse" => Some(crate::backend::BackendKind::ClickHouse),
+                _ => {
+                    return Err(ApiError::BadRequest(format!(
+                        "backend must be 'postgres' or 'clickhouse' (got {s:?})"
+                    )))
+                }
+            }
+        }
+        None => None,
+    };
+    Ok(Json(
+        crate::ingest::proposals::approve(&st.backends, &proposal_id, &identity.sub, override_kind)
+            .await?,
+    ))
 }
 
 pub async fn reject_proposal(
