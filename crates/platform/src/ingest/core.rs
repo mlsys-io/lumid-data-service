@@ -6,16 +6,14 @@
 //! dataclass exactly (run_id, target_schema, target_table, received, inserted,
 //! updated, failed, rejected, status).
 
-use std::collections::HashSet;
-
-use deadpool_postgres::Pool;
 use serde::Serialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::backend::{Registry, WriteRequest};
 use crate::error::ApiError;
-use crate::validation::{self, Rejected, SERVER_STAMPED_COLS};
-use crate::write::{engine, introspect, run};
+use crate::validation::{self, Rejected};
+use crate::write::{introspect, run};
 
 use super::lumilake::{self, LumilakeInfo};
 
@@ -99,8 +97,14 @@ pub struct IngestParams<'a> {
 }
 
 /// Write `records` to `target_schema.target_table` with full provenance.
+///
+/// The actual upsert is dispatched through the backend registry
+/// (`reg.get(schema, table).write_records(..)`); provenance/run bookkeeping +
+/// validation introspection stay on the shared Postgres pool (`reg.pool()`).
+/// Phase A: every table resolves to the Postgres backend, so this is identical
+/// to the former direct-to-PG path.
 pub async fn ingest_records(
-    pool: &Pool,
+    reg: &Registry,
     p: &IngestParams<'_>,
     records: &[Value],
 ) -> Result<IngestResult, IngestErr> {
@@ -123,7 +127,8 @@ pub async fn ingest_records(
 
     let received = records.len();
 
-    let mut client = pool
+    let client = reg
+        .pool()
         .get()
         .await
         .map_err(|e| IngestErr::Failed(e.into()))?;
@@ -198,15 +203,28 @@ pub async fn ingest_records(
         }
     };
 
-    // Run the COPY + merge inside one transaction.
-    let result = write_parsed(
-        &mut client,
-        &meta,
-        p,
-        &parsed,
-        &run_id,
-    )
-    .await;
+    // Dispatch the upsert through the resolved backend (Phase A: Postgres).
+    // Surface the inner anyhow message for `ApiError::Internal` (the write
+    // engine's bail strings) so the failed-run error_text stays identical.
+    let to_anyhow = |e: ApiError| match e {
+        ApiError::Internal(inner) => inner,
+        other => anyhow::anyhow!("{other}"),
+    };
+    let result = match reg.get(p.target_schema, p.target_table).await {
+        Ok(backend) => backend
+            .write_records(&WriteRequest {
+                schema: p.target_schema,
+                table: p.target_table,
+                meta: &meta,
+                records: &parsed,
+                source: p.source,
+                source_endpoint: p.source_endpoint,
+                source_run_id: &run_id,
+            })
+            .await
+            .map_err(to_anyhow),
+        Err(e) => Err(to_anyhow(e)),
+    };
 
     match result {
         Ok((inserted, updated)) => {
@@ -273,71 +291,4 @@ pub async fn ingest_records(
             ))))
         }
     }
-}
-
-/// COPY+merge the parsed records (column intersection + transaction). Returns
-/// `(inserted, updated)`. Empty parsed → (0,0) with no DB work.
-async fn write_parsed(
-    client: &mut deadpool_postgres::Client,
-    meta: &introspect::TableMeta,
-    p: &IngestParams<'_>,
-    parsed: &[Value],
-    run_id: &Uuid,
-) -> anyhow::Result<(i64, i64)> {
-    if parsed.is_empty() {
-        return Ok((0, 0));
-    }
-    let writable: HashSet<&str> = meta.columns.iter().map(|c| c.name.as_str()).collect();
-
-    // Column union across records ∩ writable − server-stamped (raw kept).
-    let mut present: HashSet<String> = HashSet::new();
-    for rec in parsed {
-        if let Some(o) = rec.as_object() {
-            for k in o.keys() {
-                present.insert(k.clone());
-            }
-        }
-    }
-    // Preserve target column order.
-    let cols: Vec<String> = meta
-        .columns
-        .iter()
-        .map(|c| c.name.clone())
-        .filter(|c| {
-            present.contains(c)
-                && writable.contains(c.as_str())
-                && !SERVER_STAMPED_COLS.contains(c.as_str())
-        })
-        .collect();
-
-    if cols.is_empty() {
-        anyhow::bail!(
-            "no usable columns after intersection with {}.{}",
-            p.target_schema,
-            p.target_table
-        );
-    }
-    if meta.conflict_cols.is_empty() {
-        anyhow::bail!(
-            "{}.{} has no UNIQUE/PRIMARY KEY — refusing to upsert",
-            p.target_schema,
-            p.target_table
-        );
-    }
-
-    let tx = client.transaction().await?;
-    let (ins, upd) = engine::copy_and_merge(
-        &tx,
-        p.target_schema,
-        p.target_table,
-        &cols,
-        parsed,
-        p.source,
-        p.source_endpoint,
-        run_id,
-        &meta.conflict_cols,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok((ins, upd))
 }

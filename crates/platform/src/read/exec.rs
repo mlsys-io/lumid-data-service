@@ -18,7 +18,6 @@ use super::bind;
 use super::cache::{CacheKey, CachedBody};
 use super::spec::{EndpointSpec, Shape};
 use crate::db::lineage::strip_lineage_rows;
-use crate::db::rows::rows_to_objects;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -85,6 +84,11 @@ async fn run_spec(
 }
 
 /// Execute the query and serialize the shaped JSON body.
+///
+/// The row fetch is dispatched through the backend registry
+/// (`backends.get(schema, table).query_rows(..)`) resolved on the spec's first
+/// declared table; lineage-strip + shape + serialize stay here. Phase A: every
+/// table resolves to Postgres, so this runs on `st.pool` exactly as before.
 async fn produce(
     st: &AppState,
     spec: &EndpointSpec,
@@ -92,14 +96,29 @@ async fn produce(
     has_symbol: bool,
     symbol: Option<String>,
 ) -> ApiResult<Vec<u8>> {
-    let client = st.pool.get().await?;
-    let rows = client.query(&bound.sql, &bound.refs()).await?;
-    let mut objs = rows_to_objects(&rows);
+    let (schema, table) = read_target(spec);
+    let backend = st.backends.get(&schema, &table).await?;
+    let mut objs = backend
+        .query_rows(&crate::backend::BoundQuery { sql: &bound.sql, params: bound.refs() })
+        .await?;
     if spec.strip_lineage {
         objs = strip_lineage_rows(objs);
     }
     let value = shape(spec, objs, has_symbol, symbol)?;
     serde_json::to_vec(&value).map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))
+}
+
+/// The `(schema, table)` a read endpoint resolves its backend on — the first
+/// declared source table (`schema.table`). Endpoints with no declared table (or
+/// a bare name) default to the empty pair, which resolves to Postgres.
+fn read_target(spec: &EndpointSpec) -> (String, String) {
+    match spec.tables.first() {
+        Some(t) => match t.split_once('.') {
+            Some((s, tbl)) => (s.to_string(), tbl.to_string()),
+            None => (String::new(), t.clone()),
+        },
+        None => (String::new(), String::new()),
+    }
 }
 
 /// Execute a spec from plain param maps (no axum extractors) and return the

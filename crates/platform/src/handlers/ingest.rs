@@ -130,7 +130,7 @@ pub async fn post_typed(
         validate: true,
         fire_lumilake: true,
     };
-    let result = ingest_records(&st.pool, &params, &body.records)
+    let result = ingest_records(&st.backends, &params, &body.records)
         .await
         .map_err(ingest_err_to_api)?;
     invalidate_reads(&st, &result).await;
@@ -199,7 +199,7 @@ pub async fn post_stream(
             validate: true,
             fire_lumilake: false,
         };
-        match ingest_records(&st.pool, &params, chunk).await {
+        match ingest_records(&st.backends, &params, chunk).await {
             Ok(r) => {
                 inserted += r.inserted;
                 updated += r.updated;
@@ -373,7 +373,7 @@ pub async fn post_file(
         validate: true,
         fire_lumilake: true,
     };
-    let result = ingest_records(&st.pool, &params, &records)
+    let result = ingest_records(&st.backends, &params, &records)
         .await
         .map_err(ingest_err_to_api)?;
     invalidate_reads(&st, &result).await;
@@ -521,7 +521,7 @@ pub async fn post_webhook(
         validate: true,
         fire_lumilake: false,
     };
-    let result = ingest_records(&st.pool, &params, &records)
+    let result = ingest_records(&st.backends, &params, &records)
         .await
         .map_err(ingest_err_to_api)?;
     invalidate_reads(&st, &result).await;
@@ -665,10 +665,14 @@ pub async fn revoke_acl(
 }
 
 pub async fn refresh_schemas(
+    State(st): State<AppState>,
     Extension(identity): Extension<Identity>,
 ) -> ApiResult<Json<Value>> {
     require_admin(&identity)?;
     introspect::refresh_cache();
+    // Also clear the backend-resolve cache so a re-approved/migrated table picks
+    // up its (possibly new) backend on the next request.
+    st.backends.refresh_cache().await;
     Ok(Json(json!({"status": "cleared"})))
 }
 

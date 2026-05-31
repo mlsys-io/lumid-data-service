@@ -8,6 +8,7 @@
 
 pub mod app;
 pub mod auth;
+pub mod backend;
 pub mod boot;
 pub mod config;
 pub mod db;

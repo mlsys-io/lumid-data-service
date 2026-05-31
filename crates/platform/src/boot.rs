@@ -123,8 +123,13 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         read_cache.start_invalidation_listener(client.clone());
     }
 
+    // Storage-backend registry (Phase A: Postgres-only). Resolves every table to
+    // Postgres by default, so this is a zero-behavior-change wrapper around the
+    // existing PG paths.
+    let backends = Arc::new(crate::backend::Registry::new_postgres_only(pool.clone()));
+
     let state = state::AppState {
-        pool, settings, lumid, local_keys, rate, redis, redis_client, hub, http, read_cache,
+        pool, settings, lumid, local_keys, rate, redis, redis_client, hub, http, read_cache, backends,
     };
 
     // Auto-MCP: one tool per declarative read endpoint, merged into ext routes.

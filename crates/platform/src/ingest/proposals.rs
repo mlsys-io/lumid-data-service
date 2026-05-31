@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use deadpool_postgres::Pool;
 use serde_json::{json, Map, Value};
 
+use crate::backend::CreateTablePlan;
 use crate::error::{ApiError, ApiResult};
 
 fn norm_ident(s: &str) -> Option<String> {
@@ -209,47 +210,29 @@ pub async fn approve(pool: &Pool, proposal_id: &str, reviewer: &str) -> ApiResul
     let inferred: Value = row.get(3);
     let key: Vec<String> = row.get(4);
 
-    // Re-validate identifiers (defence in depth) + build column DDL.
-    let schema_n = norm_ident(&schema).ok_or_else(|| ApiError::BadRequest("bad schema".into()))?;
-    let table_n = norm_ident(&table).ok_or_else(|| ApiError::BadRequest("bad table".into()))?;
+    // Re-validate identifiers (defence in depth) + build the CREATE TABLE DDL via
+    // the shared builder (same fn the PostgresBackend uses — single source of DDL).
     let obj = inferred.as_object().ok_or_else(|| ApiError::Internal(anyhow::anyhow!("bad inferred_schema")))?;
-    let mut col_ddl = Vec::new();
-    for (c, ty) in obj {
-        let c_n = norm_ident(c).ok_or_else(|| ApiError::BadRequest(format!("bad column {c:?}")))?;
-        let ty_s = match ty.as_str().unwrap_or("text") {
-            "text" | "bigint" | "double precision" | "boolean" | "jsonb" => ty.as_str().unwrap(),
-            _ => "text",
-        };
-        col_ddl.push(format!("\"{c_n}\" {ty_s}"));
-    }
-    // PK = inferred key (+ source for multi-source safety) if all present; else a surrogate.
-    let key_n: Vec<String> = key.iter().filter_map(|k| norm_ident(k)).filter(|k| obj.contains_key(k)).collect();
-    let pk = if key_n.is_empty() {
-        "  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n".to_string()
-    } else {
-        String::new()
-    };
-    let pk_constraint = if key_n.is_empty() {
-        String::new()
-    } else {
-        let mut cols = key_n.clone();
-        cols.push("source".into());
-        format!(",\n  PRIMARY KEY ({})", cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", "))
-    };
-
-    let ddl = format!(
-        "CREATE TABLE IF NOT EXISTS \"{schema_n}\".\"{table_n}\" (\n{pk}  {cols},\n\
-           source text NOT NULL,\n  source_endpoint text NOT NULL,\n\
-           source_run_id uuid NOT NULL REFERENCES provenance.runs(run_id),\n\
-           ingest_ts timestamptz NOT NULL DEFAULT now(),\n  raw jsonb{pkc}\n)",
-        cols = col_ddl.join(",\n  "),
-        pkc = pk_constraint,
-    );
+    let (schema_n, table_n, ddl) = crate::backend::postgres::build_create_table_ddl(&CreateTablePlan {
+        schema: &schema,
+        table: &table,
+        inferred: obj,
+        key: &key,
+    })?;
 
     let tx = client.transaction().await?;
     tx.batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema_n}\"")).await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("create schema: {e}")))?;
     tx.batch_execute(&ddl).await.map_err(|e| ApiError::Internal(anyhow::anyhow!("create table: {e}")))?;
+    // Record the storage backend for this table (Phase A: always 'postgres'),
+    // in the same transaction as the CREATE so the registry never sees a created
+    // table without a backend row.
+    tx.execute(
+        "INSERT INTO provenance.table_backend (target_schema, target_table, backend) \
+         VALUES ($1,$2,'postgres') \
+         ON CONFLICT (target_schema, target_table) DO UPDATE SET backend=EXCLUDED.backend",
+        &[&schema_n, &table_n],
+    ).await?;
     tx.execute(
         "INSERT INTO provenance.ingress_acl (role, target_schema, target_table, can_write, notes) \
          VALUES ($1,$2,$3,true,'auto-granted on proposal approval') \
