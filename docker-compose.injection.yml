@@ -34,6 +34,15 @@ services:
       FINDATA_DB_NAME: fin_ai_world_model_v2
       FINDATA_POOL_MIN: "2"
       FINDATA_POOL_MAX: "20"
+      # ClickHouse backend (multi-backend Phase B) — OPTIONAL. Leave
+      # FINDATA_CLICKHOUSE_URL empty (the default) to run Postgres-only (Phase A
+      # behavior). When set (HTTP interface, e.g. http://clickhouse:8123), a
+      # table can be approved onto ClickHouse instead of Postgres; the writer is
+      # unaffected (still POSTs to /ingest/:schema/:table).
+      FINDATA_CLICKHOUSE_URL: "${FINDATA_CLICKHOUSE_URL:-}"
+      FINDATA_CLICKHOUSE_USER: "${FINDATA_CLICKHOUSE_USER:-default}"
+      FINDATA_CLICKHOUSE_PASSWORD: "${FINDATA_CLICKHOUSE_PASSWORD:-}"
+      FINDATA_CLICKHOUSE_DB: "${FINDATA_CLICKHOUSE_DB:-default}"
       # Generous write-side statement timeout (large stream/file merges must
       # not be killed mid-COPY; a wedged backend still can't pin forever).
       FINDATA_INGEST_STATEMENT_TIMEOUT_MS: "600000"

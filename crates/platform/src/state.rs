@@ -29,4 +29,8 @@ pub struct AppState {
     /// Pluggable blob object-store backend (local filesystem by default, or
     /// S3/MinIO when `FINDATA_BLOB_BACKEND=s3`). Built once at boot.
     pub blob_store: Arc<dyn object_store::ObjectStore>,
+    /// Storage-backend registry — resolves `schema.table → Backend`. Phase A is
+    /// Postgres-only (default-to-PG when no `provenance.table_backend` row), so
+    /// every existing table resolves to PG with no behavior change.
+    pub backends: Arc<crate::backend::Registry>,
 }

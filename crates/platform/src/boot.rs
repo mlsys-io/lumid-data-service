@@ -125,8 +125,29 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         read_cache.start_invalidation_listener(client.clone());
     }
 
+    // Storage-backend registry. Postgres is always the default; ClickHouse is
+    // registered as an additional backend when `FINDATA_CLICKHOUSE_URL` is set
+    // (Phase B). With CH unconfigured this is the Phase-A zero-behavior-change
+    // wrapper — every table resolves to Postgres.
+    let backends = if settings.ch_url.is_empty() {
+        Arc::new(crate::backend::Registry::new_postgres_only(pool.clone()))
+    } else {
+        let ch = crate::backend::ClickHouseBackend::new(
+            &settings.ch_url,
+            &settings.ch_user,
+            &settings.ch_password,
+            &settings.ch_database,
+        );
+        tracing::info!(
+            "backends: ClickHouse enabled ({} db={})",
+            settings.ch_url,
+            settings.ch_database
+        );
+        Arc::new(crate::backend::Registry::new_with_clickhouse(pool.clone(), ch))
+    };
+
     let state = state::AppState {
-        pool, settings, lumid, local_keys, rate, redis, redis_client, hub, http, read_cache, blob_store,
+        pool, settings, lumid, local_keys, rate, redis, redis_client, hub, http, read_cache, blob_store, backends,
     };
 
     // Auto-MCP: one tool per declarative read endpoint, merged into ext routes.

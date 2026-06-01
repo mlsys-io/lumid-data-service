@@ -130,7 +130,7 @@ pub async fn post_typed(
         validate: true,
         fire_lumilake: true,
     };
-    let result = ingest_records(&st.pool, &params, &body.records)
+    let result = ingest_records(&st.backends, &params, &body.records)
         .await
         .map_err(ingest_err_to_api)?;
     invalidate_reads(&st, &result).await;
@@ -199,7 +199,7 @@ pub async fn post_stream(
             validate: true,
             fire_lumilake: false,
         };
-        match ingest_records(&st.pool, &params, chunk).await {
+        match ingest_records(&st.backends, &params, chunk).await {
             Ok(r) => {
                 inserted += r.inserted;
                 updated += r.updated;
@@ -373,7 +373,7 @@ pub async fn post_file(
         validate: true,
         fire_lumilake: true,
     };
-    let result = ingest_records(&st.pool, &params, &records)
+    let result = ingest_records(&st.backends, &params, &records)
         .await
         .map_err(ingest_err_to_api)?;
     invalidate_reads(&st, &result).await;
@@ -522,7 +522,7 @@ pub async fn post_webhook(
         validate: true,
         fire_lumilake: false,
     };
-    let result = ingest_records(&st.pool, &params, &records)
+    let result = ingest_records(&st.backends, &params, &records)
         .await
         .map_err(ingest_err_to_api)?;
     invalidate_reads(&st, &result).await;
@@ -570,13 +570,43 @@ pub async fn list_proposals(
     Ok(Json(crate::ingest::proposals::list(&st.pool, status.as_deref()).await?))
 }
 
+/// Optional approve body: `{ "backend": "postgres" | "clickhouse" }`. Overrides
+/// the proposal's stored `suggested_backend`. Absent ⇒ use the suggestion.
+#[derive(Deserialize, Default)]
+pub struct ApproveBody {
+    #[serde(default)]
+    pub backend: Option<String>,
+}
+
 pub async fn approve_proposal(
     State(st): State<AppState>,
     Extension(identity): Extension<Identity>,
     Path(proposal_id): Path<String>,
+    body: Option<Json<ApproveBody>>,
 ) -> ApiResult<Json<Value>> {
     require_admin(&identity)?;
-    Ok(Json(crate::ingest::proposals::approve(&st.pool, &proposal_id, &identity.sub).await?))
+    // Parse the optional backend override. An explicitly-supplied unknown value
+    // is rejected rather than silently defaulting to Postgres, so a typo can't
+    // quietly route a table to the wrong engine.
+    let override_kind = match body.and_then(|Json(b)| b.backend) {
+        Some(s) => {
+            let want = s.trim().to_ascii_lowercase();
+            match want.as_str() {
+                "postgres" => Some(crate::backend::BackendKind::Postgres),
+                "clickhouse" => Some(crate::backend::BackendKind::ClickHouse),
+                _ => {
+                    return Err(ApiError::BadRequest(format!(
+                        "backend must be 'postgres' or 'clickhouse' (got {s:?})"
+                    )))
+                }
+            }
+        }
+        None => None,
+    };
+    Ok(Json(
+        crate::ingest::proposals::approve(&st.backends, &proposal_id, &identity.sub, override_kind)
+            .await?,
+    ))
 }
 
 pub async fn reject_proposal(
@@ -644,7 +674,8 @@ pub async fn builder_approve_proposal(
     Path(proposal_id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     allow_proposer_or_admin(&st, &identity, &proposal_id).await?;
-    Ok(Json(crate::ingest::proposals::approve(&st.pool, &proposal_id, &identity.sub).await?))
+    // Builder approve uses the proposal's stored suggested backend (no override).
+    Ok(Json(crate::ingest::proposals::approve(&st.backends, &proposal_id, &identity.sub, None).await?))
 }
 
 /// `POST /ingress/proposals/{id}/reject` — builder (or admin) abandons it.
@@ -735,10 +766,14 @@ pub async fn revoke_acl(
 }
 
 pub async fn refresh_schemas(
+    State(st): State<AppState>,
     Extension(identity): Extension<Identity>,
 ) -> ApiResult<Json<Value>> {
     require_admin(&identity)?;
     introspect::refresh_cache();
+    // Also clear the backend-resolve cache so a re-approved/migrated table picks
+    // up its (possibly new) backend on the next request.
+    st.backends.refresh_cache().await;
     Ok(Json(json!({"status": "cleared"})))
 }
 
