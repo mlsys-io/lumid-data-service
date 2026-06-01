@@ -71,20 +71,21 @@ pub struct Settings {
     pub blob_s3_region: String,
     pub blob_s3_access_key: String,
     pub blob_s3_secret_key: String,
-    /// Root dir for served KOL media (empty disables `/kols/media/*` serving).
-    pub kol_media_root: String,
 
     // Realtime hub (SSE/WS fan-out). Mirrors the FINDATA_RT_* knobs.
     pub rt_heartbeat_sec: u64,
     pub rt_ws_lifetime_syms: u64,
     pub rt_sse_request_syms: usize,
     pub rt_slowclient_queue: usize,
-    /// Generic Tier-B/poll cadences (provider-specific slot caps + keys live in
-    /// the app layer — see findata-ext::cfg — so the platform names no provider).
+    /// Generic Tier-B/poll cadence (provider-specific slot caps + keys + the
+    /// per-provider poll cadences live in the app layer — see findata-ext::cfg —
+    /// so the platform names no provider).
     pub rt_tier_b_poll_sec: u64,
     pub rt_news_poll_sec: u64,
-    pub rt_kol_poll_sec: u64,
-    pub rt_kol_max_per_poll: usize,
+    /// Redis pub/sub channel KINDS the hub fans out (`<kind>:<key>` channels).
+    /// The platform names no domain channel — apps declare their kinds via
+    /// `FINDATA_RT_CHANNEL_KINDS` (comma-separated). Default `tick,news`.
+    pub rt_channel_kinds: Vec<String>,
     /// Enable the synthetic test publisher (dev only).
     pub rt_synthetic: bool,
     /// Symbols to keep subscribed independent of client demand, so their
@@ -136,15 +137,17 @@ impl Settings {
             blob_s3_region: env_str("FINDATA_BLOB_S3_REGION", "us-east-1"),
             blob_s3_access_key: env_str("FINDATA_BLOB_S3_ACCESS_KEY", ""),
             blob_s3_secret_key: env_str("FINDATA_BLOB_S3_SECRET_KEY", ""),
-            kol_media_root: env_str("FINDATA_KOL_MEDIA_ROOT", ""),
             rt_heartbeat_sec: env_u32("FINDATA_RT_HEARTBEAT_SEC", 30) as u64,
             rt_ws_lifetime_syms: env_u32("FINDATA_RT_WS_LIFETIME_SYMS", 500) as u64,
             rt_sse_request_syms: env_u32("FINDATA_RT_SSE_REQUEST_SYMS", 100) as usize,
             rt_slowclient_queue: env_u32("FINDATA_RT_SLOWCLIENT_QUEUE", 100) as usize,
             rt_tier_b_poll_sec: env_u32("FINDATA_RT_TIER_B_POLL_SEC", 5) as u64,
             rt_news_poll_sec: env_u32("FINDATA_RT_NEWS_POLL_SEC", 60) as u64,
-            rt_kol_poll_sec: env_u32("FINDATA_RT_KOL_POLL_SEC", 300) as u64,
-            rt_kol_max_per_poll: env_u32("FINDATA_RT_KOL_MAX_PER_POLL", 20) as usize,
+            rt_channel_kinds: env_str("FINDATA_RT_CHANNEL_KINDS", "tick,news")
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
             rt_synthetic: matches!(
                 env_str("FINDATA_RT_SYNTHETIC", "").to_lowercase().as_str(),
                 "1" | "true" | "yes"
