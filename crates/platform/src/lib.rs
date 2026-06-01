@@ -2,8 +2,8 @@
 //!
 //! Exposes the generic read/write/realtime data service as a library so a thin
 //! binary (and, after the repo split, a separate `my_ext` crate) can build
-//! on it. The crate is domain-agnostic: the financial specifics live in
-//! `financial.toml` (declarative reads) + the bespoke handlers/upstreams that
+//! on it. The crate is domain-agnostic: the app specifics live in
+//! the read-config TOML (declarative reads) + the bespoke handlers/upstreams that
 //! register into it (the `my_ext` boundary, established incrementally).
 
 pub mod app;

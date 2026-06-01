@@ -1,5 +1,5 @@
-//! HTTP handlers — platform (generic) only. Financial read handlers moved to
-//! the `my_ext` crate.
+//! HTTP handlers — platform (generic) only. App read handlers live in the
+//! `my_ext` crate.
 
 pub mod blobs;
 pub mod catalog;

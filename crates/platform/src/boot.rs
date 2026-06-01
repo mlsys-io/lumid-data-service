@@ -64,9 +64,8 @@ impl Default for ServeParts {
     }
 }
 
-/// Boot + serve until shutdown. Reads `LUMID_*` from env (legacy `FINDATA_*`
-/// accepted as a fallback — see `config::env_var`), incl. `LUMID_READ_CONFIG`
-/// for the read specs (legacy `FINDATA_FINANCIAL_CONFIG`), default `read.toml`.
+/// Boot + serve until shutdown. Reads `LUMID_*` from env, incl.
+/// `LUMID_READ_CONFIG` for the read specs (default `read.toml`).
 pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
@@ -133,11 +132,7 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
 
     let blob_store = build_blob_store(&settings);
 
-    // Canonical: LUMID_READ_CONFIG. Legacy fallbacks: FINDATA_READ_CONFIG (via
-    // env_var) and the original domain-named FINDATA_FINANCIAL_CONFIG.
-    let spec_path = config::env_var("READ_CONFIG")
-        .or_else(|| std::env::var("FINDATA_FINANCIAL_CONFIG").ok())
-        .unwrap_or_else(|| "read.toml".to_string());
+    let spec_path = config::env_var("READ_CONFIG").unwrap_or_else(|| "read.toml".to_string());
     let specs = match read::load_specs(&spec_path) {
         Ok(s) => {
             tracing::info!("read layer: {} declarative endpoints from {spec_path}", s.len());

@@ -93,9 +93,9 @@ services:
       LUMID_BLOB_S3_SECRET_KEY: ${MINIO_PASSWORD}
       LUMID_BLOB_S3_REGION: us-east-1
       # Your declarative read endpoints.
-      LUMID_FINANCIAL_CONFIG: /app/app.toml
+      LUMID_READ_CONFIG: /app/app.toml
       # Standalone auth: local key(s), no external introspection. Set a real key.
-      LUMID_LUMID_ENABLED: "false"
+      LUMID_AUTH_ENABLED: "false"
       LUMID_API_KEYS: ${API_KEYS:-devkey:dev}
       LUMID_BIND_ADDR: "0.0.0.0:8088"
     volumes:
