@@ -6,9 +6,10 @@
 //!   back to `application/octet-stream`. 404 if the file is missing; 400 on any
 //!   path-traversal attempt that escapes blob_root; 503 if blob_root unset.
 //!
-//! GET /storage/v1/object/findata/{path:path}
-//!   Back-compat alias — 302-redirects to `/blobs/{path}` so legacy
-//!   `raw.blobs.storage_url` values stay resolvable after the migration.
+//! `legacy_storage_alias` — a generic blob-by-path handler that 302-redirects
+//!   to `/blobs/{path}`. The platform names no path for it; an app mounts it at
+//!   whatever legacy/compat URL it needs (findata mounts it at the old
+//!   `/storage/v1/object/findata/{path}` so legacy `storage_url` values resolve).
 
 use std::path::{Component, Path as FsPath};
 

@@ -36,7 +36,7 @@ pub use registry::Registry;
 
 /// Which storage engine a table lives on. As of Phase B the `ClickHouse`
 /// variant is a working backend ([`ClickHouseBackend`]) when the deployment has
-/// `FINDATA_CLICKHOUSE_URL` configured; otherwise the registry leaves the slot
+/// `LUMID_CLICKHOUSE_URL` configured; otherwise the registry leaves the slot
 /// `None` and falls back to Postgres.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {

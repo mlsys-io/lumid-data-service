@@ -1,18 +1,32 @@
-//! Runtime configuration, read from env vars. Names mirror the Python
-//! services (`FINDATA_*`) so deploy env carries over unchanged.
+//! Runtime configuration, read from env vars.
+//!
+//! The crate is `lumid-platform`, so the **canonical** env prefix is `LUMID_`
+//! and the platform names no domain in its config namespace. The legacy
+//! `FINDATA_` prefix (carried over verbatim from the pre-split Python service)
+//! is still accepted as a fallback so existing deploy env keeps working — set
+//! `LUMID_*` and the `FINDATA_*` fallback can be dropped. App-specific config
+//! (provider keys, etc.) is named by the app, not here (e.g. `findata-ext::cfg`).
 
 use std::env;
 
-fn env_str(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_string())
+/// Read a platform setting by its bare NAME (no prefix). Tries `LUMID_<NAME>`
+/// first (canonical), then `FINDATA_<NAME>` (legacy fallback).
+pub fn env_var(name: &str) -> Option<String> {
+    env::var(format!("LUMID_{name}"))
+        .or_else(|_| env::var(format!("FINDATA_{name}")))
+        .ok()
 }
 
-fn env_u32(key: &str, default: u32) -> u32 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+fn env_str(name: &str, default: &str) -> String {
+    env_var(name).unwrap_or_else(|| default.to_string())
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+fn env_u32(name: &str, default: u32) -> u32 {
+    env_var(name).and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    env_var(name).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 #[derive(Clone, Debug)]
@@ -42,7 +56,7 @@ pub struct Settings {
     pub lumid_enabled: bool,
     pub lumid_cache_ttl_s: u64,
     pub lumid_timeout_s: u64,
-    /// Raw `FINDATA_API_KEYS` value (`key:label,key:label`); parsed in auth.
+    /// Raw `LUMID_API_KEYS` value (`key:label,key:label`); parsed in auth.
     pub api_keys_raw: String,
 
     // Rate limit, "<n>/<unit>" e.g. "600/minute".
@@ -72,7 +86,7 @@ pub struct Settings {
     pub blob_s3_access_key: String,
     pub blob_s3_secret_key: String,
 
-    // Realtime hub (SSE/WS fan-out). Mirrors the FINDATA_RT_* knobs.
+    // Realtime hub (SSE/WS fan-out). The LUMID_RT_* knobs.
     pub rt_heartbeat_sec: u64,
     pub rt_ws_lifetime_syms: u64,
     pub rt_sse_request_syms: usize,
@@ -84,13 +98,13 @@ pub struct Settings {
     pub rt_news_poll_sec: u64,
     /// Redis pub/sub channel KINDS the hub fans out (`<kind>:<key>` channels).
     /// The platform names no domain channel — apps declare their kinds via
-    /// `FINDATA_RT_CHANNEL_KINDS` (comma-separated). Default `tick,news`.
+    /// `LUMID_RT_CHANNEL_KINDS` (comma-separated). Default `tick,news`.
     pub rt_channel_kinds: Vec<String>,
     /// Enable the synthetic test publisher (dev only).
     pub rt_synthetic: bool,
     /// Symbols to keep subscribed independent of client demand, so their
     /// `last:tick` cache stays warm and `/quotes` returns live ticks even with
-    /// no active stream. Comma-separated (`FINDATA_RT_WARM_SYMBOLS`). Best for
+    /// no active stream. Comma-separated (`LUMID_RT_WARM_SYMBOLS`). Best for
     /// 24/7 venues (crypto/forex). Empty = demand-gated only (default).
     pub rt_warm_symbols: Vec<String>,
 
@@ -102,63 +116,63 @@ pub struct Settings {
 impl Settings {
     pub fn from_env() -> Self {
         Settings {
-            db_host: env_str("FINDATA_DB_HOST", "127.0.0.1"),
-            db_port: env_u32("FINDATA_DB_PORT", 5433) as u16,
-            db_user: env_str("FINDATA_DB_USER", "postgres"),
-            db_password: env_str("FINDATA_DB_PASSWORD", ""),
-            db_name: env_str("FINDATA_DB_NAME", "fin_ai_world_model_v2"),
-            pool_max: env_u32("FINDATA_POOL_MAX", 20) as usize,
-            statement_timeout_ms: env_u32("FINDATA_STATEMENT_TIMEOUT_MS", 30000),
-            ohlc_row_cap: env_u32("FINDATA_OHLC_ROW_CAP", 200_000) as i64,
-            bind_addr: env_str("FINDATA_BIND_ADDR", "0.0.0.0:8088"),
-            ch_url: env_str("FINDATA_CLICKHOUSE_URL", ""),
-            ch_user: env_str("FINDATA_CLICKHOUSE_USER", "default"),
-            ch_password: env_str("FINDATA_CLICKHOUSE_PASSWORD", ""),
-            ch_database: env_str("FINDATA_CLICKHOUSE_DB", "default"),
-            lumid_url: env_str("FINDATA_LUMID_URL", "https://lum.id"),
+            db_host: env_str("DB_HOST", "127.0.0.1"),
+            db_port: env_u32("DB_PORT", 5433) as u16,
+            db_user: env_str("DB_USER", "postgres"),
+            db_password: env_str("DB_PASSWORD", ""),
+            db_name: env_str("DB_NAME", "postgres"),
+            pool_max: env_u32("POOL_MAX", 20) as usize,
+            statement_timeout_ms: env_u32("STATEMENT_TIMEOUT_MS", 30000),
+            ohlc_row_cap: env_u32("OHLC_ROW_CAP", 200_000) as i64,
+            bind_addr: env_str("BIND_ADDR", "0.0.0.0:8088"),
+            ch_url: env_str("CLICKHOUSE_URL", ""),
+            ch_user: env_str("CLICKHOUSE_USER", "default"),
+            ch_password: env_str("CLICKHOUSE_PASSWORD", ""),
+            ch_database: env_str("CLICKHOUSE_DB", "default"),
+            lumid_url: env_str("LUMID_URL", "https://lum.id"),
             lumid_enabled: matches!(
-                env_str("FINDATA_LUMID_ENABLED", "true").to_lowercase().as_str(),
+                env_str("LUMID_ENABLED", "true").to_lowercase().as_str(),
                 "1" | "true" | "yes"
             ),
-            lumid_cache_ttl_s: env_u32("FINDATA_LUMID_CACHE_TTL", 300) as u64,
-            lumid_timeout_s: env_u32("FINDATA_LUMID_TIMEOUT_S", 5) as u64,
-            api_keys_raw: env_str("FINDATA_API_KEYS", ""),
-            rate_limit_anon: env_str("FINDATA_RATE_LIMIT_ANON", "60/minute"),
-            rate_limit_authed: env_str("FINDATA_RATE_LIMIT_AUTHED", "600/minute"),
-            redis_url: env_str("FINDATA_REDIS_URL", ""),
-            quotes_max_symbols: env_u32("FINDATA_RT_SSE_REQUEST_SYMS", 100) as usize,
-            blob_root: env_str("FINDATA_BLOB_ROOT", "/app/blobs"),
-            blob_max_bytes: env_u64("FINDATA_BLOB_MAX_BYTES", 100 * 1024 * 1024),
-            ingest_max_bytes: env_u64("FINDATA_INGEST_MAX_BYTES", 256 * 1024 * 1024),
-            blob_public_base_url: env_str("FINDATA_BLOB_PUBLIC_BASE_URL", ""),
-            blob_backend: env_str("FINDATA_BLOB_BACKEND", "localfs"),
-            blob_s3_endpoint: env_str("FINDATA_BLOB_S3_ENDPOINT", ""),
-            blob_s3_bucket: env_str("FINDATA_BLOB_S3_BUCKET", ""),
-            blob_s3_region: env_str("FINDATA_BLOB_S3_REGION", "us-east-1"),
-            blob_s3_access_key: env_str("FINDATA_BLOB_S3_ACCESS_KEY", ""),
-            blob_s3_secret_key: env_str("FINDATA_BLOB_S3_SECRET_KEY", ""),
-            rt_heartbeat_sec: env_u32("FINDATA_RT_HEARTBEAT_SEC", 30) as u64,
-            rt_ws_lifetime_syms: env_u32("FINDATA_RT_WS_LIFETIME_SYMS", 500) as u64,
-            rt_sse_request_syms: env_u32("FINDATA_RT_SSE_REQUEST_SYMS", 100) as usize,
-            rt_slowclient_queue: env_u32("FINDATA_RT_SLOWCLIENT_QUEUE", 100) as usize,
-            rt_tier_b_poll_sec: env_u32("FINDATA_RT_TIER_B_POLL_SEC", 5) as u64,
-            rt_news_poll_sec: env_u32("FINDATA_RT_NEWS_POLL_SEC", 60) as u64,
-            rt_channel_kinds: env_str("FINDATA_RT_CHANNEL_KINDS", "tick,news")
+            lumid_cache_ttl_s: env_u32("LUMID_CACHE_TTL", 300) as u64,
+            lumid_timeout_s: env_u32("LUMID_TIMEOUT_S", 5) as u64,
+            api_keys_raw: env_str("API_KEYS", ""),
+            rate_limit_anon: env_str("RATE_LIMIT_ANON", "60/minute"),
+            rate_limit_authed: env_str("RATE_LIMIT_AUTHED", "600/minute"),
+            redis_url: env_str("REDIS_URL", ""),
+            quotes_max_symbols: env_u32("RT_SSE_REQUEST_SYMS", 100) as usize,
+            blob_root: env_str("BLOB_ROOT", "/app/blobs"),
+            blob_max_bytes: env_u64("BLOB_MAX_BYTES", 100 * 1024 * 1024),
+            ingest_max_bytes: env_u64("INGEST_MAX_BYTES", 256 * 1024 * 1024),
+            blob_public_base_url: env_str("BLOB_PUBLIC_BASE_URL", ""),
+            blob_backend: env_str("BLOB_BACKEND", "localfs"),
+            blob_s3_endpoint: env_str("BLOB_S3_ENDPOINT", ""),
+            blob_s3_bucket: env_str("BLOB_S3_BUCKET", ""),
+            blob_s3_region: env_str("BLOB_S3_REGION", "us-east-1"),
+            blob_s3_access_key: env_str("BLOB_S3_ACCESS_KEY", ""),
+            blob_s3_secret_key: env_str("BLOB_S3_SECRET_KEY", ""),
+            rt_heartbeat_sec: env_u32("RT_HEARTBEAT_SEC", 30) as u64,
+            rt_ws_lifetime_syms: env_u32("RT_WS_LIFETIME_SYMS", 500) as u64,
+            rt_sse_request_syms: env_u32("RT_SSE_REQUEST_SYMS", 100) as usize,
+            rt_slowclient_queue: env_u32("RT_SLOWCLIENT_QUEUE", 100) as usize,
+            rt_tier_b_poll_sec: env_u32("RT_TIER_B_POLL_SEC", 5) as u64,
+            rt_news_poll_sec: env_u32("RT_NEWS_POLL_SEC", 60) as u64,
+            rt_channel_kinds: env_str("RT_CHANNEL_KINDS", "tick,news")
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
             rt_synthetic: matches!(
-                env_str("FINDATA_RT_SYNTHETIC", "").to_lowercase().as_str(),
+                env_str("RT_SYNTHETIC", "").to_lowercase().as_str(),
                 "1" | "true" | "yes"
             ),
-            rt_warm_symbols: env_str("FINDATA_RT_WARM_SYMBOLS", "")
+            rt_warm_symbols: env_str("RT_WARM_SYMBOLS", "")
                 .split(',')
                 .map(|s| s.trim().to_uppercase())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            llm_backend_url: env_str("FINDATA_LLM_BACKEND_URL", ""),
-            llm_default_model: env_str("FINDATA_LLM_DEFAULT_MODEL", ""),
+            llm_backend_url: env_str("LLM_BACKEND_URL", ""),
+            llm_default_model: env_str("LLM_DEFAULT_MODEL", ""),
         }
     }
 }

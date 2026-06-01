@@ -8,8 +8,6 @@
 //! but env-read keeps the hook self-contained and matches the Python module's
 //! direct `settings.*` access.
 
-use std::env;
-
 use serde_json::json;
 
 use super::core::IngestResult;
@@ -23,12 +21,7 @@ pub struct LumilakeInfo {
 }
 
 fn base_url() -> Option<String> {
-    let v = env::var("FINDATA_LUMILAKE_BASE_URL").unwrap_or_default();
-    if v.is_empty() {
-        None
-    } else {
-        Some(v)
-    }
+    crate::config::env_var("LUMILAKE_BASE_URL").filter(|v| !v.is_empty())
 }
 
 /// on_finalize equivalent — spawns a detached task that POSTs the job event.
@@ -41,10 +34,9 @@ pub fn submit_after_ingest(result: &IngestResult, info: LumilakeInfo) {
         return;
     }
     let workflow =
-        env::var("FINDATA_LUMILAKE_WORKFLOW").unwrap_or_else(|_| "findata-ingress-followup".into());
-    let token = env::var("FINDATA_LUMILAKE_TOKEN").ok().filter(|s| !s.is_empty());
-    let timeout_s = env::var("FINDATA_LUMILAKE_TIMEOUT_S")
-        .ok()
+        crate::config::env_var("LUMILAKE_WORKFLOW").unwrap_or_else(|| "ingress-followup".into());
+    let token = crate::config::env_var("LUMILAKE_TOKEN").filter(|s| !s.is_empty());
+    let timeout_s = crate::config::env_var("LUMILAKE_TIMEOUT_S")
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(10.0);
 

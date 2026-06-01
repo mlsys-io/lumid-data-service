@@ -1,4 +1,4 @@
-//! `financial.toml` read-endpoint spec types + loader.
+//! Read-endpoint spec types + loader (parses the app's read-config TOML).
 //!
 //! Each `[[read.endpoint]]` is a declarative read: a named-bind SQL template
 //! (`:name` values, always bound — never interpolated) with allow-listed
@@ -142,7 +142,7 @@ struct ReadSection {
     endpoint: Vec<EndpointSpec>,
 }
 
-/// Parse `financial.toml` into endpoint specs + run startup lints.
+/// Parse the read-config TOML into endpoint specs + run startup lints.
 pub fn load(path: &str) -> Result<Vec<EndpointSpec>, ApiError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("read {path}: {e}")))?;
@@ -151,7 +151,7 @@ pub fn load(path: &str) -> Result<Vec<EndpointSpec>, ApiError> {
 
 pub fn parse(text: &str) -> Result<Vec<EndpointSpec>, ApiError> {
     let root: Root = toml::from_str(text)
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("parse financial.toml: {e}")))?;
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("parse read config: {e}")))?;
     for ep in &root.read.endpoint {
         lint(ep)?;
     }

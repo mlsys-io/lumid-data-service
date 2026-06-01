@@ -40,5 +40,9 @@ zstd = "0.13"
 hex = "0.4"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots", "connect"] }
 tokio-util = { version = "0.7", features = ["io"] }
+# Pin the rustls crypto provider explicitly: both `ring` and `aws-lc-rs` are in
+# the graph (the latter via the ClickHouse client), so rustls 0.23 can't
+# auto-pick — install ring once at boot before any TLS use (see boot::serve).
+rustls = { version = "0.23", features = ["ring"] }
 toml = "0.8"
 humantime = "2"

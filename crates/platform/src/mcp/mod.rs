@@ -77,7 +77,7 @@ async fn handle(reg: &McpRegistry, st: AppState, body: Value) -> Response {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {"listChanged": false}},
                 "serverInfo": {
-                    "name": std::env::var("FINDATA_SERVICE_NAME").unwrap_or_else(|_| "lumid".into()),
+                    "name": crate::config::env_var("SERVICE_NAME").unwrap_or_else(|| "lumid".into()),
                     "version": env!("CARGO_PKG_VERSION")
                 }
             }),

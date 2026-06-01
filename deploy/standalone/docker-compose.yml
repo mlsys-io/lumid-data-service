@@ -79,25 +79,25 @@ services:
       minio:
         condition: service_healthy
     environment:
-      FINDATA_DB_HOST: db
-      FINDATA_DB_PORT: "5432"
-      FINDATA_DB_USER: postgres
-      FINDATA_DB_PASSWORD: ${DB_PASSWORD}
-      FINDATA_DB_NAME: ${DB_NAME:-appdb}
-      FINDATA_REDIS_URL: redis://redis:6379
+      LUMID_DB_HOST: db
+      LUMID_DB_PORT: "5432"
+      LUMID_DB_USER: postgres
+      LUMID_DB_PASSWORD: ${DB_PASSWORD}
+      LUMID_DB_NAME: ${DB_NAME:-appdb}
+      LUMID_REDIS_URL: redis://redis:6379
       # Blobs → the in-folder MinIO (object storage stays inside the bundle).
-      FINDATA_BLOB_BACKEND: s3
-      FINDATA_BLOB_S3_ENDPOINT: http://minio:9000
-      FINDATA_BLOB_S3_BUCKET: ${BLOB_BUCKET:-blobs}
-      FINDATA_BLOB_S3_ACCESS_KEY: ${MINIO_USER:-minioadmin}
-      FINDATA_BLOB_S3_SECRET_KEY: ${MINIO_PASSWORD}
-      FINDATA_BLOB_S3_REGION: us-east-1
+      LUMID_BLOB_BACKEND: s3
+      LUMID_BLOB_S3_ENDPOINT: http://minio:9000
+      LUMID_BLOB_S3_BUCKET: ${BLOB_BUCKET:-blobs}
+      LUMID_BLOB_S3_ACCESS_KEY: ${MINIO_USER:-minioadmin}
+      LUMID_BLOB_S3_SECRET_KEY: ${MINIO_PASSWORD}
+      LUMID_BLOB_S3_REGION: us-east-1
       # Your declarative read endpoints.
-      FINDATA_FINANCIAL_CONFIG: /app/app.toml
+      LUMID_FINANCIAL_CONFIG: /app/app.toml
       # Standalone auth: local key(s), no external introspection. Set a real key.
-      FINDATA_LUMID_ENABLED: "false"
-      FINDATA_API_KEYS: ${API_KEYS:-devkey:dev}
-      FINDATA_BIND_ADDR: "0.0.0.0:8088"
+      LUMID_LUMID_ENABLED: "false"
+      LUMID_API_KEYS: ${API_KEYS:-devkey:dev}
+      LUMID_BIND_ADDR: "0.0.0.0:8088"
     volumes:
       - ./app.toml:/app/app.toml:ro
     ports:

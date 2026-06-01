@@ -39,10 +39,13 @@ pub struct ServeParts {
     /// SSE/WS routes it mounts). Shape: `{ "/path": { "get": {<operation>} } }`.
     /// Default empty.
     pub openapi_paths: serde_json::Value,
+    /// App `/status` feed-liveness policy (warm-symbol grouping + expected-live).
+    /// `None` ⇒ the platform default (`realtime` group, always expected live).
+    pub feed_liveness: Option<Arc<dyn realtime::FeedLiveness>>,
     pub workers: Vec<Box<dyn UpstreamWorker>>,
     /// Enable the platform's LLM reverse-proxy feature (`/v1/*`). Optional per
     /// app — off by default; an app flips this to serve LLM (proxies to
-    /// `FINDATA_LLM_BACKEND_URL`). The capability lives in the platform; only
+    /// `LUMID_LLM_BACKEND_URL`). The capability lives in the platform; only
     /// the decision to expose it is the app's.
     pub enable_llm: bool,
 }
@@ -54,18 +57,27 @@ impl Default for ServeParts {
             public_routes: Router::new(),
             landing: crate::handlers::landing::default_routes(),
             openapi_paths: serde_json::json!({}),
+            feed_liveness: None,
             workers: Vec::new(),
             enable_llm: false,
         }
     }
 }
 
-/// Boot + serve until shutdown. Reads `FINDATA_*` from env (incl.
-/// `FINDATA_FINANCIAL_CONFIG` for the read specs, default `financial.toml`).
+/// Boot + serve until shutdown. Reads `LUMID_*` from env (legacy `FINDATA_*`
+/// accepted as a fallback — see `config::env_var`), incl. `LUMID_READ_CONFIG`
+/// for the read specs (legacy `FINDATA_FINANCIAL_CONFIG`), default `read.toml`.
 pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+
+    // rustls 0.23 needs a process-global crypto provider. Both `ring` and
+    // `aws-lc-rs` are in the dependency graph (the latter via the ClickHouse
+    // client), so rustls can't auto-determine one and the FIRST TLS connection
+    // (a WS upstream / reqwest / ClickHouse) panics its task. Install ring once,
+    // up front, so every TLS user shares it. Idempotent; ignore "already set".
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let settings = Arc::new(config::Settings::from_env());
     let bind_addr = settings.bind_addr.clone();
@@ -121,7 +133,11 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
 
     let blob_store = build_blob_store(&settings);
 
-    let spec_path = std::env::var("FINDATA_FINANCIAL_CONFIG").unwrap_or_else(|_| "financial.toml".to_string());
+    // Canonical: LUMID_READ_CONFIG. Legacy fallbacks: FINDATA_READ_CONFIG (via
+    // env_var) and the original domain-named FINDATA_FINANCIAL_CONFIG.
+    let spec_path = config::env_var("READ_CONFIG")
+        .or_else(|| std::env::var("FINDATA_FINANCIAL_CONFIG").ok())
+        .unwrap_or_else(|| "read.toml".to_string());
     let specs = match read::load_specs(&spec_path) {
         Ok(s) => {
             tracing::info!("read layer: {} declarative endpoints from {spec_path}", s.len());
@@ -144,7 +160,7 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     }
 
     // Storage-backend registry. Postgres is always the default; ClickHouse is
-    // registered as an additional backend when `FINDATA_CLICKHOUSE_URL` is set
+    // registered as an additional backend when `LUMID_CLICKHOUSE_URL` is set
     // (Phase B). With CH unconfigured this is the Phase-A zero-behavior-change
     // wrapper — every table resolves to Postgres.
     let backends = if settings.ch_url.is_empty() {
@@ -164,8 +180,13 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         Arc::new(crate::backend::Registry::new_with_clickhouse(pool.clone(), ch))
     };
 
+    let feed_liveness = parts
+        .feed_liveness
+        .unwrap_or_else(|| Arc::new(realtime::DefaultFeedLiveness));
+
     let state = state::AppState {
         pool, settings, lumid, local_keys, rate, redis, redis_client, hub, http, read_cache, blob_store, backends,
+        feed_liveness,
     };
 
     // Auto-MCP: one tool per declarative read endpoint, merged into ext routes.

@@ -370,7 +370,7 @@ fn thousands(n: i64) -> String {
 fn unavailable_page() -> String {
     r#"<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>findata · usage</title>
+<title>API usage</title>
 <style>body{margin:0;background:#fbfaf7;color:#0f172a;
 font-family:Inter,-apple-system,system-ui,sans-serif;line-height:1.5;}
 .wrap{max-width:980px;margin:0 auto;padding:32px 24px 64px;}
@@ -471,7 +471,7 @@ fn render(win: &str, m: &Metrics) -> String {
 /// port uses plain `.replace()` for the placeholders.
 const PAGE_TEMPLATE: &str = r#"<!DOCTYPE html><html lang="en"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>findata · usage</title>
+<title>API usage</title>
 <meta http-equiv="refresh" content="15">
 <style>
 :root { --bg:#fbfaf7; --bg2:#fff; --fg:#0f172a; --dim:#64748b; --muted:#94a3b8;

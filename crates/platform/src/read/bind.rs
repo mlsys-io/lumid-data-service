@@ -82,10 +82,13 @@ fn default_str(p: &ParamSpec) -> Option<String> {
 fn coerce(p: &ParamSpec, raw: &str) -> Result<Bv, ApiError> {
     let bad = |m: String| ApiError::BadRequest(m);
     match p.ty.as_str() {
-        "symbol" => {
+        // `key` is the canonical identifier coercion (uppercase + a conservative
+        // identifier charset); `symbol` is a domain-flavored alias kept so app
+        // configs that predate the rename keep working.
+        "key" | "symbol" => {
             let s = apply_transform(raw.trim().to_uppercase(), p.transform);
             if s.is_empty() || s.len() > 20 || !s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')) {
-                return Err(bad(format!("invalid symbol '{raw}'")));
+                return Err(bad(format!("invalid {} '{raw}'", p.ty)));
             }
             Ok(Bv::Text(s))
         }

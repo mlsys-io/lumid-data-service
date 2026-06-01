@@ -2,7 +2,7 @@
 //!
 //! Publishes a fake tick per second for a few test symbols so the hub + WS +
 //! SSE pipeline can be validated before real upstreams exist. Enabled by
-//! `FINDATA_RT_SYNTHETIC=1`; off in any real deployment. Uses a tiny xorshift
+//! `LUMID_RT_SYNTHETIC=1`; off in any real deployment. Uses a tiny xorshift
 //! PRNG seeded from the wall clock (no `rand` dependency for a dev-only tool).
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

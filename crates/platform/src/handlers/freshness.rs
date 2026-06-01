@@ -56,32 +56,18 @@ pub async fn status(State(st): State<AppState>) -> Html<String> {
 
     // ---- Realtime feed health, MEASURED from last:tick freshness (not login
     // state): a feed is only live if fresh ticks are actually arriving. Group
-    // the warm set by asset class; classify each by the freshest tick's age +
-    // latency + source. Crypto/forex are 24/7 (no live ticks ⇒ fail unless a
-    // standby is delivering); equities only tick during market hours.
+    // the warm set via the app's `FeedLiveness` policy (the platform names no
+    // asset class); classify each group by the freshest tick's age + latency +
+    // source, and whether the group is `expected_live` now.
     const LIVE_S: i64 = 30; // a tick this fresh ⇒ the feed is flowing
-    fn classify(s: &str) -> &'static str {
-        const CCY: &[&str] = &[
-            "USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD", "CNY", "HKD", "SGD", "NOK", "SEK",
-        ];
-        if s.len() == 6 && s.chars().all(|c| c.is_ascii_alphabetic())
-            && CCY.contains(&&s[..3]) && CCY.contains(&&s[3..])
-        {
-            return "forex";
-        }
-        if s.ends_with("USD") || s.ends_with("USDT") || s.ends_with("USDC") {
-            return "crypto";
-        }
-        "equity"
-    }
 
-    // Sample the warm set's last:tick into per-class aggregates.
+    // Sample the warm set's last:tick into per-group aggregates.
     struct Agg { total: usize, live: usize, best_age: i64, latency: Option<i64>, source: String }
-    let mut feeds: std::collections::BTreeMap<&'static str, Agg> = std::collections::BTreeMap::new();
+    let mut feeds: std::collections::BTreeMap<String, Agg> = std::collections::BTreeMap::new();
     if let Some(mut c) = st.redis.clone() {
         let now = chrono::Utc::now();
         for sym in &st.settings.rt_warm_symbols {
-            let cls = classify(sym);
+            let cls = st.feed_liveness.group(sym);
             let e = feeds.entry(cls).or_insert(Agg { total: 0, live: 0, best_age: i64::MAX, latency: None, source: String::new() });
             e.total += 1;
             let payload: Option<String> = redis::cmd("HGET")
@@ -102,64 +88,28 @@ pub async fn status(State(st): State<AppState>) -> Html<String> {
         }
     }
 
-    // Classify each feed. "fail" only for a 24/7 class (crypto/forex) with no
-    // live ticks (no standby delivering). A standby/fallback source (finnhub
-    // shadow for crypto/forex, or tier_b polling) ⇒ degraded, not up.
-    // Forex runs 24/5 — opens ~Sun 21:00 UTC (5pm ET), closes ~Fri 21:00 UTC.
-    // During the weekend close, no live forex ticks is expected, not a failure.
-    fn forex_open(now: chrono::DateTime<chrono::Utc>) -> bool {
-        use chrono::{Datelike, Timelike, Weekday};
-        match now.weekday() {
-            Weekday::Sat => false,
-            Weekday::Sun => now.hour() >= 21,
-            Weekday::Fri => now.hour() < 21,
-            _ => true,
-        }
-    }
-    // US equities trade Mon–Fri ~13:30–20:00 UTC (9:30am–4:00pm ET; ±1h with DST,
-    // approximated). Outside that, no live equity ticks is expected.
-    fn equity_open(now: chrono::DateTime<chrono::Utc>) -> bool {
-        use chrono::{Datelike, Timelike, Weekday};
-        if matches!(now.weekday(), Weekday::Sat | Weekday::Sun) {
-            return false;
-        }
-        let m = now.hour() * 60 + now.minute();
-        (13 * 60 + 30..=20 * 60).contains(&m)
-    }
+    // Classify each feed group. With live ticks: up (or degraded if only the
+    // tier_b poller is delivering). With no live ticks: a real failure if the
+    // app's policy says the group is `expected_live` now, otherwise an expected
+    // quiet period (degraded). The platform names no asset class or market
+    // calendar — that judgment is entirely the app's `FeedLiveness` policy.
     let now_cls = chrono::Utc::now();
     let mut feeds_html = String::new();
     let mut feed_fail = false;
     for (cls, a) in &feeds {
-        let cf = *cls == "crypto" || *cls == "forex";
-        let _ = cf;
-        let (state, detail) = if a.live > 0 {
+        let (state, detail): (&str, String) = if a.live > 0 {
             let lat = a.latency.map(|l| format!("{l}ms")).unwrap_or_else(|| "?".into());
-            // A live WS feed (tier_a, incl. the Finnhub crypto/forex shadow which
-            // is the de-facto primary here) is healthy = up. Only the REST poller
+            // A live WS feed (tier_a) is healthy = up; only the REST poller
             // (tier_b) is a degraded fallback.
             let poller = a.source.starts_with("tier_b");
             let how = if poller { "live via poller" } else { "live" };
             let st = if poller { "degraded" } else { "up" };
             (st, format!("{how} · {} · {lat} · {}s ago ({}/{} symbols)", a.source, a.best_age, a.live, a.total))
-        } else if *cls == "crypto" {
-            // Truly 24/7 — no live ticks is a real failure.
+        } else if st.feed_liveness.expected_live(cls, now_cls) {
             feed_fail = true;
-            ("fail", "no live ticks — no standby delivering; /quotes uses last-close fallback".to_string())
-        } else if *cls == "forex" {
-            if forex_open(now_cls) {
-                feed_fail = true;
-                ("fail", "no live ticks during market hours — /quotes uses last-close fallback".to_string())
-            } else {
-                ("degraded", "forex market closed (weekend) — /quotes uses last close".to_string())
-            }
+            ("fail", "no live ticks while expected live — /quotes uses last stored value".to_string())
         } else {
-            // equity
-            if equity_open(now_cls) {
-                feed_fail = true;
-                ("fail", "no live ticks during market hours — /quotes uses last-close fallback".to_string())
-            } else {
-                ("degraded", "equity market closed — /quotes uses last close".to_string())
-            }
+            ("degraded", "no live ticks (not expected live now) — /quotes uses last stored value".to_string())
         };
         feeds_html.push_str(&pill(cls, state, &detail));
     }
@@ -198,7 +148,7 @@ pub async fn status(State(st): State<AppState>) -> Html<String> {
     }
     if feeds_html.is_empty() {
         feeds_html = "<div class=row><span class='pill off'>feeds: n/a</span>\
-            <span class=dim>no warm symbols configured (FINDATA_RT_WARM_SYMBOLS)</span></div>".to_string();
+            <span class=dim>no warm symbols configured (LUMID_RT_WARM_SYMBOLS)</span></div>".to_string();
     }
 
     // Overall verdict: measured feed failure (a 24/7 feed with no live data)

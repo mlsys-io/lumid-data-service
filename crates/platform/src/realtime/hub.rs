@@ -190,7 +190,7 @@ impl Hub {
         for kind in &self.channel_kinds {
             pubsub.psubscribe(format!("{kind}:*")).await?;
         }
-        pubsub.subscribe("findata:rt:control").await?;
+        pubsub.subscribe("lumid:rt:control").await?;
         let mut stream = pubsub.on_message();
         while let Some(msg) = stream.next().await {
             let channel = msg.get_channel_name().to_string();

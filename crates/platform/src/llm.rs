@@ -2,7 +2,7 @@
 //! into its router (e.g. `findata_ext::routes().merge(lumid_platform::llm::routes())`).
 //! Apps that don't serve an LLM (e.g. mint) simply omit it — no `/v1/*` surface.
 //!
-//! OpenAI- + Anthropic-compatible; proxies to `FINDATA_LLM_BACKEND_URL`
+//! OpenAI- + Anthropic-compatible; proxies to `LUMID_LLM_BACKEND_URL`
 //! (handlers return 503 when that's unset). Gated like every data route once
 //! merged into the app's gated group.
 

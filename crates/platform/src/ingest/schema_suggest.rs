@@ -4,7 +4,7 @@
 //! - [`rules_suggest`] — deterministic: infer column types from sample records,
 //!   pick a heuristic natural key, detect a time-series. Always available.
 //! - [`llm_refine`] — best-effort: when an LLM backend is wired
-//!   (`FINDATA_LLM_BACKEND_URL`), ask it to refine the rules suggestion; the
+//!   (`LUMID_LLM_BACKEND_URL`), ask it to refine the rules suggestion; the
 //!   result is run back through [`validate`] before it's ever used. If the LLM
 //!   is unset / down / returns junk, we silently keep the rules suggestion.
 //! - [`validate`] — normalises every identifier (`^[a-z_][a-z0-9_]{0,62}$`) and
@@ -74,11 +74,28 @@ pub fn rules_suggest(records: &[Value]) -> (Map<String, Value>, Vec<String>, Vec
     }
     let columns: Map<String, Value> =
         cols.iter().map(|(c, vs)| (c.clone(), Value::String(infer_type(vs).into()))).collect();
-    // Heuristic natural key: identity-ish + a time column when present.
-    // (`id` is reserved for the surrogate PK — excluded above — so it's not a
-    // candidate here; key-less proposals get the auto `id` at apply time.)
-    let key: Vec<String> = ["symbol", "date", "ts", "timestamp"]
-        .iter().filter(|k| cols.contains_key(**k)).map(|k| k.to_string()).collect();
+    // Heuristic natural key: identity-shaped columns (`*_id` / `key` / `code`,
+    // a name-pattern that names no domain vocabulary) + a time column when
+    // present. (`id` is reserved for the surrogate PK — excluded above — so it's
+    // not a candidate; key-less proposals get the auto `id` at apply time, and
+    // the proposer can refine via counter.)
+    let mut key: Vec<String> = cols
+        .keys()
+        .filter(|c| {
+            let l = c.to_ascii_lowercase();
+            l.ends_with("_id") || l == "key" || l == "code"
+        })
+        .cloned()
+        .collect();
+    key.sort();
+    if !key.is_empty() {
+        if let Some(t) = ["ts", "timestamp", "time", "date", "created_at"]
+            .iter()
+            .find(|k| cols.contains_key(**k))
+        {
+            key.push(t.to_string());
+        }
+    }
     // Time-series hint: a timestamp/date column → candidate hypertable axis.
     let time_col = ["ts", "timestamp", "time", "date", "created_at"]
         .iter().find(|k| cols.contains_key(**k)).map(|s| s.to_string());

@@ -26,7 +26,7 @@ pub struct Registry {
     pool: Pool,
     postgres: PostgresBackend,
     /// The ClickHouse backend, present only when the deployment configured
-    /// `FINDATA_CLICKHOUSE_URL` (+ user/pass/db). `None` ⇒ Phase A behavior
+    /// `LUMID_CLICKHOUSE_URL` (+ user/pass/db). `None` ⇒ Phase A behavior
     /// (every table resolves to Postgres; a CH approve/route is rejected).
     clickhouse: Option<Arc<dyn Backend>>,
     /// `schema.table -> BackendKind`, mirroring the introspect metadata cache
@@ -47,7 +47,7 @@ impl Registry {
     }
 
     /// Build a registry with ClickHouse enabled (Phase B). `boot` calls this
-    /// when `FINDATA_CLICKHOUSE_URL` is configured; otherwise it stays on
+    /// when `LUMID_CLICKHOUSE_URL` is configured; otherwise it stays on
     /// [`Self::new_postgres_only`].
     pub fn new_with_clickhouse(pool: Pool, ch: ClickHouseBackend) -> Self {
         let postgres = PostgresBackend::new(pool.clone());

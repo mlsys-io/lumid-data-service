@@ -69,54 +69,44 @@ fn infer_type(values: &[&Value]) -> &'static str {
 /// column set. Empty key ⇒ a generated-identity PK, which the COPY+merge upsert
 /// cannot target; this function exists to avoid that (see `create`).
 fn infer_natural_key(cols: &BTreeMap<String, Vec<&Value>>) -> Vec<String> {
-    let has = |c: &str| cols.contains_key(c);
-    // Entity dimensions in key order (coarse → fine).
-    let entity: Vec<&str> = [
-        "tenant_id", "venue", "class_id", "instrument_id", "symbol", "event_id",
-        "market_id", "asset_id", "ticker",
-    ]
-    .into_iter()
-    .filter(|c| has(c))
-    .collect();
-    if !entity.is_empty() {
-        let mut key: Vec<String> = entity.iter().map(|s| (*s).to_string()).collect();
-        // Append the finest event-time column, if any (first match wins).
-        if let Some(t) = ["ts_event_ns", "ts_event", "ts", "timestamp", "date"]
-            .into_iter()
-            .find(|c| has(c))
-        {
-            key.push(t.to_string());
-        }
-        return key;
-    }
-    // Legacy single identity-ish column.
-    let legacy: Vec<String> = ["symbol", "id", "date", "ts", "timestamp"]
-        .into_iter()
-        .filter(|c| has(c))
-        .map(String::from)
+    // Generic identity columns — name-pattern, not a domain vocabulary: `id`,
+    // any `*_id` (covers tenant_id / instrument_id / asset_id / … without naming
+    // them), `key`, or `code`. `cols` is a BTreeMap, so `keys()` is already
+    // sorted → the inferred key order is deterministic.
+    let mut entity: Vec<String> = cols
+        .keys()
+        .filter(|c| {
+            let l = c.to_ascii_lowercase();
+            l == "id" || l.ends_with("_id") || l == "key" || l == "code"
+        })
+        .cloned()
         .collect();
-    if !legacy.is_empty() {
-        return legacy;
+    if !entity.is_empty() {
+        // Append the finest event-time column, if any (first match wins) — a
+        // per-event time-series key.
+        if let Some(t) = ["ts_event_ns", "ts_event", "ts", "timestamp", "date", "time"]
+            .into_iter()
+            .find(|c| cols.contains_key(*c))
+        {
+            entity.push(t.to_string());
+        }
+        return entity;
     }
-    // Last resort: all columns (guarantees a valid ON CONFLICT target; at worst
-    // dedups exact-duplicate rows). Never returns empty for a non-empty `cols`.
+    // No identity-shaped column → all columns: always a valid ON CONFLICT target
+    // (at worst dedups exact-duplicate rows), and the proposer refines it via the
+    // counter step. Never returns empty for a non-empty `cols`.
     cols.keys().cloned().collect()
 }
 
 /// Suggest a storage backend for an inferred shape (multi-backend Phase B).
 ///
-/// Heuristic (documented in the canonical contract): high-frequency / append
-/// heavy shapes go to ClickHouse, everything else to Postgres. "High frequency"
-/// is recognised as either
-///   * the declared schema being `md` (the market-data convention), or
-///   * the inferred natural key carrying a time column (`ts*` prefix, or one of
-///     `timestamp` / `date` / `time`) — a per-event time-series key.
+/// Generic heuristic (names no domain): a natural key carrying a time column
+/// (`ts*` prefix, or one of `timestamp` / `date` / `time`) is a per-event
+/// time-series shape → ClickHouse; everything else → Postgres. The proposer can
+/// override the choice at approve time.
 ///
 /// Returns the wire form stored in `ingress_proposals.suggested_backend`.
-fn suggest_backend(schema: &str, key: &[String]) -> BackendKind {
-    if schema.eq_ignore_ascii_case("md") {
-        return BackendKind::ClickHouse;
-    }
+fn suggest_backend(_schema: &str, key: &[String]) -> BackendKind {
     let has_time_col = key.iter().any(|k| {
         let k = k.to_ascii_lowercase();
         k.starts_with("ts") || k == "timestamp" || k == "date" || k == "time"
@@ -362,7 +352,7 @@ pub async fn approve(
     if chosen == BackendKind::ClickHouse && !reg.clickhouse_configured() {
         return Err(ApiError::Unavailable(
             "ClickHouse backend is not configured on this deployment \
-             (set FINDATA_CLICKHOUSE_URL); cannot approve onto ClickHouse"
+             (set LUMID_CLICKHOUSE_URL); cannot approve onto ClickHouse"
                 .into(),
         ));
     }
@@ -499,35 +489,38 @@ mod tests {
             "tenant_id", "venue", "instrument_id", "bid_price_ticks", "ask_price_ticks",
             "ts_event_ns", "ts_recv_ns",
         ]);
+        // Generic: `*_id` columns (sorted) + the finest time column. `venue` is
+        // not identity-shaped (no `_id`), so it isn't auto-keyed — the proposer
+        // adds it via counter if needed.
         assert_eq!(
             infer_natural_key(&cols),
-            vec!["tenant_id", "venue", "instrument_id", "ts_event_ns"]
+            vec!["instrument_id", "tenant_id", "ts_event_ns"]
         );
     }
 
     #[test]
     fn reference_data_without_time_gets_entity_key() {
         let cols = cols_of(&["tenant_id", "venue", "instrument_id", "class_id"]);
-        // entity order: tenant_id, venue, class_id, instrument_id; no time col appended.
+        // `*_id` cols sorted; no time col appended; `venue` not auto-keyed.
         assert_eq!(
             infer_natural_key(&cols),
-            vec!["tenant_id", "venue", "class_id", "instrument_id"]
+            vec!["class_id", "instrument_id", "tenant_id"]
         );
     }
 
     #[test]
-    fn legacy_single_column_key_still_works() {
+    fn no_identity_column_falls_back_to_all_columns() {
+        // No `id`/`*_id`/`key`/`code` column → all columns (sorted), a always-valid
+        // ON CONFLICT target the proposer refines.
         let cols = cols_of(&["symbol", "open", "close"]);
-        assert_eq!(infer_natural_key(&cols), vec!["symbol"]);
+        assert_eq!(infer_natural_key(&cols), vec!["close", "open", "symbol"]);
     }
 
     #[test]
-    fn suggest_backend_md_schema_is_clickhouse() {
-        // schema 'md' → clickhouse regardless of key.
-        assert_eq!(suggest_backend("md", &["symbol".into()]), BackendKind::ClickHouse);
-        assert_eq!(suggest_backend("md", &[]), BackendKind::ClickHouse);
-        // case-insensitive.
-        assert_eq!(suggest_backend("MD", &["foo".into()]), BackendKind::ClickHouse);
+    fn suggest_backend_ignores_schema_name() {
+        // Schema name is not a signal (no magic schemas) — only the key shape is.
+        assert_eq!(suggest_backend("md", &["symbol".into()]), BackendKind::Postgres);
+        assert_eq!(suggest_backend("md", &["id".into(), "ts".into()]), BackendKind::ClickHouse);
     }
 
     #[test]

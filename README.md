@@ -39,12 +39,12 @@ Every field has a sensible default (`Default::default()` for the routers/vec, `f
 read layer, the cache (+ cross-replica invalidation), auto-MCP, and the listener.
 
 A new app therefore = **a config file + a thin `main` + a DB schema**:
-1. **Database/schema** — set `FINDATA_DB_*` (defaults to the shared warehouse); a new app
+1. **Database/schema** — set `LUMID_DB_*` (defaults to the shared warehouse); a new app
    typically uses its own Postgres **schema** (referenced by `schema.table` in its config + the
    tables it creates). No schema declaration in code — tables are introspected at write time.
 2. **Reads** — a TOML of `[[read.endpoint]]` specs (`id`, `path`, `params`, `sql`, `ttl`,
    `shape`). Values bind as `:name` (always parameterized); `{{fragment}}` switches come only
-   from author-controlled enum/presence maps. Pointed to via `FINDATA_FINANCIAL_CONFIG`.
+   from author-controlled enum/presence maps. Pointed to via `LUMID_FINANCIAL_CONFIG`.
 3. **Bespoke** — anything SQL-in-config can't express: a compiled handler (gated via
    `ext_routes`, un-gated via `public_routes`), a realtime `UpstreamWorker` (via `workers`), a
    custom landing (`landing`), and OpenAPI entries for any of it (`openapi_paths`).
@@ -71,9 +71,9 @@ See the `mint` app (in the `findata` repo) for a complete platform-only example.
   generation-based invalidation (inline on write + `cache:invalidate` pub/sub across replicas).
 - **Realtime hub** — SSE/WS fan-out; `UpstreamWorker` trait (`start(hub, mux, settings, pool)`)
   is the IoC seam for domain feeds (the worker gets `pool`, so it can persist as well as publish).
-  `Hub::warm(symbols)` (`FINDATA_RT_WARM_SYMBOLS`) keeps a baseline subscribed so quote
+  `Hub::warm(symbols)` (`LUMID_RT_WARM_SYMBOLS`) keeps a baseline subscribed so quote
   caches stay hot without an open client stream. The hub fans out app-declared **channel kinds**
-  (`FINDATA_RT_CHANNEL_KINDS`, e.g. `tick,news`) — it `PSUBSCRIBE`s `<kind>:*` and names no
+  (`LUMID_RT_CHANNEL_KINDS`, e.g. `tick,news`) — it `PSUBSCRIBE`s `<kind>:*` and names no
   domain channel. The platform provides the generic SSE/WS *transport handlers*
   (`handlers::sse_quotes::quotes_stream`, `handlers::ws::{quotes,news}`) + `auth::extract_ws_token`;
   the app mounts them at its chosen paths (via `ext_routes`/`public_routes`) and adds any
@@ -82,20 +82,20 @@ See the `mint` app (in the `findata` repo) for a complete platform-only example.
   `report_feed` (data feed); `/status` renders feeds **measured by tick freshness + latency**
   (up / degraded / fail), and `/freshness` the per-endpoint SLA + per-source lag.
 - **MCP** — `POST /mcp` (JSON-RPC 2.0); `mcp::registry_from_specs` auto-generates one tool per
-  declarative read endpoint. `serverInfo.name` ← `FINDATA_SERVICE_NAME` (default `lumid`).
+  declarative read endpoint. `serverInfo.name` ← `LUMID_SERVICE_NAME` (default `lumid`).
 - **LLM proxy (optional)** — enable via `ServeParts.enable_llm`; mounts the OpenAI/Anthropic-
-  compatible `/v1/*` surface proxying to `FINDATA_LLM_BACKEND_URL`.
+  compatible `/v1/*` surface proxying to `LUMID_LLM_BACKEND_URL`.
 
-## Config (env, all `FINDATA_*`)
-DB: `FINDATA_DB_{HOST,PORT,USER,PASSWORD,NAME}`, `FINDATA_POOL_MAX`, `FINDATA_STATEMENT_TIMEOUT_MS`.
-Service: `FINDATA_BIND_ADDR`, `FINDATA_FINANCIAL_CONFIG`, `FINDATA_SERVICE_NAME`,
-`FINDATA_API_KEYS`, `FINDATA_RATE_LIMIT_{ANON,AUTHED}`, `FINDATA_REDIS_URL`,
-`FINDATA_LUMID_{ENABLED,URL}`, `FINDATA_BLOB_ROOT`, `FINDATA_LLM_BACKEND_URL`.
-Realtime: `FINDATA_RT_CHANNEL_KINDS` (hub channel kinds, default `tick,news`),
-`FINDATA_RT_WARM_SYMBOLS`, `FINDATA_RT_{HEARTBEAT_SEC,SSE_REQUEST_SYMS,SLOWCLIENT_QUEUE,…}`.
-Storage backends (optional): `FINDATA_CLICKHOUSE_*` registers a ClickHouse backend alongside
-Postgres (per-table routing via `provenance.table_backend`); `FINDATA_BLOB_BACKEND=s3` +
-`FINDATA_BLOB_S3_*` puts blobs in MinIO/S3.
+## Config (env, all `LUMID_*`; legacy `FINDATA_*` accepted as a fallback)
+DB: `LUMID_DB_{HOST,PORT,USER,PASSWORD,NAME}`, `LUMID_POOL_MAX`, `LUMID_STATEMENT_TIMEOUT_MS`.
+Service: `LUMID_BIND_ADDR`, `LUMID_FINANCIAL_CONFIG`, `LUMID_SERVICE_NAME`,
+`LUMID_API_KEYS`, `LUMID_RATE_LIMIT_{ANON,AUTHED}`, `LUMID_REDIS_URL`,
+`LUMID_LUMID_{ENABLED,URL}`, `LUMID_BLOB_ROOT`, `LUMID_LLM_BACKEND_URL`.
+Realtime: `LUMID_RT_CHANNEL_KINDS` (hub channel kinds, default `tick,news`),
+`LUMID_RT_WARM_SYMBOLS`, `LUMID_RT_{HEARTBEAT_SEC,SSE_REQUEST_SYMS,SLOWCLIENT_QUEUE,…}`.
+Storage backends (optional): `LUMID_CLICKHOUSE_*` registers a ClickHouse backend alongside
+Postgres (per-table routing via `provenance.table_backend`); `LUMID_BLOB_BACKEND=s3` +
+`LUMID_BLOB_S3_*` puts blobs in MinIO/S3.
 Provider keys/caps + domain channel kinds for an app's workers live in the **app**
 (e.g. `findata-ext::cfg`), not here.
 

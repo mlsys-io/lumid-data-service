@@ -58,8 +58,7 @@ async fn run_spec(
         Err(e) => return e.into_response(),
     };
 
-    let has_symbol = path.contains_key("symbol");
-    let symbol = path.get("symbol").cloned();
+    let id_kv = id_echo(&path);
     let ttl = spec.ttl_duration();
 
     // Produce (or fetch cached) the serialized body.
@@ -68,11 +67,11 @@ async fn run_spec(
         let key = CacheKey::new(id, gen, bound.canon.clone());
         st.read_cache
             .get_or_compute(key, ttl, true, || async {
-                produce(st, spec, &bound, has_symbol, symbol.clone()).await
+                produce(st, spec, &bound, id_kv.clone()).await
             })
             .await
     } else {
-        produce(st, spec, &bound, has_symbol, symbol.clone())
+        produce(st, spec, &bound, id_kv.clone())
             .await
             .map(|bytes| CachedBody::new(bytes, ttl))
     };
@@ -93,8 +92,7 @@ async fn produce(
     st: &AppState,
     spec: &EndpointSpec,
     bound: &bind::Bound,
-    has_symbol: bool,
-    symbol: Option<String>,
+    id_kv: Option<(String, String)>,
 ) -> ApiResult<Vec<u8>> {
     let (schema, table) = read_target(spec);
     let backend = st.backends.get(&schema, &table).await?;
@@ -104,8 +102,21 @@ async fn produce(
     if spec.strip_lineage {
         objs = strip_lineage_rows(objs);
     }
-    let value = shape(spec, objs, has_symbol, symbol)?;
+    let value = shape(spec, objs, id_kv)?;
     serde_json::to_vec(&value).map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))
+}
+
+/// The id path-param to echo into an `Envelope` response, as `(name, value)`.
+/// Recognizes a path param named `key` (canonical) or `symbol` (legacy alias) —
+/// the platform names no domain field, but echoes whichever the route declared
+/// under its own name, so existing `:symbol` routes keep emitting `"symbol"`.
+fn id_echo(path: &HashMap<String, String>) -> Option<(String, String)> {
+    for name in ["key", "symbol"] {
+        if let Some(v) = path.get(name) {
+            return Some((name.to_string(), v.clone()));
+        }
+    }
+    None
 }
 
 /// The `(schema, table)` a read endpoint resolves its backend on — the first
@@ -132,17 +143,15 @@ pub async fn execute_to_value(
     query: HashMap<String, String>,
 ) -> ApiResult<Value> {
     let bound = bind::resolve(spec, &path, &query)?;
-    let has_symbol = path.contains_key("symbol");
-    let symbol = path.get("symbol").cloned();
-    let bytes = produce(st, spec, &bound, has_symbol, symbol).await?;
+    let id_kv = id_echo(&path);
+    let bytes = produce(st, spec, &bound, id_kv).await?;
     serde_json::from_slice(&bytes).map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))
 }
 
 fn shape(
     spec: &EndpointSpec,
     objs: Vec<Map<String, Value>>,
-    has_symbol: bool,
-    symbol: Option<String>,
+    id_kv: Option<(String, String)>,
 ) -> ApiResult<Value> {
     match spec.shape {
         Shape::Rows => Ok(Value::Array(objs.into_iter().map(Value::Object).collect())),
@@ -153,10 +162,8 @@ fn shape(
         Shape::Envelope => {
             let key = spec.envelope_key.clone().unwrap_or_else(|| "data".to_string());
             let mut env = Map::new();
-            if has_symbol {
-                if let Some(s) = symbol {
-                    env.insert("symbol".into(), Value::String(s));
-                }
+            if let Some((name, val)) = id_kv {
+                env.insert(name, Value::String(val));
             }
             env.insert("count".into(), Value::from(objs.len()));
             env.insert(key, Value::Array(objs.into_iter().map(Value::Object).collect()));
