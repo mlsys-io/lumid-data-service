@@ -54,6 +54,35 @@ fn extract_token(headers: &axum::http::HeaderMap) -> Option<String> {
     None
 }
 
+/// Extract a bearer token for the self-authenticating WebSocket / SSE realtime
+/// routes (which authenticate outside the `gate`). Superset of the gate's
+/// header check: Authorization / x-api-key plus `Sec-WebSocket-Protocol:
+/// bearer.<tok>` (the only way a browser WebSocket can pass a credential).
+/// Lives in `auth` so the platform's WS handlers and app-layer realtime
+/// handlers share one extractor.
+pub fn extract_ws_token(headers: &axum::http::HeaderMap) -> Option<String> {
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        if let Some((scheme, tok)) = auth.split_once(' ') {
+            if scheme.eq_ignore_ascii_case("bearer") && !tok.trim().is_empty() {
+                return Some(tok.trim().to_string());
+            }
+        }
+    }
+    if let Some(k) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        if !k.trim().is_empty() {
+            return Some(k.trim().to_string());
+        }
+    }
+    if let Some(proto) = headers.get("sec-websocket-protocol").and_then(|v| v.to_str().ok()) {
+        if let Some(tok) = proto.strip_prefix("bearer.") {
+            if !tok.trim().is_empty() {
+                return Some(tok.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
 fn client_ip(headers: &axum::http::HeaderMap) -> String {
     for h in ["x-forwarded-for", "x-real-ip"] {
         if let Some(v) = headers.get(h).and_then(|v| v.to_str().ok()) {

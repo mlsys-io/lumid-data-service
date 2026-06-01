@@ -34,6 +34,11 @@ pub struct ServeParts {
     /// a config-only app still gets a landing). An app passes its own marketing
     /// / reference pages here.
     pub landing: Router<state::AppState>,
+    /// App-contributed OpenAPI paths object, merged into `/openapi.json` — so an
+    /// app can document routes the platform doesn't name (e.g. the realtime
+    /// SSE/WS routes it mounts). Shape: `{ "/path": { "get": {<operation>} } }`.
+    /// Default empty.
+    pub openapi_paths: serde_json::Value,
     pub workers: Vec<Box<dyn UpstreamWorker>>,
     /// Enable the platform's LLM reverse-proxy feature (`/v1/*`). Optional per
     /// app — off by default; an app flips this to serve LLM (proxies to
@@ -48,6 +53,7 @@ impl Default for ServeParts {
             ext_routes: Router::new(),
             public_routes: Router::new(),
             landing: crate::handlers::landing::default_routes(),
+            openapi_paths: serde_json::json!({}),
             workers: Vec::new(),
             enable_llm: false,
         }
@@ -172,7 +178,7 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     }
 
     let read_router = read::exec::build_router(&specs);
-    let openapi_router = crate::openapi::build_router(&specs);
+    let openapi_router = crate::openapi::build_router(&specs, &parts.openapi_paths);
     let router = app::build_router(
         state,
         read_router,

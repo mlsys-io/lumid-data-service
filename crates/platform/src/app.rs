@@ -35,12 +35,10 @@ pub fn build_router(
         .route("/usage", get(handlers::usage::usage))
         .route("/freshness", get(handlers::freshness::freshness))
         // Webhook ingress: HMAC-authenticated, mounted OUTSIDE the gate.
-        .route("/webhook/:webhook_id", post(handlers::ingest::post_webhook))
-        // WebSocket realtime: self-authenticating (the WS upgrade can't carry
-        // the gate's 401 body), so mounted OUTSIDE the gate.
-        .route("/ws/quotes", get(handlers::ws::quotes))
-        .route("/ws/news", get(handlers::ws::news))
-        .route("/ws/prediction-markets", get(handlers::ws::prediction_markets));
+        .route("/webhook/:webhook_id", post(handlers::ingest::post_webhook));
+        // Realtime WebSocket routes (self-authenticating, outside the gate) are
+        // app-contributed via `ServeParts.public_routes` — the platform exposes
+        // the generic `ws::{quotes,news}` transport handlers but names no path.
 
     let gated = Router::new()
         // Catalog read plane (provenance-exposing) — port of api/routes/catalog.py.
@@ -83,9 +81,9 @@ pub fn build_router(
         .route("/blobs/*key", get(handlers::blobs::serve_blob))
         .route("/storage/v1/object/findata/*path", get(handlers::blobs::legacy_storage_alias))
 
-        // Realtime SSE (normal GET → gated through the auth middleware).
-        .route("/quotes/stream", get(handlers::sse_quotes::quotes_stream))
-        .route("/prediction-markets/stream", get(handlers::pm_stream::stream))
+        // Realtime SSE routes (gated) are app-contributed via `ServeParts.ext_routes`
+        // — the platform exposes the generic `sse_quotes::quotes_stream` handler
+        // but names no path.
 
         // Ingress write plane — bounded body limit (batch NDJSON/file/blob need
         // more than axum's 2 MB default, but not unbounded → OOM/DoS guard).

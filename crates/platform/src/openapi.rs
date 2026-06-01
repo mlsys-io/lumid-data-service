@@ -29,7 +29,7 @@ fn oapi_path(path: &str) -> String {
         .join("/")
 }
 
-fn generate(specs: &[Arc<EndpointSpec>]) -> Value {
+fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
     let mut paths = Map::new();
     for s in specs {
         let params: Vec<Value> = s
@@ -85,16 +85,21 @@ fn generate(specs: &[Arc<EndpointSpec>]) -> Value {
     add("/catalog/lineage/run/{run_id}", "get", "Lineage for a run", vec![p("run_id", "path", true)], "");
     add("/catalog/lineage/row", "get", "Lineage for a row", vec![p("schema", "query", true), p("table", "query", true)], "Trace a row back to its ingest run.");
 
-    // --- Realtime (SSE + WebSocket) ---
-    add("/quotes/stream", "get", "Quote tick SSE", vec![p("symbols", "query", true)], "Server-Sent Events: subscribed/tick/heartbeat.");
-    add("/prediction-markets/stream", "get", "Prediction-market event SSE", vec![p("asset_ids", "query", false), p("condition_ids", "query", false)], "SSE of live PM trades + orderbook events (Polymarket + Kalshi, tagged by venue).");
-    add("/ws/quotes", "get", "Quote WebSocket", vec![], "WebSocket upgrade — subscribe {symbols}. Self-authenticating (bearer via header/query/subprotocol).");
-    add("/ws/news", "get", "News WebSocket", vec![], "WebSocket upgrade. Self-authenticating.");
-    add("/ws/prediction-markets", "get", "Prediction-market WebSocket", vec![p("asset_ids", "query", false), p("condition_ids", "query", false)], "WebSocket alternative to /prediction-markets/stream.");
+    // Realtime SSE/WebSocket routes are app-contributed (the platform names no
+    // such path) — see `extra_paths` below.
 
     // --- MCP + own usage ---
     add("/mcp", "post", "MCP JSON-RPC", vec![], "Model Context Protocol (JSON-RPC 2.0, Streamable-HTTP). One tool per read endpoint; tools/list + tools/call.");
     add("/usage/me", "get", "Your usage", vec![], "Calling identity's totals: total_calls, bytes_out, calls_last_24h, hourly_last_24h.");
+
+    // App-contributed paths (e.g. realtime SSE/WS the app mounts) — merged last
+    // so the app can document routes the platform doesn't name. Shape is an
+    // OpenAPI paths object: `{ "/path": { "get": {<operation>} } }`.
+    if let Some(extra) = extra_paths.as_object() {
+        for (path, item) in extra {
+            paths.insert(path.clone(), item.clone());
+        }
+    }
 
     json!({
         "openapi": "3.1.0",
@@ -115,8 +120,10 @@ fn generate(specs: &[Arc<EndpointSpec>]) -> Value {
 }
 
 /// A router with `GET /openapi.json` (public — merge outside the gate).
-pub fn build_router(specs: &[Arc<EndpointSpec>]) -> Router<AppState> {
-    let doc = Arc::new(generate(specs));
+/// `extra_paths` is an app-contributed OpenAPI paths object merged into the doc
+/// (so apps can document routes the platform doesn't name, e.g. realtime SSE/WS).
+pub fn build_router(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Router<AppState> {
+    let doc = Arc::new(generate(specs, extra_paths));
     Router::new().route(
         "/openapi.json",
         get(move || {
