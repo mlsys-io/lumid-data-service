@@ -1,6 +1,6 @@
 //! Auth + rate-limit gate — port of `api/auth.py`.
 //!
-//! Token sources (in order): local env keys (`FINDATA_API_KEYS`), then Lumid
+//! Token sources (in order): local env keys (`LUMID_API_KEYS`), then Lumid
 //! introspection. The `gate` middleware requires an identity (bite #38: all
 //! data routes need a PAT/local key; only `/health` is public), then applies
 //! the tiered rate limit. Resolved `Identity` is inserted into request
@@ -21,7 +21,7 @@ use crate::state::AppState;
 pub use lumid::Identity;
 use lumid::LumidError;
 
-/// Parse `FINDATA_API_KEYS=key:label,key:label` → {key: label}.
+/// Parse `LUMID_API_KEYS=key:label,key:label` → {key: label}.
 pub fn parse_local_keys(raw: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for chunk in raw.split(',') {

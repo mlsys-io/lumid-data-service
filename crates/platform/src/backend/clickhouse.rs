@@ -442,7 +442,7 @@ mod tests {
 
     /// Live CH round-trip: create → write → read. `#[ignore]`-gated; needs a
     /// running ClickHouse HTTP interface. Run with:
-    ///   `FINDATA_CLICKHOUSE_URL=http://127.0.0.1:8123 \
+    ///   `LUMID_CLICKHOUSE_URL=http://127.0.0.1:8123 \
     ///    cargo test -p lumid-platform clickhouse_live -- --ignored --nocapture`
     #[tokio::test]
     #[ignore]
@@ -450,11 +450,11 @@ mod tests {
         use crate::backend::Backend;
         use crate::write::introspect::{ColumnInfo, TableMeta};
 
-        let url = std::env::var("FINDATA_CLICKHOUSE_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8123".into());
-        let user = std::env::var("FINDATA_CLICKHOUSE_USER").unwrap_or_else(|_| "default".into());
-        let pass = std::env::var("FINDATA_CLICKHOUSE_PASSWORD").unwrap_or_default();
-        let db = std::env::var("FINDATA_CLICKHOUSE_DB").unwrap_or_else(|_| "default".into());
+        let url = crate::config::env_var("CLICKHOUSE_URL")
+            .unwrap_or_else(|| "http://127.0.0.1:8123".into());
+        let user = crate::config::env_var("CLICKHOUSE_USER").unwrap_or_else(|| "default".into());
+        let pass = crate::config::env_var("CLICKHOUSE_PASSWORD").unwrap_or_default();
+        let db = crate::config::env_var("CLICKHOUSE_DB").unwrap_or_else(|| "default".into());
         let be = ClickHouseBackend::new(&url, &user, &pass, &db);
 
         let inf = inferred(&[("venue", "text"), ("ts_event_ns", "bigint"), ("px", "double precision")]);

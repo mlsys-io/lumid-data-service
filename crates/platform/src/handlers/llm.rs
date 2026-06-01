@@ -32,7 +32,7 @@ fn require_backend(st: &AppState) -> Result<String, ApiError> {
     let url = st.settings.llm_backend_url.trim_end_matches('/');
     if url.is_empty() {
         return Err(ApiError::Unavailable(
-            "LLM backend not configured (FINDATA_LLM_BACKEND_URL is empty)".into(),
+            "LLM backend not configured (LUMID_LLM_BACKEND_URL is empty)".into(),
         ));
     }
     Ok(url.to_string())

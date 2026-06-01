@@ -362,7 +362,7 @@ pub async fn approve(
     if chosen == BackendKind::ClickHouse && !reg.clickhouse_configured() {
         return Err(ApiError::Unavailable(
             "ClickHouse backend is not configured on this deployment \
-             (set FINDATA_CLICKHOUSE_URL); cannot approve onto ClickHouse"
+             (set LUMID_CLICKHOUSE_URL); cannot approve onto ClickHouse"
                 .into(),
         ));
     }

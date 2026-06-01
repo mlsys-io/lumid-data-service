@@ -104,7 +104,7 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
     json!({
         "openapi": "3.1.0",
         "info": {
-            "title": std::env::var("FINDATA_SERVICE_NAME").unwrap_or_else(|_| "lumid".into()),
+            "title": crate::config::env_var("SERVICE_NAME").unwrap_or_else(|| "lumid".into()),
             "version": env!("CARGO_PKG_VERSION"),
             "description": "Read + discovery + realtime + MCP surface. Declarative read \
                 endpoints, catalog/lineage, SSE/WebSocket streams, and POST /mcp. \

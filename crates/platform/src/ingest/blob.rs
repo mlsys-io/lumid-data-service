@@ -138,7 +138,7 @@ pub async fn ingest_blob(
 ) -> Result<BlobIngestResult, ApiError> {
     if !is_configured(settings) {
         return Err(ApiError::Unavailable(
-            "blob storage not configured (set FINDATA_BLOB_ROOT)".into(),
+            "blob storage not configured (set LUMID_BLOB_ROOT)".into(),
         ));
     }
     if body.is_empty() {

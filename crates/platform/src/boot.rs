@@ -42,7 +42,7 @@ pub struct ServeParts {
     pub workers: Vec<Box<dyn UpstreamWorker>>,
     /// Enable the platform's LLM reverse-proxy feature (`/v1/*`). Optional per
     /// app — off by default; an app flips this to serve LLM (proxies to
-    /// `FINDATA_LLM_BACKEND_URL`). The capability lives in the platform; only
+    /// `LUMID_LLM_BACKEND_URL`). The capability lives in the platform; only
     /// the decision to expose it is the app's.
     pub enable_llm: bool,
 }
@@ -60,8 +60,9 @@ impl Default for ServeParts {
     }
 }
 
-/// Boot + serve until shutdown. Reads `FINDATA_*` from env (incl.
-/// `FINDATA_FINANCIAL_CONFIG` for the read specs, default `financial.toml`).
+/// Boot + serve until shutdown. Reads `LUMID_*` from env (legacy `FINDATA_*`
+/// accepted as a fallback — see `config::env_var`), incl. `LUMID_READ_CONFIG`
+/// for the read specs (legacy `FINDATA_FINANCIAL_CONFIG`), default `read.toml`.
 pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
@@ -121,7 +122,11 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
 
     let blob_store = build_blob_store(&settings);
 
-    let spec_path = std::env::var("FINDATA_FINANCIAL_CONFIG").unwrap_or_else(|_| "financial.toml".to_string());
+    // Canonical: LUMID_READ_CONFIG. Legacy fallbacks: FINDATA_READ_CONFIG (via
+    // env_var) and the original domain-named FINDATA_FINANCIAL_CONFIG.
+    let spec_path = config::env_var("READ_CONFIG")
+        .or_else(|| std::env::var("FINDATA_FINANCIAL_CONFIG").ok())
+        .unwrap_or_else(|| "read.toml".to_string());
     let specs = match read::load_specs(&spec_path) {
         Ok(s) => {
             tracing::info!("read layer: {} declarative endpoints from {spec_path}", s.len());
@@ -144,7 +149,7 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     }
 
     // Storage-backend registry. Postgres is always the default; ClickHouse is
-    // registered as an additional backend when `FINDATA_CLICKHOUSE_URL` is set
+    // registered as an additional backend when `LUMID_CLICKHOUSE_URL` is set
     // (Phase B). With CH unconfigured this is the Phase-A zero-behavior-change
     // wrapper — every table resolves to Postgres.
     let backends = if settings.ch_url.is_empty() {

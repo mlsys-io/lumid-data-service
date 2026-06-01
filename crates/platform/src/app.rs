@@ -75,11 +75,10 @@ pub fn build_router(
         // LLM reverse proxy is now an opt-in plugin — apps merge
         // `lumid_platform::llm::routes()` (src/llm.rs). Not mounted by the platform.
 
-        // Government trades — port of api/routes/gov_trades.py.
-
-        // Blob serving (read side) — port of api/routes/blobs.py.
+        // Blob serving (read side). The generic `/blobs/*key` is platform-owned;
+        // any domain-named compatibility alias (e.g. a legacy `/storage/...` URL)
+        // is app-contributed via `ServeParts.ext_routes` → `blobs::legacy_storage_alias`.
         .route("/blobs/*key", get(handlers::blobs::serve_blob))
-        .route("/storage/v1/object/findata/*path", get(handlers::blobs::legacy_storage_alias))
 
         // Realtime SSE routes (gated) are app-contributed via `ServeParts.ext_routes`
         // — the platform exposes the generic `sse_quotes::quotes_stream` handler

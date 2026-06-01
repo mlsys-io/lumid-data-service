@@ -4,7 +4,7 @@
 //! - [`rules_suggest`] — deterministic: infer column types from sample records,
 //!   pick a heuristic natural key, detect a time-series. Always available.
 //! - [`llm_refine`] — best-effort: when an LLM backend is wired
-//!   (`FINDATA_LLM_BACKEND_URL`), ask it to refine the rules suggestion; the
+//!   (`LUMID_LLM_BACKEND_URL`), ask it to refine the rules suggestion; the
 //!   result is run back through [`validate`] before it's ever used. If the LLM
 //!   is unset / down / returns junk, we silently keep the rules suggestion.
 //! - [`validate`] — normalises every identifier (`^[a-z_][a-z0-9_]{0,62}$`) and

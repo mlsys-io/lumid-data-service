@@ -28,7 +28,7 @@ docker run --rm -v "$PWD":/build -e CARGO_HOME=/build/.cargo-home \
   -w /build rust:1-bookworm cargo build --release --bin mint-app
 # package the binary into a slim image
 install -D target/release/mint-app /tmp/img/lumid-app
-printf 'FROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*\nWORKDIR /app\nCOPY lumid-app /usr/local/bin/lumid-app\nENV FINDATA_BIND_ADDR=0.0.0.0:8088\nEXPOSE 8088\nCMD ["lumid-app"]\n' > /tmp/img/Dockerfile
+printf 'FROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*\nWORKDIR /app\nCOPY lumid-app /usr/local/bin/lumid-app\nENV LUMID_BIND_ADDR=0.0.0.0:8088\nEXPOSE 8088\nCMD ["lumid-app"]\n' > /tmp/img/Dockerfile
 docker build -t lumid-app:latest /tmp/img
 ```
 
@@ -76,12 +76,12 @@ Reads serve whatever is in the DB. Load it however you like:
 
 ## Notes
 - **MinIO vs local FS**: this bundle stores blobs in MinIO (self-contained). To use a
-  plain folder instead, set `FINDATA_BLOB_BACKEND=localfs` and bind-mount a blobs dir.
-- **Auth**: standalone uses local keys (`FINDATA_API_KEYS`, `FINDATA_LUMID_ENABLED=false`).
+  plain folder instead, set `LUMID_BLOB_BACKEND=localfs` and bind-mount a blobs dir.
+- **Auth**: standalone uses local keys (`LUMID_API_KEYS`, `LUMID_LUMID_ENABLED=false`).
   Point at a real introspection service by flipping those.
 - **Optional platform features** (set in the compose `environment:` block): a ClickHouse
-  backend alongside Postgres (`FINDATA_CLICKHOUSE_*`, per-table routing via
+  backend alongside Postgres (`LUMID_CLICKHOUSE_*`, per-table routing via
   `provenance.table_backend`); realtime channel kinds for a bespoke app's workers
-  (`FINDATA_RT_CHANNEL_KINDS`, default `tick,news`). See the platform README's Config section.
+  (`LUMID_RT_CHANNEL_KINDS`, default `tick,news`). See the platform README's Config section.
 - **First boot only**: `schema.sql` runs only when `./data/pgdata` is empty. To re-init,
   stop and delete `./data/pgdata`. Schema changes after that are manual DDL (`psql`).

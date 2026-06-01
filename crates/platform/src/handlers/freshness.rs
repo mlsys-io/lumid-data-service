@@ -198,7 +198,7 @@ pub async fn status(State(st): State<AppState>) -> Html<String> {
     }
     if feeds_html.is_empty() {
         feeds_html = "<div class=row><span class='pill off'>feeds: n/a</span>\
-            <span class=dim>no warm symbols configured (FINDATA_RT_WARM_SYMBOLS)</span></div>".to_string();
+            <span class=dim>no warm symbols configured (LUMID_RT_WARM_SYMBOLS)</span></div>".to_string();
     }
 
     // Overall verdict: measured feed failure (a 24/7 feed with no live data)

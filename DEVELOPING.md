@@ -87,13 +87,13 @@ docker run --rm -v /parent:/parent -w /parent/myapp \
 
 ## 4. Run (local)
 ```bash
-FINDATA_DB_HOST=localhost FINDATA_DB_PORT=5433 FINDATA_DB_PASSWORD=… \
-FINDATA_DB_NAME=fin_ai_world_model_v2 \
-FINDATA_REDIS_URL=redis://127.0.0.1:6379 \
-FINDATA_API_KEYS='devkey:dev' \
-FINDATA_FINANCIAL_CONFIG=$PWD/myapp.toml \
-FINDATA_SERVICE_NAME=myapp \
-FINDATA_BIND_ADDR=0.0.0.0:8090 \
+LUMID_DB_HOST=localhost LUMID_DB_PORT=5433 LUMID_DB_PASSWORD=… \
+LUMID_DB_NAME=appdb \
+LUMID_REDIS_URL=redis://127.0.0.1:6379 \
+LUMID_API_KEYS='devkey:dev' \
+LUMID_READ_CONFIG=$PWD/myapp.toml \
+LUMID_SERVICE_NAME=myapp \
+LUMID_BIND_ADDR=0.0.0.0:8090 \
 ./target/release/myapp
 ```
 Smoke test:
@@ -114,7 +114,7 @@ realtime hub, and auto-MCP (one tool per read endpoint) for free.
    RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
    COPY myapp /usr/local/bin/myapp
    COPY myapp.toml /app/myapp.toml
-   ENV FINDATA_BIND_ADDR=0.0.0.0:8088 FINDATA_FINANCIAL_CONFIG=/app/myapp.toml
+   ENV LUMID_BIND_ADDR=0.0.0.0:8088 LUMID_READ_CONFIG=/app/myapp.toml
    EXPOSE 8088
    CMD ["myapp"]
    ```
@@ -126,8 +126,8 @@ realtime hub, and auto-MCP (one tool per read endpoint) for free.
    ```bash
    docker run -d --name myapp --network findata-net -p 0.0.0.0:5030:8088 \
      --env-file secrets.env \
-     -e FINDATA_DB_HOST=finai-tsdb-pg17 -e FINDATA_DB_PORT=5432 -e FINDATA_DB_NAME=fin_ai_world_model_v2 \
-     -e FINDATA_REDIS_URL=redis://finai-redis:6379 -e FINDATA_SERVICE_NAME=myapp \
+     -e LUMID_DB_HOST=finai-tsdb-pg17 -e LUMID_DB_PORT=5432 -e LUMID_DB_NAME=appdb \
+     -e LUMID_REDIS_URL=redis://finai-redis:6379 -e LUMID_SERVICE_NAME=myapp \
      --restart unless-stopped myapp:latest
    ```
 3. Public exposure: add an nginx `location / { proxy_pass http://172.17.0.1:5030; }` (+ TLS).
@@ -139,5 +139,5 @@ The **mint** app (in the `findata` repo: `crates/mint-app-bin/` + `mint.toml`) i
 platform-only app — copy it.
 
 ## Enabling the LLM proxy
-Set `enable_llm: true` in `ServeParts` and `FINDATA_LLM_BACKEND_URL` in the env → the
+Set `enable_llm: true` in `ServeParts` and `LUMID_LLM_BACKEND_URL` in the env → the
 OpenAI/Anthropic-compatible `/v1/*` surface is served, proxying to that backend.
