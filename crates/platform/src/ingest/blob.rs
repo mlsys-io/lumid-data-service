@@ -5,9 +5,10 @@
 //! insert the raw.blobs metadata row, close the run. Idempotent: same sha256 →
 //! existing row, no second write.
 
-use std::path::PathBuf;
+use std::sync::Arc;
 
 use deadpool_postgres::Pool;
+use object_store::{path::Path as ObjPath, ObjectStore, PutPayload};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -124,6 +125,7 @@ async fn lookup_existing(
 pub async fn ingest_blob(
     pool: &Pool,
     settings: &Settings,
+    blob_store: &Arc<dyn ObjectStore>,
     body: &[u8],
     content_type: Option<&str>,
     suggested_name: Option<&str>,
@@ -173,25 +175,13 @@ pub async fn ingest_blob(
     let ct = content_type_for(content_type, suggested_name);
     let prefix = key_prefix_for(&ct);
     let key = format!("{prefix}/sha256={sha}");
-    let target: PathBuf = [&settings.blob_root, prefix, &format!("sha256={sha}")]
-        .iter()
-        .collect();
 
-    // 2) Atomic write (tmp → rename) unless present.
-    if !target.exists() {
-        if let Some(parent) = target.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| ApiError::Internal(anyhow::anyhow!("blob mkdir: {e}")))?;
-        }
-        let tmp = target.with_extension("tmp");
-        tokio::fs::write(&tmp, body)
-            .await
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("blob write: {e}")))?;
-        tokio::fs::rename(&tmp, &target)
-            .await
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("blob rename: {e}")))?;
-    }
+    // 2) Write to the object store (localfs default → identical on-disk layout
+    //    at `<blob_root>/<prefix>/sha256=<hex>`; or S3/MinIO when configured).
+    blob_store
+        .put(&ObjPath::from(key.as_str()), PutPayload::from(body.to_vec()))
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("blob put: {e}")))?;
 
     let storage_url = public_url_for(settings, &key);
 

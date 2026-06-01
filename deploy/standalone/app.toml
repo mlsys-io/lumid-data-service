@@ -1,0 +1,27 @@
+# Declarative read endpoints — served generically by the platform (no Rust).
+# Values bind as :name (always parameterised); {{fragments}} come only from
+# enum allow-lists. See the platform read-layer docs for the full grammar.
+
+[[read.endpoint]]
+id = "events.recent"
+method = "GET"
+path = "/events/recent"
+tables = ["app.events"]          # write-invalidation reverse index
+ttl = "30s"
+shape = "rows"
+row_cap = 500
+cache = true
+sql = """
+SELECT id, ts, kind, payload
+  FROM app.events
+ ORDER BY ts DESC
+ LIMIT :limit
+"""
+
+  [[read.endpoint.param]]
+  name = "limit"
+  kind = "query"
+  type = "int"
+  default = 100
+  min = 1
+  max = 500

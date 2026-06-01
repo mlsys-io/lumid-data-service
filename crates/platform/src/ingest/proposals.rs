@@ -170,18 +170,25 @@ pub async fn create(
     // Suggest a storage backend for the shape (admin can override at approve).
     let suggested = suggest_backend(&schema_n, &key);
 
-    let sample: Vec<Value> = records.iter().take(3).cloned().collect();
+    let sample: Vec<Value> = records.iter().take(5).cloned().collect();
+    // Round 0 of the negotiation history (author = platform, rules-inferred). The
+    // builder can `counter` to refine columns/key before approval.
+    let round0 = json!({
+        "author": "platform", "kind": "suggestion", "reason": "rules-inferred",
+        "columns": &inferred, "key": &key,
+    });
     let client = pool.get().await?;
     let row = client
         .query_one(
             "INSERT INTO provenance.ingress_proposals \
                (declared_schema, declared_table, proposer_sub, proposer_role, \
                 inferred_schema, inferred_key, sample_records, drop_count, \
-                suggested_backend, status) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending') \
+                suggested_backend, status, rounds) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10) \
              RETURNING proposal_id::text",
             &[&schema_n, &table_n, &sub, &role, &Value::Object(inferred.clone()),
-              &key, &Value::Array(sample), &(skipped.len() as i64), &suggested.as_str()],
+              &key, &Value::Array(sample), &(skipped.len() as i64), &suggested.as_str(),
+              &json!([round0])],
         )
         .await?;
     let pid: String = row.get(0);
@@ -189,11 +196,96 @@ pub async fn create(
         "status": "proposed",
         "proposal_id": pid,
         "target": format!("{schema_n}.{table_n}"),
-        "inferred_columns": inferred,
-        "inferred_key": key,
+        "suggested_columns": inferred,
+        "suggested_key": key,
         "skipped_keys": skipped,
         "suggested_backend": suggested.as_str(),
-        "note": "net-new table — pending admin approval (GET /catalog/ingress/proposals)"
+        "note": "net-new table — negotiate the schema: GET /catalog/ingress/proposals/{id}, \
+                 then approve / reject / counter (POST /ingress/proposals/{id}/{approve,reject,counter})."
+    }))
+}
+
+/// Full detail of one proposal: current suggested schema + the round history.
+pub async fn get_detail(pool: &Pool, proposal_id: &str) -> ApiResult<Value> {
+    let client = pool.get().await?;
+    let r = client.query_opt(
+        "SELECT proposal_id::text, declared_schema, declared_table, proposer_sub, proposer_role, \
+            inferred_schema, inferred_key, status, applied_table, rounds, sample_records, created_at::text \
+         FROM provenance.ingress_proposals WHERE proposal_id::text=$1", &[&proposal_id],
+    ).await?.ok_or_else(|| ApiError::NotFound("no such proposal".into()))?;
+    Ok(json!({
+        "proposal_id": r.get::<_, String>(0),
+        "target": format!("{}.{}", r.get::<_, String>(1), r.get::<_, String>(2)),
+        "proposer": r.get::<_, String>(3),
+        "proposer_role": r.get::<_, String>(4),
+        "current_columns": r.get::<_, Value>(5),
+        "current_key": r.get::<_, Vec<String>>(6),
+        "status": r.get::<_, String>(7),
+        "applied_table": r.get::<_, Option<String>>(8),
+        "rounds": r.get::<_, Value>(9),
+        "sample_records": r.get::<_, Value>(10),
+        "created_at": r.get::<_, String>(11),
+    }))
+}
+
+/// Is `sub` the original proposer of this (still-pending) proposal?
+pub async fn is_proposer(pool: &Pool, proposal_id: &str, sub: &str) -> ApiResult<bool> {
+    let client = pool.get().await?;
+    Ok(client.query_opt(
+        "SELECT 1 FROM provenance.ingress_proposals WHERE proposal_id::text=$1 AND proposer_sub=$2",
+        &[&proposal_id, &sub],
+    ).await?.is_some())
+}
+
+/// Counter-propose a schema. The platform validates + normalises the caller's
+/// columns/key, optionally refines them through the wired LLM, records a builder
+/// round + a platform round, and updates the current suggestion — leaving the
+/// proposal `pending` for another approve/reject/counter cycle.
+pub async fn counter(
+    pool: &Pool,
+    settings: &crate::config::Settings,
+    http: &reqwest::Client,
+    proposal_id: &str,
+    sub: &str,
+    columns: &Value,
+    key: &[String],
+    records_hint: &[Value],
+) -> ApiResult<Value> {
+    // 1) Validate the builder's proposal (safe identifiers + allow-listed types).
+    let (b_cols, b_key) = super::schema_suggest::validate(columns, key)
+        .map_err(ApiError::BadRequest)?;
+
+    // 2) Optional LLM refine (best-effort; falls back to the builder's proposal).
+    let (cur_cols, cur_key, refined_by) =
+        match super::schema_suggest::llm_refine(settings, http, &b_cols, &b_key, records_hint).await {
+            Some((c, k)) => (c, k, "rules+ai"),
+            None => (b_cols.clone(), b_key.clone(), "rules"),
+        };
+
+    let builder_round = json!({"author": "builder", "kind": "counter", "columns": &b_cols, "key": &b_key});
+    let platform_round = json!({"author": "platform", "kind": "suggestion", "reason": refined_by,
+                                "columns": &cur_cols, "key": &cur_key});
+
+    let client = pool.get().await?;
+    let n = client.execute(
+        "UPDATE provenance.ingress_proposals \
+            SET inferred_schema=$2, inferred_key=$3, \
+                rounds = rounds || $4::jsonb, updated_at=now() \
+          WHERE proposal_id::text=$1 AND status='pending'",
+        &[&proposal_id, &Value::Object(cur_cols.clone()), &cur_key,
+          &json!([builder_round, platform_round])],
+    ).await?;
+    if n == 0 {
+        return Err(ApiError::NotFound("no pending proposal with that id".into()));
+    }
+    let _ = sub;
+    Ok(json!({
+        "status": "countered",
+        "proposal_id": proposal_id,
+        "refined_by": refined_by,
+        "current_columns": cur_cols,
+        "current_key": cur_key,
+        "note": "schema updated — approve to apply, or counter again."
     }))
 }
 

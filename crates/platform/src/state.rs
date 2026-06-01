@@ -26,6 +26,9 @@ pub struct AppState {
     pub read_cache: std::sync::Arc<crate::read::cache::CacheManager>,
     /// Shared HTTP client for the LLM reverse proxy (and any outbound calls).
     pub http: reqwest::Client,
+    /// Pluggable blob object-store backend (local filesystem by default, or
+    /// S3/MinIO when `FINDATA_BLOB_BACKEND=s3`). Built once at boot.
+    pub blob_store: Arc<dyn object_store::ObjectStore>,
     /// Storage-backend registry — resolves `schema.table → Backend`. Phase A is
     /// Postgres-only (default-to-PG when no `provenance.table_backend` row), so
     /// every existing table resolves to PG with no behavior change.

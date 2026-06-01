@@ -215,13 +215,11 @@ const LANDING_HTML: &str = r##"<!DOCTYPE html>
       </svg>
       findata
     </div>
-    <a class="link" href="/reference">Reference</a>
     <a class="link" href="/usage.md">Guide</a>
+    <a class="link" href="/openapi.json">OpenAPI</a>
     <a class="link" href="/llm">LLM</a>
     <a class="link" href="/status">Status</a>
     <a class="link" href="/usage">Usage</a>
-    <a class="link" href="/redoc">ReDoc</a>
-    <a class="link" href="/docs">Swagger</a>
     <div class="spacer"></div>
     <span class="pill"><span class="dot"></span>kv.run:5000</span>
   </nav>
@@ -231,23 +229,23 @@ const LANDING_HTML: &str = r##"<!DOCTYPE html>
     <p class="tagline">
       A read-only HTTP, WebSocket, and MCP interface over a <em>1.3 TB</em>
       financial dataset — symbols, OHLC bars, fundamentals, news, ownership,
-      regulatory, macro, plus an <em>11.4 M-row</em> KOL tweet archive with
+      regulatory, macro, plus an <em>11.3 M-row</em> KOL tweet archive with
       <em>4.7 M</em> mirrored images. Refreshed hourly, streamed live.
     </p>
     <div class="cta">
-      <a class="btn primary" href="/reference">Open reference →</a>
+      <a class="btn primary" href="/usage.md">Open the guide →</a>
       <a class="btn secondary" href="#quickstart">Quick start</a>
       <a class="btn secondary" href="#realtime">Realtime &amp; KOL</a>
     </div>
 
     <div class="stats">
       <div class="stat"><div class="v">133</div><div class="l">endpoints</div></div>
-      <div class="stat"><div class="v">11.4 M</div><div class="l">KOL tweets</div></div>
+      <div class="stat"><div class="v">11.3 M</div><div class="l">KOL tweets</div></div>
       <div class="stat"><div class="v">4.7 M</div><div class="l">tweet images</div></div>
-      <div class="stat"><div class="v">17.4 M</div><div class="l">news articles</div></div>
+      <div class="stat"><div class="v">17.2 M</div><div class="l">news articles</div></div>
       <div class="stat"><div class="v">7,851</div><div class="l">symbols</div></div>
-      <div class="stat"><div class="v">8.2 M+</div><div class="l">prediction markets</div></div>
-      <div class="stat"><div class="v">85 M+</div><div class="l">PM trades</div></div>
+      <div class="stat"><div class="v">10.3 M+</div><div class="l">prediction markets</div></div>
+      <div class="stat"><div class="v">95 M+</div><div class="l">PM trades</div></div>
       <div class="stat"><div class="v">1.3 TB</div><div class="l">total dataset</div></div>
     </div>
   </header>
@@ -290,12 +288,12 @@ const LANDING_HTML: &str = r##"<!DOCTYPE html>
       </div>
       <div class="ex">
         <h3>KOL tweets — archive search</h3>
-        <div class="sub">11.4 M tweets, 2010-2026. Full-text + cashtag indexed.</div>
+        <div class="sub">11.3 M tweets, 2010-2026. Full-text + cashtag indexed.</div>
 <pre class="code"><span class="k1">curl</span> "https://kv.run:5000<span class="p1">/kols/tweets/search</span>?q=<span class="s1">earnings+beat</span>"</pre>
       </div>
       <div class="ex">
         <h3>News firehose by category</h3>
-        <div class="sub">17.4 M articles across multiple wire and CSV feeds.</div>
+        <div class="sub">17.2 M articles across multiple wire and CSV feeds.</div>
 <pre class="code"><span class="k1">curl</span> "https://kv.run:5000<span class="p1">/news/latest</span>?category=<span class="s1">general</span>&amp;limit=20"</pre>
       </div>
       <div class="ex">
@@ -311,8 +309,8 @@ const LANDING_HTML: &str = r##"<!DOCTYPE html>
     <h2><span class="num">02</span>Surface</h2>
     <p class="intro">
       Endpoints are grouped by data domain. Open any group in the
-      <a href="/reference">reference</a> for a request builder, response schema,
-      and an example payload.
+      <a href="/openapi.json">OpenAPI spec</a> or the <a href="/usage.md">guide</a>
+      for schemas and example payloads.
     </p>
 
     <div class="tiles">
@@ -373,13 +371,13 @@ const LANDING_HTML: &str = r##"<!DOCTYPE html>
 
       <a class="tile" href="/reference#tag/News">
         <div class="title"><span class="ic">/</span>News</div>
-        <div class="desc"><b>17.4 M articles</b> deduped across multiple wire and CSV feeds. Per-symbol, global firehose by category, or PG full-text search.</div>
+        <div class="desc"><b>17.2 M articles</b> deduped across multiple wire and CSV feeds. Per-symbol, global firehose by category, or PG full-text search.</div>
         <div class="ep">GET /news/latest • /news/search • /news/{symbol}</div>
       </a>
 
       <a class="tile" href="/reference#tag/KOL">
         <div class="title"><span class="ic">/</span>KOL</div>
-        <div class="desc">Curated 78-handle roster + live cashtag SSE. <b>11.4 M-row Postgres archive</b> (2010-2026, full-text + cashtag-indexed) with <b>4.7 M mirrored images</b> served at <code>/kols/media/</code>.</div>
+        <div class="desc">Curated 78-handle roster + live cashtag SSE. <b>11.3 M-row Postgres archive</b> (2010-2026, full-text + cashtag-indexed) with <b>4.7 M mirrored images</b> served at <code>/kols/media/</code>.</div>
         <div class="ep">GET /kols/tweets/search • /kols/{handle}/tweets/history • /kols/media/by-url</div>
       </a>
 
@@ -599,7 +597,7 @@ const LANDING_HTML: &str = r##"<!DOCTYPE html>
     <div class="row">
       <a href="/status">Status</a>
       <a href="/usage">Usage</a>
-      <a href="/reference">Reference</a>
+      <a href="/usage.md">Guide</a>
       <div class="spacer"></div>
       <span class="signature">findata · mlsys-io</span>
     </div>

@@ -52,13 +52,60 @@ fn generate(specs: &[Arc<EndpointSpec>]) -> Value {
         });
         paths.insert(oapi_path(&s.path), json!({ s.method.to_lowercase(): op }));
     }
+
+    // Platform routes that aren't declarative specs but ARE part of the
+    // read-accessible surface: catalog/lineage, realtime (SSE/WS), MCP, and the
+    // caller's own usage. Write/ingest/admin are intentionally OMITTED — these
+    // are operator/submitter routes, not the end-user (read) surface.
+    let p = |name: &str, loc: &str, required: bool| {
+        json!({"name": name, "in": loc, "required": required, "schema": {"type": "string"}})
+    };
+    let mut add = |path: &str, method: &str, summary: &str, params: Vec<Value>, desc: &str| {
+        let op = json!({
+            "summary": summary,
+            "operationId": format!("{}_{}", method, path.replace(['/', '{', '}'], "_").trim_matches('_')),
+            "description": desc,
+            "parameters": params,
+            "responses": {"200": {"description": "OK"}},
+        });
+        let entry = paths.entry(path.to_string()).or_insert_with(|| json!({}));
+        if let Some(m) = entry.as_object_mut() {
+            m.insert(method.to_string(), op);
+        }
+    };
+
+    // --- Catalog / lineage (discovery; read-only) ---
+    add("/catalog/schemas", "get", "List schemas", vec![], "User schemas in the warehouse.");
+    add("/catalog/schemas/{schema}/tables", "get", "List tables in a schema", vec![p("schema", "path", true)], "");
+    add("/catalog/tables/{schema}/{table}", "get", "Table profile", vec![p("schema", "path", true), p("table", "path", true)], "Columns, row estimate, provenance.");
+    add("/catalog/tables/{schema}/{table}/schema.json", "get", "Table JSON Schema", vec![p("schema", "path", true), p("table", "path", true)], "");
+    add("/catalog/sources", "get", "Ingest sources", vec![], "");
+    add("/catalog/submitters", "get", "Ingest submitters", vec![], "");
+    add("/catalog/lineage/runs", "get", "Recent ingest runs", vec![], "");
+    add("/catalog/lineage/run/{run_id}", "get", "Lineage for a run", vec![p("run_id", "path", true)], "");
+    add("/catalog/lineage/row", "get", "Lineage for a row", vec![p("schema", "query", true), p("table", "query", true)], "Trace a row back to its ingest run.");
+
+    // --- Realtime (SSE + WebSocket) ---
+    add("/quotes/stream", "get", "Quote tick SSE", vec![p("symbols", "query", true)], "Server-Sent Events: subscribed/tick/heartbeat.");
+    add("/prediction-markets/stream", "get", "Prediction-market event SSE", vec![p("asset_ids", "query", false), p("condition_ids", "query", false)], "SSE of live PM trades + orderbook events (Polymarket + Kalshi, tagged by venue).");
+    add("/ws/quotes", "get", "Quote WebSocket", vec![], "WebSocket upgrade — subscribe {symbols}. Self-authenticating (bearer via header/query/subprotocol).");
+    add("/ws/news", "get", "News WebSocket", vec![], "WebSocket upgrade. Self-authenticating.");
+    add("/ws/prediction-markets", "get", "Prediction-market WebSocket", vec![p("asset_ids", "query", false), p("condition_ids", "query", false)], "WebSocket alternative to /prediction-markets/stream.");
+
+    // --- MCP + own usage ---
+    add("/mcp", "post", "MCP JSON-RPC", vec![], "Model Context Protocol (JSON-RPC 2.0, Streamable-HTTP). One tool per read endpoint; tools/list + tools/call.");
+    add("/usage/me", "get", "Your usage", vec![], "Calling identity's totals: total_calls, bytes_out, calls_last_24h, hourly_last_24h.");
+
     json!({
         "openapi": "3.1.0",
         "info": {
             "title": std::env::var("FINDATA_SERVICE_NAME").unwrap_or_else(|_| "lumid".into()),
             "version": env!("CARGO_PKG_VERSION"),
-            "description": "Declarative read endpoints. Bespoke routes (ohlc, quotes, screener, \
-                prediction-markets, /v1 LLM, MCP) are documented at /reference.",
+            "description": "Read + discovery + realtime + MCP surface. Declarative read \
+                endpoints, catalog/lineage, SSE/WebSocket streams, and POST /mcp. \
+                App-compiled reads (ohlc, quotes, screener, prediction-market candles) and \
+                the optional /v1 LLM proxy are at /reference. Write/ingest/admin routes are \
+                operator-only and intentionally not listed here.",
         },
         "servers": [{"url": "/"}],
         "components": {"securitySchemes": {"bearer": {"type": "http", "scheme": "bearer"}}},
