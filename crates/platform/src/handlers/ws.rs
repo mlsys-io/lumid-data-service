@@ -1,8 +1,9 @@
 //! WebSocket realtime endpoints — port of `api/routes/ws_quotes.py` +
 //! `ws_news.py`.
 //!
-//! `/ws/quotes` streams tick/news/kol frames; `/ws/news` is the same protocol
-//! but the sender drops everything except news + control frames. Both
+//! `/ws/quotes` streams all data-frame kinds; `/ws/news` is the same protocol
+//! but the sender drops everything except `news` data frames + control frames.
+//! (The set of data-frame kinds is app-configured — see `rt_channel_kinds`.) Both
 //! authenticate themselves (token from Authorization / x-api-key /
 //! `Sec-WebSocket-Protocol: bearer.<tok>`) — they are mounted OUTSIDE the
 //! `gate` middleware because the WS upgrade can't carry the gate's 401 body.

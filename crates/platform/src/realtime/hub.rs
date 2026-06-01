@@ -6,12 +6,13 @@
 //! transitions so upstream workers can claim/release a symbol), and a single
 //! background listener task.
 //!
-//! Redis model: the Python hub dynamically SUBSCRIBEs `tick:<sym>` etc. per
-//! demanded symbol. redis-rs makes dynamic (un)subscription on a live consumer
-//! awkward, so this port instead `PSUBSCRIBE`s `tick:* news:* kol:*` once and
-//! fans out by the local `subs_by_symbol` index. In a single-process,
-//! demand-gated deployment (upstreams only publish symbols the hub asked for)
-//! the message volume is identical — only symbols with subscribers ever flow.
+//! Redis model: the hub dynamically SUBSCRIBEs `<kind>:<key>` per demanded
+//! symbol. redis-rs makes dynamic (un)subscription on a live consumer awkward,
+//! so this instead `PSUBSCRIBE`s `<kind>:*` once for each app-declared channel
+//! kind (`Settings::rt_channel_kinds`) and fans out by the local
+//! `subs_by_symbol` index. In a single-process, demand-gated deployment
+//! (upstreams only publish symbols the hub asked for) the message volume is
+//! identical — only symbols with subscribers ever flow.
 //!
 //! Slow-client safeguard: each connection has a bounded queue (default 100);
 //! on overflow the OLDEST frame is dropped and the client is notified at most

@@ -2,7 +2,8 @@
 //!
 //! - `hub`       — per-connection registry + Redis pub/sub fan-out
 //! - `synthetic` — dev-only test publisher
-//! - `upstream`  — provider workers (finnhub_ws, fmp_ws, news, kol, polling)
+//! - `upstream`  — the `UpstreamWorker` trait; concrete provider workers are
+//!   supplied by the app layer (the platform names no provider)
 
 pub mod health;
 pub mod hub;
@@ -33,7 +34,7 @@ pub async fn start(
 
     // Drive the registered upstreams in order. Each registers its demand
     // listener synchronously before returning, so registration order sets the
-    // tier-claim precedence (FMP → Finnhub → news → kol → polling; bite #28).
+    // app-defined tier-claim precedence (the app orders its `workers()`).
     for w in &workers {
         if let Err(e) = w
             .start(hub.clone(), mux.clone(), settings.clone(), pool.clone())

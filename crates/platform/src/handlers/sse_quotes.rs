@@ -1,9 +1,10 @@
 //! SSE quote stream — port of `api/routes/sse_quotes.py`.
 //!
-//! `GET /quotes/stream?symbols=AAPL,NVDA` — Server-Sent Events tick/news/kol
+//! `GET /quotes/stream?symbols=AAPL,NVDA` — Server-Sent Events data-frame
 //! stream. Gated (the `gate` middleware injects the identity); subscribes the
 //! connection to the requested symbols and emits one SSE event per frame, with
-//! `event:` ∈ {tick,news,kol,subscribed,heartbeat,error}.
+//! `event:` ∈ the app-configured data-frame kinds (`rt_channel_kinds`) plus the
+//! control events {subscribed, heartbeat, error}.
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
