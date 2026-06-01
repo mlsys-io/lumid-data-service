@@ -310,7 +310,7 @@ impl Backend for ClickHouseBackend {
         // Phase B scopes CH to write-side + backend approval. CH *reads* (the
         // PG-`$N`-vs-CH-`?` dialect branch + CH SQL specs) are deferred to Phase
         // C. The mechanics below DO work for a CH-native SQL string with no
-        // positional binds, but the platform's `financial.toml` specs are
+        // positional binds, but the platform's the read-config TOML specs are
         // authored in PG dialect, so resolving a read endpoint onto a CH table
         // today would send PG SQL to CH. We fail loud rather than silently
         // mis-execute.

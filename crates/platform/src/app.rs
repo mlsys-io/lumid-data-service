@@ -28,7 +28,7 @@ pub fn build_router(
         .merge(public_ext_router) // app-contributed public routes (e.g. /usage.md)
         // Public landing surfaces (no auth) — app-contributed (`ServeParts.landing`)
         // or the platform's generic fallback (`GET /`). The platform names no
-        // domain, so the financial landing/reference/llm pages live in the app.
+        // domain, so the app-provided landing/reference/llm pages live in the app.
         .merge(landing_router)
         // Status board + usage dashboard: browsable HTML, public.
         .route("/status", get(handlers::freshness::status))

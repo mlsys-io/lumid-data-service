@@ -12,11 +12,10 @@ use crate::config::Settings;
 use crate::realtime::hub::Hub;
 
 /// A realtime provider upstream — the IoC seam between the generic hub
-/// (platform) and the domain providers (financial). The platform's
-/// `realtime::start` drives a `Vec<Box<dyn UpstreamWorker>>` in registration
-/// order; the financial crate supplies the concrete workers. (Trait stays in
-/// the platform; the concrete impls + `financial_workers()` move to
-/// my_ext on extraction.)
+/// (platform) and the app's domain feeds. The platform's `realtime::start`
+/// drives a `Vec<Box<dyn UpstreamWorker>>` in registration order; the app crate
+/// supplies the concrete workers (via `ServeParts.workers`). The trait stays in
+/// the platform; the concrete impls live in the app (e.g. `my_ext`).
 pub trait UpstreamWorker: Send + Sync {
     fn name(&self) -> &'static str;
     fn start(

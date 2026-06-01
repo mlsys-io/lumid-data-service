@@ -1,20 +1,15 @@
 //! Runtime configuration, read from env vars.
 //!
-//! The crate is `lumid-platform`, so the **canonical** env prefix is `LUMID_`
-//! and the platform names no domain in its config namespace. The legacy
-//! `FINDATA_` prefix (carried over verbatim from the pre-split Python service)
-//! is still accepted as a fallback so existing deploy env keeps working — set
-//! `LUMID_*` and the `FINDATA_*` fallback can be dropped. App-specific config
-//! (provider keys, etc.) is named by the app, not here (e.g. `my_ext::cfg`).
+//! The crate is `lumid-platform`, so every platform setting is read as
+//! `LUMID_<NAME>`. The platform names no app in its config namespace.
+//! App-specific config (provider keys, etc.) is named by the app, not here
+//! (e.g. `my_ext::cfg`).
 
 use std::env;
 
-/// Read a platform setting by its bare NAME (no prefix). Tries `LUMID_<NAME>`
-/// first (canonical), then `FINDATA_<NAME>` (legacy fallback).
+/// Read a platform setting by its bare NAME (no prefix): `LUMID_<NAME>`.
 pub fn env_var(name: &str) -> Option<String> {
-    env::var(format!("LUMID_{name}"))
-        .or_else(|_| env::var(format!("FINDATA_{name}")))
-        .ok()
+    env::var(format!("LUMID_{name}")).ok()
 }
 
 fn env_str(name: &str, default: &str) -> String {
@@ -129,13 +124,15 @@ impl Settings {
             ch_user: env_str("CLICKHOUSE_USER", "default"),
             ch_password: env_str("CLICKHOUSE_PASSWORD", ""),
             ch_database: env_str("CLICKHOUSE_DB", "default"),
-            lumid_url: env_str("LUMID_URL", "https://lum.id"),
+            // Auth-service (Lumid identity) config — named AUTH_* so the env
+            // var isn't a doubled prefix under the platform's LUMID_ namespace.
+            lumid_url: env_str("AUTH_URL", "https://lum.id"),
             lumid_enabled: matches!(
-                env_str("LUMID_ENABLED", "true").to_lowercase().as_str(),
+                env_str("AUTH_ENABLED", "true").to_lowercase().as_str(),
                 "1" | "true" | "yes"
             ),
-            lumid_cache_ttl_s: env_u32("LUMID_CACHE_TTL", 300) as u64,
-            lumid_timeout_s: env_u32("LUMID_TIMEOUT_S", 5) as u64,
+            lumid_cache_ttl_s: env_u32("AUTH_CACHE_TTL", 300) as u64,
+            lumid_timeout_s: env_u32("AUTH_TIMEOUT_S", 5) as u64,
             api_keys_raw: env_str("API_KEYS", ""),
             rate_limit_anon: env_str("RATE_LIMIT_ANON", "60/minute"),
             rate_limit_authed: env_str("RATE_LIMIT_AUTHED", "600/minute"),

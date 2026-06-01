@@ -1,6 +1,6 @@
 //! Config-driven read layer (the "config" half of the platform/app split).
 //!
-//! Endpoints are declared in `financial.toml` (`[[read.endpoint]]` blocks):
+//! Endpoints are declared in the read-config TOML (`[[read.endpoint]]` blocks):
 //! `{ id, method, path, sql (named `:binds` + allow-listed `{{fragments}}`),
 //! params[], tables[], ttl, shape, strip_lineage, row_cap }`. At startup the
 //! platform parses them, lowers each to prepared SQL, and mounts them as axum
@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use spec::EndpointSpec;
 
-/// Load + validate `financial.toml` into Arc'd specs.
+/// Load + validate the read-config TOML into Arc'd specs.
 pub fn load_specs(path: &str) -> Result<Vec<Arc<EndpointSpec>>, crate::error::ApiError> {
     Ok(spec::load(path)?.into_iter().map(Arc::new).collect())
 }

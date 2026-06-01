@@ -44,7 +44,7 @@ A new app therefore = **a config file + a thin `main` + a DB schema**:
    tables it creates). No schema declaration in code — tables are introspected at write time.
 2. **Reads** — a TOML of `[[read.endpoint]]` specs (`id`, `path`, `params`, `sql`, `ttl`,
    `shape`). Values bind as `:name` (always parameterized); `{{fragment}}` switches come only
-   from author-controlled enum/presence maps. Pointed to via `LUMID_FINANCIAL_CONFIG`.
+   from author-controlled enum/presence maps. Pointed to via `LUMID_READ_CONFIG`.
 3. **Bespoke** — anything SQL-in-config can't express: a compiled handler (gated via
    `ext_routes`, un-gated via `public_routes`), a realtime `UpstreamWorker` (via `workers`), a
    custom landing (`landing`), and OpenAPI entries for any of it (`openapi_paths`).
@@ -86,11 +86,11 @@ See the `mint` reference app for a complete platform-only example.
 - **LLM proxy (optional)** — enable via `ServeParts.enable_llm`; mounts the OpenAI/Anthropic-
   compatible `/v1/*` surface proxying to `LUMID_LLM_BACKEND_URL`.
 
-## Config (env, all `LUMID_*`; legacy `FINDATA_*` accepted as a fallback)
+## Config (env, all `LUMID_*`)
 DB: `LUMID_DB_{HOST,PORT,USER,PASSWORD,NAME}`, `LUMID_POOL_MAX`, `LUMID_STATEMENT_TIMEOUT_MS`.
-Service: `LUMID_BIND_ADDR`, `LUMID_FINANCIAL_CONFIG`, `LUMID_SERVICE_NAME`,
+Service: `LUMID_BIND_ADDR`, `LUMID_READ_CONFIG`, `LUMID_SERVICE_NAME`,
 `LUMID_API_KEYS`, `LUMID_RATE_LIMIT_{ANON,AUTHED}`, `LUMID_REDIS_URL`,
-`LUMID_LUMID_{ENABLED,URL}`, `LUMID_BLOB_ROOT`, `LUMID_LLM_BACKEND_URL`.
+`LUMID_AUTH_{ENABLED,URL}`, `LUMID_BLOB_ROOT`, `LUMID_LLM_BACKEND_URL`.
 Realtime: `LUMID_RT_CHANNEL_KINDS` (hub channel kinds, default `tick,news`),
 `LUMID_RT_WARM_SYMBOLS`, `LUMID_RT_{HEARTBEAT_SEC,SSE_REQUEST_SYMS,SLOWCLIENT_QUEUE,…}`.
 Storage backends (optional): `LUMID_CLICKHOUSE_*` registers a ClickHouse backend alongside

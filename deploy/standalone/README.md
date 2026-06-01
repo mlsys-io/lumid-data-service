@@ -77,7 +77,7 @@ Reads serve whatever is in the DB. Load it however you like:
 ## Notes
 - **MinIO vs local FS**: this bundle stores blobs in MinIO (self-contained). To use a
   plain folder instead, set `LUMID_BLOB_BACKEND=localfs` and bind-mount a blobs dir.
-- **Auth**: standalone uses local keys (`LUMID_API_KEYS`, `LUMID_LUMID_ENABLED=false`).
+- **Auth**: standalone uses local keys (`LUMID_API_KEYS`, `LUMID_AUTH_ENABLED=false`).
   Point at a real introspection service by flipping those.
 - **Optional platform features** (set in the compose `environment:` block): a ClickHouse
   backend alongside Postgres (`LUMID_CLICKHOUSE_*`, per-table routing via
