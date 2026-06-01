@@ -216,8 +216,12 @@ async fn serve(
         loop {
             for frame in send_conn.drain().await {
                 if news_only {
+                    // The /ws/news variant carries only `news` data frames (+
+                    // heartbeat/control). Drop any other data frame (domain-agnostic:
+                    // a data frame carries a `data` payload) and tier-change notices.
                     let t = frame.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    if t == "tick" || t == "kol" || t == "tier_change" {
+                    let is_data = frame.get("data").is_some();
+                    if (is_data && t != "news") || t == "tier_change" {
                         continue;
                     }
                 }

@@ -142,17 +142,29 @@ pub struct Hub {
     demand_listeners: Mutex<Vec<DemandListener>>,
     lag_buf: Mutex<HashMap<String, VecDeque<i64>>>,
     stream_counts: Mutex<HashMap<String, u64>>,
+    /// Redis pub/sub channel KINDS the listener fans out: it `PSUBSCRIBE`s
+    /// `<kind>:*` for each and ignores channels whose prefix isn't in this set.
+    /// Supplied by the app via `Settings::rt_channel_kinds` so the platform
+    /// names no domain channel.
+    channel_kinds: Vec<String>,
 }
 
 impl Hub {
-    pub fn new(redis: redis::aio::MultiplexedConnection) -> Arc<Self> {
+    pub fn new(redis: redis::aio::MultiplexedConnection, channel_kinds: Vec<String>) -> Arc<Self> {
         Arc::new(Self {
             redis: Mutex::new(redis),
             state: Mutex::new(HubState::default()),
             demand_listeners: Mutex::new(Vec::new()),
             lag_buf: Mutex::new(HashMap::new()),
             stream_counts: Mutex::new(HashMap::new()),
+            channel_kinds,
         })
+    }
+
+    /// The configured channel kinds (e.g. `["tick","news"]`) — used by the SSE /
+    /// WS transports to decide which frame `type`s are data frames.
+    pub fn channel_kinds(&self) -> &[String] {
+        &self.channel_kinds
     }
 
     /// Spawn the background Redis pub/sub listener. `client` opens a dedicated
@@ -172,9 +184,11 @@ impl Hub {
 
     async fn run_listener(self: Arc<Self>, client: &redis::Client) -> redis::RedisResult<()> {
         let mut pubsub = client.get_async_pubsub().await?;
-        pubsub.psubscribe("tick:*").await?;
-        pubsub.psubscribe("news:*").await?;
-        pubsub.psubscribe("kol:*").await?;
+        // PSUBSCRIBE `<kind>:*` for each app-declared channel kind. The platform
+        // names no domain channel — the set comes from `Settings::rt_channel_kinds`.
+        for kind in &self.channel_kinds {
+            pubsub.psubscribe(format!("{kind}:*")).await?;
+        }
         pubsub.subscribe("findata:rt:control").await?;
         let mut stream = pubsub.on_message();
         while let Some(msg) = stream.next().await {
@@ -182,7 +196,7 @@ impl Hub {
             let Some((kind, key)) = channel.split_once(':') else {
                 continue;
             };
-            if kind != "tick" && kind != "news" && kind != "kol" {
+            if !self.channel_kinds.iter().any(|k| k == kind) {
                 continue;
             }
             let raw: String = match msg.get_payload() {

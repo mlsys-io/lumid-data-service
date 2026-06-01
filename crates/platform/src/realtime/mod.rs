@@ -25,7 +25,7 @@ pub async fn start(
     pool: Pool,
     workers: Vec<Box<dyn upstream::UpstreamWorker>>,
 ) -> Arc<hub::Hub> {
-    let hub = hub::Hub::new(mux.clone());
+    let hub = hub::Hub::new(mux.clone(), settings.rt_channel_kinds.clone());
     hub.start_listener(client);
     if settings.rt_synthetic {
         synthetic::run(mux.clone());

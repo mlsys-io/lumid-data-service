@@ -6,7 +6,7 @@
 //! the remaining endpoints + the write plane + the proxy gateway.
 
 use axum::middleware::from_fn_with_state;
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
@@ -19,26 +19,21 @@ pub fn build_router(
     ext_router: Router<AppState>,
     openapi_router: Router<AppState>,
     public_ext_router: Router<AppState>,
+    landing_router: Router<AppState>,
 ) -> Router {
     let public = Router::new()
         .route("/health", get(handlers::health::health))
         .route("/health/db", get(handlers::health::health_db))
         .merge(openapi_router) // GET /openapi.json (public)
         .merge(public_ext_router) // app-contributed public routes (e.g. /usage.md)
-        // Public landing surfaces (no auth) — ports of api/landing.py + llm_landing.py.
-        .route("/", get(handlers::landing::landing))
-        .route("/reference", get(handlers::landing::landing))
-        .route("/llm", get(handlers::landing::llm_landing))
-        // Status board + usage dashboard: browsable HTML linked from the public
-        // landing, so public (matches Python: bare @app.get, no auth dep).
+        // Public landing surfaces (no auth) — app-contributed (`ServeParts.landing`)
+        // or the platform's generic fallback (`GET /`). The platform names no
+        // domain, so the financial landing/reference/llm pages live in the app.
+        .merge(landing_router)
+        // Status board + usage dashboard: browsable HTML, public.
         .route("/status", get(handlers::freshness::status))
         .route("/usage", get(handlers::usage::usage))
         .route("/freshness", get(handlers::freshness::freshness))
-        // Doc aliases linked from the landing. FastAPI's /docs + /redoc weren't
-        // ported (no OpenAPI spec generator on the Rust side); /reference is the
-        // canonical API reference, so redirect the legacy paths there.
-        .route("/docs", get(|| async { axum::response::Redirect::permanent("/reference") }))
-        .route("/redoc", get(|| async { axum::response::Redirect::permanent("/reference") }))
         // Webhook ingress: HMAC-authenticated, mounted OUTSIDE the gate.
         .route("/webhook/:webhook_id", post(handlers::ingest::post_webhook))
         // WebSocket realtime: self-authenticating (the WS upgrade can't carry
@@ -87,15 +82,6 @@ pub fn build_router(
         // Blob serving (read side) — port of api/routes/blobs.py.
         .route("/blobs/*key", get(handlers::blobs::serve_blob))
         .route("/storage/v1/object/findata/*path", get(handlers::blobs::legacy_storage_alias))
-
-        // KOL media — port of api/routes/kol_media.py.
-        .route("/kols/media", get(handlers::kol_media::info))
-        .route("/kols/media/by-url", get(handlers::kol_media::by_url))
-        .route("/kols/media/*rel", get(handlers::kol_media::serve))
-
-        // KOL roster admin (super_admin / local) — port of api/routes/admin_kols.py.
-        .route("/admin/kols", post(handlers::admin_kols::add_kol))
-        .route("/admin/kols/:handle", delete(handlers::admin_kols::remove_kol))
 
         // Realtime SSE (normal GET → gated through the auth middleware).
         .route("/quotes/stream", get(handlers::sse_quotes::quotes_stream))

@@ -1,13 +1,11 @@
 //! HTTP handlers — platform (generic) only. Financial read handlers moved to
 //! the `findata-ext` crate.
 
-pub mod admin_kols;
 pub mod blobs;
 pub mod catalog;
 pub mod freshness;
 pub mod health;
 pub mod ingest;
-pub mod kol_media;
 pub mod landing;
 pub mod llm;
 pub mod pm_stream;

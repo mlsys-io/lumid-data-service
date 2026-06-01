@@ -145,19 +145,22 @@ pub async fn quotes_stream(
 fn frame_to_event(frame: Value) -> Event {
     let kind = frame.get("type").and_then(|v| v.as_str()).unwrap_or("message").to_string();
     match kind.as_str() {
-        "tick" | "news" | "kol" => {
-            let k = kind.clone();
-            Event::default()
-                .event(kind)
-                .json_data(frame.get("data").cloned().unwrap_or(json!({})))
-                .unwrap_or_else(|_| Event::default().event(k).data("{}"))
-        }
         "heartbeat" => {
             let ts = frame.get("ts").cloned().unwrap_or_else(|| json!(now_iso()));
             Event::default()
                 .event("heartbeat")
                 .json_data(json!({"ts": ts}))
                 .unwrap_or_else(|_| Event::default().event("heartbeat").data("{}"))
+        }
+        // Data frames carry a `data` payload (emit just that — any channel kind,
+        // domain-agnostic); control frames (subscribed / error / tier_change)
+        // carry their fields inline, so emit the whole frame.
+        _ if frame.get("data").is_some() => {
+            let k = kind.clone();
+            Event::default()
+                .event(kind)
+                .json_data(frame.get("data").cloned().unwrap_or(json!({})))
+                .unwrap_or_else(|_| Event::default().event(k).data("{}"))
         }
         _ => Event::default()
             .event(kind)

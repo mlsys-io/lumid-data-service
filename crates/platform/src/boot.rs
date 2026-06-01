@@ -28,6 +28,12 @@ pub struct ServeParts {
     /// platform's public group alongside the landing surfaces. Use for
     /// app-owned docs / static pages that should need no auth. Default empty.
     pub public_routes: Router<state::AppState>,
+    /// Public landing routes (`/`, and whatever else the app wants there) —
+    /// override the platform's generic fallback landing. Default is the
+    /// platform's domain-free `GET /` page (so the platform names no domain and
+    /// a config-only app still gets a landing). An app passes its own marketing
+    /// / reference pages here.
+    pub landing: Router<state::AppState>,
     pub workers: Vec<Box<dyn UpstreamWorker>>,
     /// Enable the platform's LLM reverse-proxy feature (`/v1/*`). Optional per
     /// app — off by default; an app flips this to serve LLM (proxies to
@@ -38,7 +44,13 @@ pub struct ServeParts {
 
 impl Default for ServeParts {
     fn default() -> Self {
-        Self { ext_routes: Router::new(), public_routes: Router::new(), workers: Vec::new(), enable_llm: false }
+        Self {
+            ext_routes: Router::new(),
+            public_routes: Router::new(),
+            landing: crate::handlers::landing::default_routes(),
+            workers: Vec::new(),
+            enable_llm: false,
+        }
     }
 }
 
@@ -161,7 +173,14 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
 
     let read_router = read::exec::build_router(&specs);
     let openapi_router = crate::openapi::build_router(&specs);
-    let router = app::build_router(state, read_router, ext_router, openapi_router, parts.public_routes);
+    let router = app::build_router(
+        state,
+        read_router,
+        ext_router,
+        openapi_router,
+        parts.public_routes,
+        parts.landing,
+    );
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!("listening on {bind_addr}");
     axum::serve(listener, router).await?;
