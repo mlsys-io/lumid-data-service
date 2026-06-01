@@ -6,7 +6,7 @@ crate (`lumid-platform`, in `crates/platform`). Applications embed it and add on
 domain: declarative read endpoints (config), any bespoke routes, and any realtime workers.
 
 It is a **library, not a separate service**: an app statically links it into one binary/process.
-(`findata` is one such app; `mint` is a minimal reference app.)
+(`mint` is a minimal reference app; a fuller app adds bespoke routes + realtime workers.)
 
 ## Build an app on it
 The whole of `mint`'s `main.rs` (a config-only app — no domain Rust at all):
@@ -19,16 +19,16 @@ async fn main() -> anyhow::Result<()> {
 ```
 `ServeParts::default()` is empty: no ext routes, no workers, no app landing → the platform
 serves a **generic fallback landing** at `/`. A richer app fills in the fields it needs
-(`findata`'s `main.rs`):
+(a fuller app's `main.rs`):
 ```rust
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     lumid_platform::serve(lumid_platform::ServeParts {
-        ext_routes:    findata_ext::routes(),         // gated bespoke routes (merged into the auth'd group)
-        public_routes: findata_ext::public_routes(),  // un-gated routes (docs, self-auth WS upgrades, …)
-        landing:       findata_ext::landing_routes(), // overrides the generic `/`; adds /reference, /llm, /docs
-        openapi_paths: findata_ext::openapi_paths(),  // app routes to document in /openapi.json
-        workers:       findata_ext::workers(),         // realtime UpstreamWorkers
+        ext_routes:    my_ext::routes(),         // gated bespoke routes (merged into the auth'd group)
+        public_routes: my_ext::public_routes(),  // un-gated routes (docs, self-auth WS upgrades, …)
+        landing:       my_ext::landing_routes(), // overrides the generic `/`; adds /reference, /llm, /docs
+        openapi_paths: my_ext::openapi_paths(),  // app routes to document in /openapi.json
+        workers:       my_ext::workers(),         // realtime UpstreamWorkers
         enable_llm:    true,                           // mount the /v1 LLM proxy
     }).await
 }
@@ -49,15 +49,15 @@ A new app therefore = **a config file + a thin `main` + a DB schema**:
    `ext_routes`, un-gated via `public_routes`), a realtime `UpstreamWorker` (via `workers`), a
    custom landing (`landing`), and OpenAPI entries for any of it (`openapi_paths`).
 
-See the `mint` app (in the `findata` repo) for a complete platform-only example.
+See the `mint` reference app for a complete platform-only example.
 
 ## What the platform provides (no app code)
 - **Auth gate** — Lumid PAT + local-key bypass, tiered rate limit (emits
   `x-ratelimit-{limit,remaining,reset}` headers). Platform-owned public surfaces: `/health`,
   `/openapi.json` (generated OpenAPI 3.1), `/status`, `/usage`, `/freshness`, and a **generic
   fallback landing at `/`**. Apps add their own public routes via `ServeParts.public_routes`
-  (findata serves `/usage.md`, `/skill.md`, and the self-authenticating WS upgrades) and replace
-  the landing via `ServeParts.landing` (findata serves `/`, `/reference`, `/llm`, `/docs`,
+  (e.g. `/usage.md`, `/skill.md`, and the self-authenticating WS upgrades) and replace
+  the landing via `ServeParts.landing` (e.g. an app serving `/`, `/reference`, `/llm`, `/docs`,
   `/redoc`). The platform names no domain route — even `/quotes/stream` is the app's choice.
 - **Write/ingest plane** — `POST /ingest/:schema/:table` (+ `/stream`, `/file`, `/blob`):
   table introspection, JSON-Schema validation, newest-wins upsert, full provenance, read-cache
@@ -97,12 +97,12 @@ Storage backends (optional): `LUMID_CLICKHOUSE_*` registers a ClickHouse backend
 Postgres (per-table routing via `provenance.table_backend`); `LUMID_BLOB_BACKEND=s3` +
 `LUMID_BLOB_S3_*` puts blobs in MinIO/S3.
 Provider keys/caps + domain channel kinds for an app's workers live in the **app**
-(e.g. `findata-ext::cfg`), not here.
+(e.g. `my_ext::cfg`), not here.
 
 ## Dev layout
 Two repos, one binary. Clone as siblings:
 ```
 /parent/lumid-data-service   (this repo — crates/platform → crate `lumid-platform`)
-/parent/findata              (the financial app — depends on ../lumid-data-service via path dep)
+/parent/myapp                (your app — depends on ../lumid-data-service via path dep)
 ```
-The platform stays generic and names no domain provider; financial naming lives only in `findata`.
+The platform stays generic and names no domain provider; all domain naming lives in the app, never here.

@@ -8,8 +8,8 @@
 //!
 //! `legacy_storage_alias` — a generic blob-by-path handler that 302-redirects
 //!   to `/blobs/{path}`. The platform names no path for it; an app mounts it at
-//!   whatever legacy/compat URL it needs (findata mounts it at the old
-//!   `/storage/v1/object/findata/{path}` so legacy `storage_url` values resolve).
+//!   whatever legacy/compat URL it needs (e.g. an old `/storage/v1/object/<x>/{path}`
+//!   route) so pre-migration `storage_url` values keep resolving.
 
 use std::path::{Component, Path as FsPath};
 

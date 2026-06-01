@@ -124,7 +124,7 @@ realtime hub, and auto-MCP (one tool per read endpoint) for free.
    ```
 2. Run on the shared network with real env:
    ```bash
-   docker run -d --name myapp --network findata-net -p 0.0.0.0:5030:8088 \
+   docker run -d --name myapp --network appnet -p 0.0.0.0:5030:8088 \
      --env-file secrets.env \
      -e LUMID_DB_HOST=finai-tsdb-pg17 -e LUMID_DB_PORT=5432 -e LUMID_DB_NAME=appdb \
      -e LUMID_REDIS_URL=redis://finai-redis:6379 -e LUMID_SERVICE_NAME=myapp \
@@ -135,7 +135,7 @@ realtime hub, and auto-MCP (one tool per read endpoint) for free.
 4. Iterate: rebuild binary → rebuild tiny image → `docker rm -f myapp && docker run …`.
 
 ## Worked example
-The **mint** app (in the `findata` repo: `crates/mint-app-bin/` + `mint.toml`) is a complete
+The **mint** app (`crates/mint-app-bin/` + `mint.toml`) is a complete
 platform-only app — copy it.
 
 ## Enabling the LLM proxy

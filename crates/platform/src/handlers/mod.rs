@@ -1,5 +1,5 @@
 //! HTTP handlers — platform (generic) only. Financial read handlers moved to
-//! the `findata-ext` crate.
+//! the `my_ext` crate.
 
 pub mod blobs;
 pub mod catalog;

@@ -1,6 +1,6 @@
 //! Realtime upstream seam (platform). The `UpstreamWorker` trait is the IoC
 //! boundary; the concrete provider modules live in the app layer (e.g. the
-//! `findata-ext` crate) and register via `realtime::start`. The platform names
+//! `my_ext` crate) and register via `realtime::start`. The platform names
 //! no provider.
 
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use crate::realtime::hub::Hub;
 /// `realtime::start` drives a `Vec<Box<dyn UpstreamWorker>>` in registration
 /// order; the financial crate supplies the concrete workers. (Trait stays in
 /// the platform; the concrete impls + `financial_workers()` move to
-/// findata-ext on extraction.)
+/// my_ext on extraction.)
 pub trait UpstreamWorker: Send + Sync {
     fn name(&self) -> &'static str;
     fn start(

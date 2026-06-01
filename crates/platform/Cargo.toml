@@ -4,7 +4,7 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
-# Platform library only — the binary lives in crates/findata-app-bin.
+# Platform library only — the binary lives in the app's bin crate.
 
 [dependencies]
 axum = { version = "0.7", features = ["macros", "ws", "multipart"] }
