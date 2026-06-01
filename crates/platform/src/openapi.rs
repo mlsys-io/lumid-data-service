@@ -108,9 +108,8 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
             "version": env!("CARGO_PKG_VERSION"),
             "description": "Read + discovery + realtime + MCP surface. Declarative read \
                 endpoints, catalog/lineage, SSE/WebSocket streams, and POST /mcp. \
-                App-compiled reads (ohlc, quotes, screener, prediction-market candles) and \
-                the optional /v1 LLM proxy are at /reference. Write/ingest/admin routes are \
-                operator-only and intentionally not listed here.",
+                App-compiled reads and the optional /v1 LLM proxy are at /reference. \
+                Write/ingest/admin routes are operator-only and intentionally not listed here.",
         },
         "servers": [{"url": "/"}],
         "components": {"securitySchemes": {"bearer": {"type": "http", "scheme": "bearer"}}},
