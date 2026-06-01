@@ -69,12 +69,19 @@ Reads serve whatever is in the DB. Load it however you like:
 - Write/ingest plane + catalog/lineage + schema proposals.
 - Realtime hub (SSE/WS) — register upstream workers in a bespoke app.
 - `POST /mcp` (one tool per read endpoint) + optional OpenAI/Anthropic LLM proxy.
-- `/`, `/reference`, `/openapi.json`, `/status` (health + measured realtime feeds).
+- A generic **landing at `/`**, plus `/openapi.json`, `/status` (health + measured realtime
+  feeds), `/usage`, `/freshness`. (`/reference`, `/llm`, and any realtime SSE/WS routes are
+  *app*-provided — a bespoke app overrides the landing via `ServeParts.landing` and mounts its
+  own routes; a config-only app gets the generic `/`.)
 
 ## Notes
 - **MinIO vs local FS**: this bundle stores blobs in MinIO (self-contained). To use a
   plain folder instead, set `FINDATA_BLOB_BACKEND=localfs` and bind-mount a blobs dir.
 - **Auth**: standalone uses local keys (`FINDATA_API_KEYS`, `FINDATA_LUMID_ENABLED=false`).
   Point at a real introspection service by flipping those.
+- **Optional platform features** (set in the compose `environment:` block): a ClickHouse
+  backend alongside Postgres (`FINDATA_CLICKHOUSE_*`, per-table routing via
+  `provenance.table_backend`); realtime channel kinds for a bespoke app's workers
+  (`FINDATA_RT_CHANNEL_KINDS`, default `tick,news`). See the platform README's Config section.
 - **First boot only**: `schema.sql` runs only when `./data/pgdata` is empty. To re-init,
   stop and delete `./data/pgdata`. Schema changes after that are manual DDL (`psql`).
