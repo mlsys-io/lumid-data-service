@@ -39,6 +39,9 @@ pub struct ServeParts {
     /// SSE/WS routes it mounts). Shape: `{ "/path": { "get": {<operation>} } }`.
     /// Default empty.
     pub openapi_paths: serde_json::Value,
+    /// App `/status` feed-liveness policy (warm-symbol grouping + expected-live).
+    /// `None` ⇒ the platform default (`realtime` group, always expected live).
+    pub feed_liveness: Option<Arc<dyn realtime::FeedLiveness>>,
     pub workers: Vec<Box<dyn UpstreamWorker>>,
     /// Enable the platform's LLM reverse-proxy feature (`/v1/*`). Optional per
     /// app — off by default; an app flips this to serve LLM (proxies to
@@ -54,6 +57,7 @@ impl Default for ServeParts {
             public_routes: Router::new(),
             landing: crate::handlers::landing::default_routes(),
             openapi_paths: serde_json::json!({}),
+            feed_liveness: None,
             workers: Vec::new(),
             enable_llm: false,
         }
@@ -67,6 +71,13 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+
+    // rustls 0.23 needs a process-global crypto provider. Both `ring` and
+    // `aws-lc-rs` are in the dependency graph (the latter via the ClickHouse
+    // client), so rustls can't auto-determine one and the FIRST TLS connection
+    // (a WS upstream / reqwest / ClickHouse) panics its task. Install ring once,
+    // up front, so every TLS user shares it. Idempotent; ignore "already set".
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let settings = Arc::new(config::Settings::from_env());
     let bind_addr = settings.bind_addr.clone();
@@ -169,8 +180,13 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         Arc::new(crate::backend::Registry::new_with_clickhouse(pool.clone(), ch))
     };
 
+    let feed_liveness = parts
+        .feed_liveness
+        .unwrap_or_else(|| Arc::new(realtime::DefaultFeedLiveness));
+
     let state = state::AppState {
         pool, settings, lumid, local_keys, rate, redis, redis_client, hub, http, read_cache, blob_store, backends,
+        feed_liveness,
     };
 
     // Auto-MCP: one tool per declarative read endpoint, merged into ext routes.

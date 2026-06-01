@@ -33,4 +33,7 @@ pub struct AppState {
     /// Postgres-only (default-to-PG when no `provenance.table_backend` row), so
     /// every existing table resolves to PG with no behavior change.
     pub backends: Arc<crate::backend::Registry>,
+    /// App-provided `/status` feed-liveness policy (grouping + expected-live).
+    /// Defaults to `realtime`-group, always-expected-live.
+    pub feed_liveness: Arc<dyn crate::realtime::FeedLiveness>,
 }
