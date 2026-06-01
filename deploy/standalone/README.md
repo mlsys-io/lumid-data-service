@@ -32,7 +32,7 @@ printf 'FROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y --no
 docker build -t lumid-app:latest /tmp/img
 ```
 
-**App with bespoke Rust** (custom handlers / realtime upstreams, like findata): build
+**App with bespoke Rust** (custom handlers / realtime upstreams): build
 your own image and set `APP_IMAGE=your-image:tag` in `.env`.
 
 ## 2. Configure + bring it up

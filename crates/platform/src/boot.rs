@@ -6,8 +6,8 @@
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
 //!     lumid_platform::serve(lumid_platform::ServeParts {
-//!         ext_routes: findata_ext::routes(),   // or axum::Router::new()
-//!         workers: findata_ext::workers(),     // or vec![]
+//!         ext_routes: my_ext::routes(),   // or axum::Router::new()
+//!         workers: my_ext::workers(),     // or vec![]
 //!     }).await
 //! }
 //! ```

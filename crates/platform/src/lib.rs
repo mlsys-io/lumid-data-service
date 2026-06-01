@@ -1,10 +1,10 @@
 //! lumid-data-service — the portable data platform library.
 //!
 //! Exposes the generic read/write/realtime data service as a library so a thin
-//! binary (and, after the repo split, a separate `findata-ext` crate) can build
+//! binary (and, after the repo split, a separate `my_ext` crate) can build
 //! on it. The crate is domain-agnostic: the financial specifics live in
 //! `financial.toml` (declarative reads) + the bespoke handlers/upstreams that
-//! register into it (the `findata-ext` boundary, established incrementally).
+//! register into it (the `my_ext` boundary, established incrementally).
 
 pub mod app;
 pub mod auth;

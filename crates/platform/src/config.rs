@@ -5,7 +5,7 @@
 //! `FINDATA_` prefix (carried over verbatim from the pre-split Python service)
 //! is still accepted as a fallback so existing deploy env keeps working — set
 //! `LUMID_*` and the `FINDATA_*` fallback can be dropped. App-specific config
-//! (provider keys, etc.) is named by the app, not here (e.g. `findata-ext::cfg`).
+//! (provider keys, etc.) is named by the app, not here (e.g. `my_ext::cfg`).
 
 use std::env;
 
@@ -92,7 +92,7 @@ pub struct Settings {
     pub rt_sse_request_syms: usize,
     pub rt_slowclient_queue: usize,
     /// Generic Tier-B/poll cadence (provider-specific slot caps + keys + the
-    /// per-provider poll cadences live in the app layer — see findata-ext::cfg —
+    /// per-provider poll cadences live in the app layer — see my_ext::cfg —
     /// so the platform names no provider).
     pub rt_tier_b_poll_sec: u64,
     pub rt_news_poll_sec: u64,

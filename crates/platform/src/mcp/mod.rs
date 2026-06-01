@@ -2,7 +2,7 @@
 //!
 //! Provides the transport (Streamable-HTTP JSON-RPC 2.0 at `POST /mcp`) and a
 //! domain-agnostic tool registry. The *tools* are supplied by the application
-//! (e.g. findata-ext auto-generates them from the declarative read specs), so
+//! (e.g. my_ext auto-generates them from the declarative read specs), so
 //! the platform carries no domain knowledge — mirroring the read-layer split.
 //!
 //! Mounted inside the gated router, so MCP inherits the same PAT / local-key
