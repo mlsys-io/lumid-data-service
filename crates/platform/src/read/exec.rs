@@ -97,7 +97,11 @@ async fn produce(
     let (schema, table) = read_target(spec);
     let backend = st.backends.get(&schema, &table).await?;
     let mut objs = backend
-        .query_rows(&crate::backend::BoundQuery { sql: &bound.sql, params: bound.refs() })
+        .query_rows(&crate::backend::BoundQuery {
+            sql: &bound.sql,
+            params: bound.refs(),
+            binds: &bound.values,
+        })
         .await?;
     if spec.strip_lineage {
         objs = strip_lineage_rows(objs);

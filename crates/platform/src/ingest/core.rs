@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::backend::{Registry, WriteRequest};
 use crate::error::ApiError;
 use crate::validation::{self, Rejected};
-use crate::write::{introspect, run};
+use crate::write::run;
 
 use super::lumilake::{self, LumilakeInfo};
 
@@ -133,11 +133,24 @@ pub async fn ingest_records(
         .await
         .map_err(|e| IngestErr::Failed(e.into()))?;
 
-    // Introspect target (also confirms existence). Done before opening a run.
-    let meta = introspect::table_meta(&client, p.target_schema, p.target_table)
+    // Resolve the backend that OWNS this table (Phase B/C: Postgres or
+    // ClickHouse, per the `provenance.table_backend` registry; an unknown table
+    // defaults to Postgres, preserving the net-new-table → proposal flow).
+    // Introspect existence + columns through THAT backend — a ClickHouse-backed
+    // table isn't visible in Postgres's information_schema, so the prior
+    // PG-only introspect re-proposed every write to a CH table instead of
+    // upserting it.
+    let backend = reg
+        .get(p.target_schema, p.target_table)
         .await
-        .map_err(|e| IngestErr::Failed(e.into()))?;
-    let meta = match meta {
+        .map_err(IngestErr::Failed)?;
+
+    // Introspect target (also confirms existence). Done before opening a run.
+    let meta = match backend
+        .table_meta(p.target_schema, p.target_table)
+        .await
+        .map_err(IngestErr::Failed)?
+    {
         Some(m) => m,
         None => {
             return Err(IngestErr::UnknownTable(format!(
@@ -203,28 +216,26 @@ pub async fn ingest_records(
         }
     };
 
-    // Dispatch the upsert through the resolved backend (Phase A: Postgres).
-    // Surface the inner anyhow message for `ApiError::Internal` (the write
-    // engine's bail strings) so the failed-run error_text stays identical.
+    // Dispatch the upsert through the backend resolved above (Postgres or
+    // ClickHouse). Surface the inner anyhow message for `ApiError::Internal`
+    // (the write engine's bail strings) so the failed-run error_text stays
+    // identical.
     let to_anyhow = |e: ApiError| match e {
         ApiError::Internal(inner) => inner,
         other => anyhow::anyhow!("{other}"),
     };
-    let result = match reg.get(p.target_schema, p.target_table).await {
-        Ok(backend) => backend
-            .write_records(&WriteRequest {
-                schema: p.target_schema,
-                table: p.target_table,
-                meta: &meta,
-                records: &parsed,
-                source: p.source,
-                source_endpoint: p.source_endpoint,
-                source_run_id: &run_id,
-            })
-            .await
-            .map_err(to_anyhow),
-        Err(e) => Err(to_anyhow(e)),
-    };
+    let result = backend
+        .write_records(&WriteRequest {
+            schema: p.target_schema,
+            table: p.target_table,
+            meta: &meta,
+            records: &parsed,
+            source: p.source,
+            source_endpoint: p.source_endpoint,
+            source_run_id: &run_id,
+        })
+        .await
+        .map_err(to_anyhow);
 
     match result {
         Ok((inserted, updated)) => {

@@ -88,11 +88,16 @@ pub struct WriteRequest<'a> {
     pub source_run_id: &'a uuid::Uuid,
 }
 
-/// One read query: already-bound SQL + its positional parameters. The PG backend
-/// runs it on `st.pool`; a CH backend would translate the dialect (Phase C).
+/// One read query: already-bound SQL + its positional parameters. The SQL
+/// carries PG-dialect `$N` placeholders (with `::int8`/`::float8` casts on
+/// numeric binds). The Postgres backend runs it on `st.pool` via `params`; the
+/// ClickHouse backend translates `$N`(+cast) → `?` and binds from `binds` (the
+/// backend-neutral values — it can't recover a value from a `dyn ToSql`).
+/// `params` and `binds` are the same values in the same order.
 pub struct BoundQuery<'a> {
     pub sql: &'a str,
     pub params: Vec<&'a (dyn tokio_postgres::types::ToSql + Sync)>,
+    pub binds: &'a [crate::read::bind::BindValue],
 }
 
 /// A storage backend. Writers/readers depend only on this trait; the registry

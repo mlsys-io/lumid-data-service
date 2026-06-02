@@ -15,8 +15,15 @@ use super::spec::{EndpointSpec, Kind, ParamSpec, Transform};
 use crate::error::ApiError;
 
 /// A coerced, cloneable bind value (cloned per `:name` occurrence).
+///
+/// This is the backend-neutral param ABI between bind-resolution and the
+/// backends: the Postgres backend boxes each value into `dyn ToSql` (see
+/// `boxed`), while the ClickHouse backend reads the concrete variant directly
+/// (it can't recover a value from a `dyn ToSql`). `Bound` carries both the
+/// boxed PG form (`params`) and these neutral values (`values`) in the same
+/// order as the lowered `$N` placeholders.
 #[derive(Clone)]
-enum Bv {
+pub enum BindValue {
     Text(String),
     Int(i64),
     Float(f64),
@@ -25,25 +32,25 @@ enum Bv {
     Bool(bool),
 }
 
-impl Bv {
+impl BindValue {
     fn boxed(&self) -> Box<dyn ToSql + Sync + Send> {
         match self {
-            Bv::Text(s) => Box::new(s.clone()),
-            Bv::Int(i) => Box::new(*i),
-            Bv::Float(f) => Box::new(*f),
-            Bv::Date(d) => Box::new(*d),
-            Bv::Ts(t) => Box::new(*t),
-            Bv::Bool(b) => Box::new(*b),
+            BindValue::Text(s) => Box::new(s.clone()),
+            BindValue::Int(i) => Box::new(*i),
+            BindValue::Float(f) => Box::new(*f),
+            BindValue::Date(d) => Box::new(*d),
+            BindValue::Ts(t) => Box::new(*t),
+            BindValue::Bool(b) => Box::new(*b),
         }
     }
     fn canon(&self) -> String {
         match self {
-            Bv::Text(s) => s.clone(),
-            Bv::Int(i) => i.to_string(),
-            Bv::Float(f) => f.to_string(),
-            Bv::Date(d) => d.to_string(),
-            Bv::Ts(t) => t.to_rfc3339(),
-            Bv::Bool(b) => b.to_string(),
+            BindValue::Text(s) => s.clone(),
+            BindValue::Int(i) => i.to_string(),
+            BindValue::Float(f) => f.to_string(),
+            BindValue::Date(d) => d.to_string(),
+            BindValue::Ts(t) => t.to_rfc3339(),
+            BindValue::Bool(b) => b.to_string(),
         }
     }
 }
@@ -51,6 +58,10 @@ impl Bv {
 pub struct Bound {
     pub sql: String,
     pub params: Vec<Box<dyn ToSql + Sync + Send>>,
+    /// Backend-neutral bind values, in the same order as the lowered `$N`
+    /// placeholders (and as `params`). The ClickHouse backend binds from these;
+    /// Postgres uses `params`/`refs()`.
+    pub values: Vec<BindValue>,
     /// Canonical "name=value&…" of resolved params (sorted) for the cache key.
     pub canon: String,
 }
@@ -79,7 +90,7 @@ fn default_str(p: &ParamSpec) -> Option<String> {
     })
 }
 
-fn coerce(p: &ParamSpec, raw: &str) -> Result<Bv, ApiError> {
+fn coerce(p: &ParamSpec, raw: &str) -> Result<BindValue, ApiError> {
     let bad = |m: String| ApiError::BadRequest(m);
     match p.ty.as_str() {
         // `key` is the canonical identifier coercion (uppercase + a conservative
@@ -90,7 +101,7 @@ fn coerce(p: &ParamSpec, raw: &str) -> Result<Bv, ApiError> {
             if s.is_empty() || s.len() > 20 || !s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')) {
                 return Err(bad(format!("invalid {} '{raw}'", p.ty)));
             }
-            Ok(Bv::Text(s))
+            Ok(BindValue::Text(s))
         }
         "str" => {
             let s = apply_transform(raw.to_string(), p.transform);
@@ -99,24 +110,24 @@ fn coerce(p: &ParamSpec, raw: &str) -> Result<Bv, ApiError> {
                     return Err(bad(format!("'{}' too long (max {ml})", p.name)));
                 }
             }
-            Ok(Bv::Text(s))
+            Ok(BindValue::Text(s))
         }
         "int" => {
             let mut n: i64 = raw.trim().parse().map_err(|_| bad(format!("'{}' must be an integer", p.name)))?;
             if let Some(mn) = p.min { n = n.max(mn as i64); }
             if let Some(mx) = p.max { n = n.min(mx as i64); }
-            Ok(Bv::Int(n))
+            Ok(BindValue::Int(n))
         }
         "float" => {
             let mut f: f64 = raw.trim().parse().map_err(|_| bad(format!("'{}' must be a number", p.name)))?;
             if let Some(mn) = p.min { if f < mn { f = mn; } }
             if let Some(mx) = p.max { if f > mx { f = mx; } }
-            Ok(Bv::Float(f))
+            Ok(BindValue::Float(f))
         }
         "date" => {
             let d = NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d")
                 .map_err(|_| bad(format!("'{}' must be YYYY-MM-DD", p.name)))?;
-            Ok(Bv::Date(d))
+            Ok(BindValue::Date(d))
         }
         "timestamp" => {
             // Accept a full RFC3339 timestamp, or a bare `YYYY-MM-DD` date
@@ -134,14 +145,14 @@ fn coerce(p: &ParamSpec, raw: &str) -> Result<Bv, ApiError> {
                     })
                 })
                 .map_err(|_| bad(format!("'{}' must be RFC3339 or YYYY-MM-DD", p.name)))?;
-            Ok(Bv::Ts(t))
+            Ok(BindValue::Ts(t))
         }
         "bool" => {
             let b = matches!(raw.trim().to_lowercase().as_str(), "1" | "true" | "yes");
-            Ok(Bv::Bool(b))
+            Ok(BindValue::Bool(b))
         }
         // enum: the "value" is the variant string (used for fragment selection).
-        "enum" => Ok(Bv::Text(apply_transform(raw.to_string(), p.transform))),
+        "enum" => Ok(BindValue::Text(apply_transform(raw.to_string(), p.transform))),
         other => Err(bad(format!("unknown param type '{other}'"))),
     }
 }
@@ -153,7 +164,7 @@ pub fn resolve(
     query: &HashMap<String, String>,
 ) -> Result<Bound, ApiError> {
     // 1) Resolve each param's value (or mark absent).
-    let mut values: HashMap<String, Bv> = HashMap::new();
+    let mut values: HashMap<String, BindValue> = HashMap::new();
     let mut enum_choice: HashMap<String, String> = HashMap::new();
     let mut present: HashMap<String, bool> = HashMap::new();
     let mut canon_parts: Vec<(String, String)> = Vec::new();
@@ -194,7 +205,7 @@ pub fn resolve(
                         .and_then(|m| m.get(&p.name))
                         .cloned()
                         .unwrap_or_else(|| choice.clone());
-                    values.insert(p.name.clone(), Bv::Text(bound));
+                    values.insert(p.name.clone(), BindValue::Text(bound));
                 } else {
                     let v = coerce(p, &r)?;
                     canon_parts.push((p.name.clone(), v.canon()));
@@ -228,13 +239,13 @@ pub fn resolve(
     let substituted = substitute_fragments(&spec.sql, &fragments);
 
     // 4) Lower :name binds → $N (skip ::type casts), collecting values in order.
-    let (sql, params) = lower_binds(&substituted, &values)?;
+    let (sql, params, ordered_values) = lower_binds(&substituted, &values)?;
 
     // 5) Canonical cache key.
     canon_parts.sort();
     let canon = canon_parts.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
 
-    Ok(Bound { sql, params, canon })
+    Ok(Bound { sql, params, values: ordered_values, canon })
 }
 
 fn substitute_fragments(sql: &str, fragments: &HashMap<String, String>) -> String {
@@ -267,11 +278,12 @@ fn is_ident(b: u8) -> bool {
 /// preceded or followed by another `:` (a `::type` cast) is left untouched.
 fn lower_binds(
     sql: &str,
-    values: &HashMap<String, Bv>,
-) -> Result<(String, Vec<Box<dyn ToSql + Sync + Send>>), ApiError> {
+    values: &HashMap<String, BindValue>,
+) -> Result<(String, Vec<Box<dyn ToSql + Sync + Send>>, Vec<BindValue>), ApiError> {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len() + 16);
     let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
+    let mut ordered: Vec<BindValue> = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b':' {
@@ -288,14 +300,15 @@ fn lower_binds(
                     ApiError::Internal(anyhow::anyhow!("bind ':{name}' has no resolved value"))
                 })?;
                 params.push(v.boxed());
+                ordered.push(v.clone());
                 out.push('$');
                 out.push_str(&params.len().to_string());
                 // Cast numeric binds so a single Rust width matches any column
                 // width (i64 vs int4 / numeric): `$N::int8` / `$N::float8`.
                 // Postgres implicitly promotes in comparisons (int4 = int8 etc).
                 match v {
-                    Bv::Int(_) => out.push_str("::int8"),
-                    Bv::Float(_) => out.push_str("::float8"),
+                    BindValue::Int(_) => out.push_str("::int8"),
+                    BindValue::Float(_) => out.push_str("::float8"),
                     _ => {}
                 }
                 i = j;
@@ -305,5 +318,5 @@ fn lower_binds(
         out.push(bytes[i] as char);
         i += 1;
     }
-    Ok((out, params))
+    Ok((out, params, ordered))
 }

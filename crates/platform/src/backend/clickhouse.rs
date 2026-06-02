@@ -44,8 +44,40 @@ use serde_json::{Map, Value};
 
 use super::{Backend, BackendKind, BoundQuery, CreateTablePlan, WriteRequest};
 use crate::error::{ApiError, ApiResult};
+use crate::read::bind::BindValue;
 use crate::validation::SERVER_STAMPED_COLS;
 use crate::write::introspect::{ColumnInfo, TableMeta};
+
+/// Translate the PG-dialect placeholders the bind layer emits into ClickHouse's
+/// `?` positional form: each `$N` (optionally followed by an `::int8`/`::float8`
+/// cast) becomes a single `?`. The bind layer numbers placeholders `$1,$2,…` in
+/// left-to-right order, so the `?`s come out in the same order as `q.binds`.
+fn pg_placeholders_to_ch(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            // Strip the inline numeric-widening cast the PG path adds.
+            for cast in ["::int8", "::float8"] {
+                if sql[j..].starts_with(cast) {
+                    j += cast.len();
+                    break;
+                }
+            }
+            out.push('?');
+            i = j;
+            continue;
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
 
 /// Validate + normalise a SQL identifier to `^[a-z_][a-z0-9_]{0,62}$`. Same
 /// rule the PG backend uses (`postgres::norm_ident`) so a table can be created
@@ -307,23 +339,27 @@ impl Backend for ClickHouseBackend {
     }
 
     async fn query_rows(&self, q: &BoundQuery<'_>) -> ApiResult<Vec<Map<String, Value>>> {
-        // Phase B scopes CH to write-side + backend approval. CH *reads* (the
-        // PG-`$N`-vs-CH-`?` dialect branch + CH SQL specs) are deferred to Phase
-        // C. The mechanics below DO work for a CH-native SQL string with no
-        // positional binds, but the platform's the read-config TOML specs are
-        // authored in PG dialect, so resolving a read endpoint onto a CH table
-        // today would send PG SQL to CH. We fail loud rather than silently
-        // mis-execute.
-        if !q.params.is_empty() {
-            return Err(ApiError::Unavailable(
-                "ClickHouse read endpoints (positional-bind dialect) are not yet supported \
-                 (Phase C); author CH-native read specs or keep reads on Postgres"
-                    .into(),
-            ));
+        // Phase C: translate the PG-dialect placeholders the bind layer emits
+        // (`$N`, with `::int8`/`::float8` casts on numeric binds) into CH's `?`
+        // positional form, then bind `q.binds` (the backend-neutral values) in
+        // order. Only the PLACEHOLDER dialect is translated — a read spec whose
+        // SQL also uses PG-only functions/casts must be authored CH-native; the
+        // platform doesn't transpile arbitrary SQL.
+        let ch_sql = pg_placeholders_to_ch(q.sql);
+        let mut query = self.client.query(&ch_sql);
+        for b in q.binds {
+            query = match b {
+                BindValue::Text(s) => query.bind(s.clone()),
+                BindValue::Int(i) => query.bind(*i),
+                BindValue::Float(f) => query.bind(*f),
+                BindValue::Bool(b) => query.bind(*b),
+                // CH bind has no native date/timestamp here (default-features
+                // off); send the canonical string and let CH parse/compare.
+                BindValue::Date(d) => query.bind(d.to_string()),
+                BindValue::Ts(t) => query.bind(t.to_rfc3339()),
+            };
         }
-        let mut cursor = self
-            .client
-            .query(q.sql)
+        let mut cursor = query
             .fetch_bytes("JSONEachRow")
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("clickhouse query: {e}")))?;
         let bytes = cursor
@@ -489,6 +525,7 @@ mod tests {
             .query_rows(&BoundQuery {
                 sql: "SELECT venue, px FROM md.phaseb_smoke LIMIT 1",
                 params: vec![],
+                binds: &[],
             })
             .await
             .expect("query_rows");
