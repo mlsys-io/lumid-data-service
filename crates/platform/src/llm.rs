@@ -2,8 +2,9 @@
 //! into its router (e.g. `my_ext::routes().merge(lumid_platform::llm::routes())`).
 //! Apps that don't serve an LLM (e.g. mint) simply omit it — no `/v1/*` surface.
 //!
-//! OpenAI- + Anthropic-compatible; proxies to `LUMID_LLM_BACKEND_URL`
-//! (handlers return 503 when that's unset). Gated like every data route once
+//! OpenAI- + Anthropic-compatible; model-routed across the primary
+//! `LUMID_LLM_BACKEND_URL` + any `LUMID_LLM_BACKENDS` (`model=url;…`) backends
+//! (handlers return 503 when none is set). Gated like every data route once
 //! merged into the app's gated group.
 
 use axum::routing::{get, post};

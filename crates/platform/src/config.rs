@@ -104,8 +104,15 @@ pub struct Settings {
     pub rt_warm_symbols: Vec<String>,
 
     // LLM reverse proxy. Empty `llm_backend_url` disables the /v1/* routes (503).
+    // `llm_backend_url` is the PRIMARY/default backend; `llm_default_model` is the
+    // model injected when a request omits one (→ primary).
     pub llm_backend_url: String,
     pub llm_default_model: String,
+    /// Additional model→backend routes for the multi-backend `/v1/*` proxy, as
+    /// `(model, base_url)` pairs from `LUMID_LLM_BACKENDS` (`model=url;model=url`).
+    /// A request whose `model` matches one of these is proxied to that backend;
+    /// everything else goes to the primary. `/v1/models` aggregates all backends.
+    pub llm_backends: Vec<(String, String)>,
 }
 
 impl Settings {
@@ -170,6 +177,12 @@ impl Settings {
                 .collect(),
             llm_backend_url: env_str("LLM_BACKEND_URL", ""),
             llm_default_model: env_str("LLM_DEFAULT_MODEL", ""),
+            llm_backends: env_str("LLM_BACKENDS", "")
+                .split(';')
+                .filter_map(|e| e.trim().split_once('='))
+                .map(|(m, u)| (m.trim().to_string(), u.trim().trim_end_matches('/').to_string()))
+                .filter(|(m, u)| !m.is_empty() && !u.is_empty())
+                .collect(),
         }
     }
 }
