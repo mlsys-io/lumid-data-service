@@ -1,8 +1,11 @@
 //! LLM reverse proxy — OpenAI + Anthropic compatible. Port of `api/routes/llm.py`.
 //!
-//! A thin stateless reverse proxy in front of an upstream vLLM-compatible
-//! inference server (`settings.llm_backend_url`). Same auth model as every other
-//! route — the `gate` middleware runs at router level.
+//! A thin stateless reverse proxy in front of one or more upstream
+//! OpenAI/Anthropic-compatible inference servers. The request's `model` selects
+//! the backend: a model listed in `settings.llm_backends` (`LUMID_LLM_BACKENDS`)
+//! routes to that server; everything else (incl. no model → the default) routes
+//! to the primary `settings.llm_backend_url`. `/v1/models` aggregates all
+//! backends. Same auth model as every other route — the `gate` runs at router level.
 //!
 //! | path                            | shape       | streaming |
 //! |---------------------------------|-------------|-----------|
@@ -27,15 +30,31 @@ use serde_json::{json, Value};
 use crate::error::ApiError;
 use crate::state::AppState;
 
-/// 503 when the backend isn't configured.
-fn require_backend(st: &AppState) -> Result<String, ApiError> {
-    let url = st.settings.llm_backend_url.trim_end_matches('/');
-    if url.is_empty() {
+/// The model named in a (post-default) request body, if non-empty.
+fn model_of(body: &Value) -> Option<String> {
+    body.get("model")
+        .and_then(|m| m.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Resolve the upstream base URL for a request's `model`. A model listed in
+/// `llm_backends` routes to that backend; anything else (incl. no model) routes
+/// to the primary `llm_backend_url`. 503 when nothing is configured.
+fn backend_for_model(st: &AppState, model: Option<&str>) -> Result<String, ApiError> {
+    if let Some(m) = model {
+        if let Some((_, url)) = st.settings.llm_backends.iter().find(|(bm, _)| bm == m) {
+            return Ok(url.trim_end_matches('/').to_string());
+        }
+    }
+    let primary = st.settings.llm_backend_url.trim_end_matches('/');
+    if primary.is_empty() {
         return Err(ApiError::Unavailable(
             "LLM backend not configured (LUMID_LLM_BACKEND_URL is empty)".into(),
         ));
     }
-    Ok(url.to_string())
+    Ok(primary.to_string())
 }
 
 /// Inject the server-configured default `model` when the caller omits it (or
@@ -66,14 +85,11 @@ fn apply_default_model(st: &AppState, mut body: Value) -> Value {
 /// status + JSON body (or wraps a non-JSON body).
 async fn proxy_json(
     st: &AppState,
+    base: &str,
     method: reqwest::Method,
     path: &str,
     body: Option<Value>,
 ) -> Response {
-    let base = match require_backend(st) {
-        Ok(b) => b,
-        Err(e) => return e.into_response(),
-    };
     let url = format!("{base}{path}");
     let mut req = st.http.request(method.clone(), &url);
     if let Some(b) = body {
@@ -126,11 +142,7 @@ async fn proxy_json(
 
 /// Streaming proxy. Upstream is expected to return SSE (`text/event-stream`) or
 /// chunked JSONLs; bytes pass through unchanged with no buffering.
-async fn proxy_stream(st: &AppState, path: &str, body: Value) -> Response {
-    let base = match require_backend(st) {
-        Ok(b) => b,
-        Err(e) => return e.into_response(),
-    };
+async fn proxy_stream(st: &AppState, base: &str, path: &str, body: Value) -> Response {
     let url = format!("{base}{path}");
     let resp = match st.http.post(&url).json(&body).send().await {
         Ok(r) => r,
@@ -183,9 +195,56 @@ fn require_object(body: Value) -> Result<Value, ApiError> {
 
 // ----------------------------------------------------------------- OpenAI
 
-/// GET /v1/models
+/// GET /v1/models — aggregate the `data` list across every configured backend
+/// (primary + `llm_backends`), deduped by model id. Best-effort: a backend that
+/// errors is skipped. 503 only when nothing is configured.
 pub async fn list_models(State(st): State<AppState>) -> Response {
-    proxy_json(&st, reqwest::Method::GET, "/v1/models", None).await
+    // Distinct backend base URLs, primary first.
+    let mut bases: Vec<String> = Vec::new();
+    let primary = st.settings.llm_backend_url.trim_end_matches('/').to_string();
+    if !primary.is_empty() {
+        bases.push(primary);
+    }
+    for (_, url) in &st.settings.llm_backends {
+        let u = url.trim_end_matches('/').to_string();
+        if !bases.contains(&u) {
+            bases.push(u);
+        }
+    }
+    if bases.is_empty() {
+        return ApiError::Unavailable(
+            "LLM backend not configured (LUMID_LLM_BACKEND_URL is empty)".into(),
+        )
+        .into_response();
+    }
+    // Single backend → relay verbatim (preserves the upstream's exact shape).
+    if bases.len() == 1 {
+        return proxy_json(&st, &bases[0], reqwest::Method::GET, "/v1/models", None).await;
+    }
+    let mut data: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for base in &bases {
+        let resp = match st.http.get(format!("{base}/v1/models")).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("list_models: backend {base} unreachable: {e}");
+                continue;
+            }
+        };
+        let v: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+            for m in arr {
+                let id = m.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                if seen.insert(id) {
+                    data.push(m.clone());
+                }
+            }
+        }
+    }
+    Json(json!({ "object": "list", "data": data })).into_response()
 }
 
 /// POST /v1/chat/completions
@@ -195,10 +254,14 @@ pub async fn chat_completions(State(st): State<AppState>, body: Json<Value>) -> 
         Err(e) => return e.into_response(),
     };
     let body = apply_default_model(&st, body);
+    let base = match backend_for_model(&st, model_of(&body).as_deref()) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
     if wants_stream(&body) {
-        proxy_stream(&st, "/v1/chat/completions", body).await
+        proxy_stream(&st, &base, "/v1/chat/completions", body).await
     } else {
-        proxy_json(&st, reqwest::Method::POST, "/v1/chat/completions", Some(body)).await
+        proxy_json(&st, &base, reqwest::Method::POST, "/v1/chat/completions", Some(body)).await
     }
 }
 
@@ -209,10 +272,14 @@ pub async fn completions(State(st): State<AppState>, body: Json<Value>) -> Respo
         Err(e) => return e.into_response(),
     };
     let body = apply_default_model(&st, body);
+    let base = match backend_for_model(&st, model_of(&body).as_deref()) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
     if wants_stream(&body) {
-        proxy_stream(&st, "/v1/completions", body).await
+        proxy_stream(&st, &base, "/v1/completions", body).await
     } else {
-        proxy_json(&st, reqwest::Method::POST, "/v1/completions", Some(body)).await
+        proxy_json(&st, &base, reqwest::Method::POST, "/v1/completions", Some(body)).await
     }
 }
 
@@ -223,7 +290,11 @@ pub async fn embeddings(State(st): State<AppState>, body: Json<Value>) -> Respon
         Err(e) => return e.into_response(),
     };
     let body = apply_default_model(&st, body);
-    proxy_json(&st, reqwest::Method::POST, "/v1/embeddings", Some(body)).await
+    let base = match backend_for_model(&st, model_of(&body).as_deref()) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    proxy_json(&st, &base, reqwest::Method::POST, "/v1/embeddings", Some(body)).await
 }
 
 // -------------------------------------------------------------- Anthropic
@@ -235,10 +306,14 @@ pub async fn messages(State(st): State<AppState>, body: Json<Value>) -> Response
         Err(e) => return e.into_response(),
     };
     let body = apply_default_model(&st, body);
+    let base = match backend_for_model(&st, model_of(&body).as_deref()) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
     if wants_stream(&body) {
-        proxy_stream(&st, "/v1/messages", body).await
+        proxy_stream(&st, &base, "/v1/messages", body).await
     } else {
-        proxy_json(&st, reqwest::Method::POST, "/v1/messages", Some(body)).await
+        proxy_json(&st, &base, reqwest::Method::POST, "/v1/messages", Some(body)).await
     }
 }
 
@@ -249,5 +324,9 @@ pub async fn count_tokens(State(st): State<AppState>, body: Json<Value>) -> Resp
         Err(e) => return e.into_response(),
     };
     let body = apply_default_model(&st, body);
-    proxy_json(&st, reqwest::Method::POST, "/v1/messages/count_tokens", Some(body)).await
+    let base = match backend_for_model(&st, model_of(&body).as_deref()) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    proxy_json(&st, &base, reqwest::Method::POST, "/v1/messages/count_tokens", Some(body)).await
 }
