@@ -84,13 +84,18 @@ See the `mint` reference app for a complete platform-only example.
 - **MCP** — `POST /mcp` (JSON-RPC 2.0); `mcp::registry_from_specs` auto-generates one tool per
   declarative read endpoint. `serverInfo.name` ← `LUMID_SERVICE_NAME` (default `lumid`).
 - **LLM proxy (optional)** — enable via `ServeParts.enable_llm`; mounts the OpenAI/Anthropic-
-  compatible `/v1/*` surface proxying to `LUMID_LLM_BACKEND_URL`.
+  compatible `/v1/*` surface, **model-routed** across the primary `LUMID_LLM_BACKEND_URL` plus
+  any extra backends in `LUMID_LLM_BACKENDS` (`model=url;model=url`). A request's `model` selects
+  its backend (unknown / omitted → primary, with `LUMID_LLM_DEFAULT_MODEL` filled in);
+  `GET /v1/models` aggregates the model list across all backends.
 
 ## Config (env, all `LUMID_*`)
 DB: `LUMID_DB_{HOST,PORT,USER,PASSWORD,NAME}`, `LUMID_POOL_MAX`, `LUMID_STATEMENT_TIMEOUT_MS`.
 Service: `LUMID_BIND_ADDR`, `LUMID_READ_CONFIG`, `LUMID_SERVICE_NAME`,
 `LUMID_API_KEYS`, `LUMID_RATE_LIMIT_{ANON,AUTHED}`, `LUMID_REDIS_URL`,
-`LUMID_AUTH_{ENABLED,URL}`, `LUMID_BLOB_ROOT`, `LUMID_LLM_BACKEND_URL`.
+`LUMID_AUTH_{ENABLED,URL}`, `LUMID_BLOB_ROOT`.
+LLM proxy: `LUMID_LLM_BACKEND_URL` (primary) + `LUMID_LLM_DEFAULT_MODEL` + `LUMID_LLM_BACKENDS`
+(`model=url;model=url` — extra model-routed backends).
 Realtime: `LUMID_RT_CHANNEL_KINDS` (hub channel kinds, default `tick,news`),
 `LUMID_RT_WARM_SYMBOLS`, `LUMID_RT_{HEARTBEAT_SEC,SSE_REQUEST_SYMS,SLOWCLIENT_QUEUE,…}`.
 Storage backends (optional): `LUMID_CLICKHOUSE_*` registers a ClickHouse backend alongside
