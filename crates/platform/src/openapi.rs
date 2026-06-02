@@ -92,6 +92,13 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
     add("/mcp", "post", "MCP JSON-RPC", vec![], "Model Context Protocol (JSON-RPC 2.0, Streamable-HTTP). One tool per read endpoint; tools/list + tools/call.");
     add("/usage/me", "get", "Your usage", vec![], "Calling identity's totals: total_calls, bytes_out, calls_last_24h, hourly_last_24h.");
 
+    // --- Platform public surfaces (no auth) ---
+    add("/health", "get", "Liveness", vec![], "Liveness probe.");
+    add("/status", "get", "Status board", vec![], "HTML health board: DB/Redis/pool + realtime feed health + endpoint-freshness SLA.");
+    add("/freshness", "get", "Freshness (JSON)", vec![], "Per-endpoint freshness SLA counts + per-source realtime lag.");
+    add("/usage", "get", "Usage dashboard", vec![], "Global request dashboard (all callers, aggregate).");
+    add("/openapi.json", "get", "OpenAPI document", vec![], "This document.");
+
     // App-contributed paths (e.g. realtime SSE/WS the app mounts) — merged last
     // so the app can document routes the platform doesn't name. Shape is an
     // OpenAPI paths object: `{ "/path": { "get": {<operation>} } }`.
