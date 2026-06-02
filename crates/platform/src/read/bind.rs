@@ -33,7 +33,7 @@ pub enum BindValue {
 }
 
 impl BindValue {
-    fn boxed(&self) -> Box<dyn ToSql + Sync + Send> {
+    pub(crate) fn boxed(&self) -> Box<dyn ToSql + Sync + Send> {
         match self {
             BindValue::Text(s) => Box::new(s.clone()),
             BindValue::Int(i) => Box::new(*i),
@@ -62,6 +62,13 @@ pub struct Bound {
     /// placeholders (and as `params`). The ClickHouse backend binds from these;
     /// Postgres uses `params`/`refs()`.
     pub values: Vec<BindValue>,
+    /// The fully-substituted SQL with binds still as `:name` (pre-`$N` lowering).
+    /// The dialect lowerers (`T-READ-IR-001`) re-lower this per backend — PG to
+    /// `$N` (byte-equivalent to `sql`), CH to `?`.
+    pub substituted: String,
+    /// `name → resolved BindValue` for every resolved param (the IR lowerers look
+    /// binds up by name). Distinct from `values`, which is positional.
+    pub value_map: HashMap<String, BindValue>,
     /// Canonical "name=value&…" of resolved params (sorted) for the cache key.
     pub canon: String,
 }
@@ -239,13 +246,26 @@ pub fn resolve(
     let substituted = substitute_fragments(&spec.sql, &fragments);
 
     // 4) Lower :name binds → $N (skip ::type casts), collecting values in order.
-    let (sql, params, ordered_values) = lower_binds(&substituted, &values)?;
+    //    The PG lowering is shared with the IR path (`PostgresDialect`) so the
+    //    two stay byte-equivalent by construction. `params` boxes each value for
+    //    the PG backend; `ordered_values` is the backend-neutral ABI.
+    let lowered = super::dialect::PostgresDialect::lower_binds(&substituted, &values)?;
+    let sql = lowered.sql;
+    let ordered_values = lowered.values;
+    let params: Vec<Box<dyn ToSql + Sync + Send>> = ordered_values.iter().map(|v| v.boxed()).collect();
 
     // 5) Canonical cache key.
     canon_parts.sort();
     let canon = canon_parts.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
 
-    Ok(Bound { sql, params, values: ordered_values, canon })
+    Ok(Bound {
+        sql,
+        params,
+        values: ordered_values,
+        substituted,
+        value_map: values,
+        canon,
+    })
 }
 
 fn substitute_fragments(sql: &str, fragments: &HashMap<String, String>) -> String {
@@ -267,56 +287,3 @@ fn substitute_fragments(sql: &str, fragments: &HashMap<String, String>) -> Strin
     out
 }
 
-fn is_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
-}
-fn is_ident(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
-/// Replace `:name` binds with `$N`, pushing each occurrence's value. A `:`
-/// preceded or followed by another `:` (a `::type` cast) is left untouched.
-fn lower_binds(
-    sql: &str,
-    values: &HashMap<String, BindValue>,
-) -> Result<(String, Vec<Box<dyn ToSql + Sync + Send>>, Vec<BindValue>), ApiError> {
-    let bytes = sql.as_bytes();
-    let mut out = String::with_capacity(sql.len() + 16);
-    let mut params: Vec<Box<dyn ToSql + Sync + Send>> = Vec::new();
-    let mut ordered: Vec<BindValue> = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b':' {
-            let prev_colon = i > 0 && bytes[i - 1] == b':';
-            let next_colon = i + 1 < bytes.len() && bytes[i + 1] == b':';
-            if !prev_colon && !next_colon && i + 1 < bytes.len() && is_ident_start(bytes[i + 1]) {
-                // Read the identifier.
-                let mut j = i + 1;
-                while j < bytes.len() && is_ident(bytes[j]) {
-                    j += 1;
-                }
-                let name = &sql[i + 1..j];
-                let v = values.get(name).ok_or_else(|| {
-                    ApiError::Internal(anyhow::anyhow!("bind ':{name}' has no resolved value"))
-                })?;
-                params.push(v.boxed());
-                ordered.push(v.clone());
-                out.push('$');
-                out.push_str(&params.len().to_string());
-                // Cast numeric binds so a single Rust width matches any column
-                // width (i64 vs int4 / numeric): `$N::int8` / `$N::float8`.
-                // Postgres implicitly promotes in comparisons (int4 = int8 etc).
-                match v {
-                    BindValue::Int(_) => out.push_str("::int8"),
-                    BindValue::Float(_) => out.push_str("::float8"),
-                    _ => {}
-                }
-                i = j;
-                continue;
-            }
-        }
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-    Ok((out, params, ordered))
-}

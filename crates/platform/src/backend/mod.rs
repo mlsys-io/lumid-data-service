@@ -98,6 +98,12 @@ pub struct BoundQuery<'a> {
     pub sql: &'a str,
     pub params: Vec<&'a (dyn tokio_postgres::types::ToSql + Sync)>,
     pub binds: &'a [crate::read::bind::BindValue],
+    /// When `true`, `sql` is already lowered to the target backend's dialect
+    /// (`T-READ-IR-001` CH path — `?` placeholders, CH casts) and must be run
+    /// verbatim. When `false`, `sql` carries PG `$N` placeholders and a non-PG
+    /// backend translates them itself (the PR #9 placeholder-only path). Postgres
+    /// ignores this flag (it always runs `sql`/`params` directly).
+    pub pre_lowered: bool,
 }
 
 /// A storage backend. Writers/readers depend only on this trait; the registry

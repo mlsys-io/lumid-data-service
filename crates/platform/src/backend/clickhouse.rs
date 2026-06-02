@@ -31,10 +31,13 @@
 //!
 //!   * **`query_rows`** runs the (already-bound) SQL with
 //!     `FORMAT JSONEachRow` and parses the NDJSON response into JSON objects.
-//!     NOTE: the **read dialect** (CH SQL vs PG SQL, `$N` vs `?` binds) is a
-//!     Phase C concern — see `query_rows` below. A read endpoint whose first
-//!     table resolves to CH will still be sent PG-shaped SQL; authoring CH read
-//!     specs is deferred.
+//!     The **read dialect** is handled two ways (`T-READ-IR-001`): a spec that
+//!     parsed into the backend-neutral query IR is lowered to ClickHouse SQL
+//!     *upstream* (in `read::exec::produce` via `ClickHouseDialect`) and arrives
+//!     here `pre_lowered` — run verbatim. A spec that fell back to the raw-SQL
+//!     path arrives PG-shaped and we translate just the `$N`(+cast) placeholders
+//!     to `?` (the PR #9 path). So a `md.*` read endpoint authored once now
+//!     lowers + executes on CH; there is no separate CH-native spec to maintain.
 
 use std::sync::Arc;
 
@@ -339,13 +342,17 @@ impl Backend for ClickHouseBackend {
     }
 
     async fn query_rows(&self, q: &BoundQuery<'_>) -> ApiResult<Vec<Map<String, Value>>> {
-        // Phase C: translate the PG-dialect placeholders the bind layer emits
-        // (`$N`, with `::int8`/`::float8` casts on numeric binds) into CH's `?`
-        // positional form, then bind `q.binds` (the backend-neutral values) in
-        // order. Only the PLACEHOLDER dialect is translated — a read spec whose
-        // SQL also uses PG-only functions/casts must be authored CH-native; the
-        // platform doesn't transpile arbitrary SQL.
-        let ch_sql = pg_placeholders_to_ch(q.sql);
+        // `T-READ-IR-001`: when the read layer parsed the spec into the
+        // backend-neutral query IR it lowers the *whole* statement to ClickHouse
+        // dialect upstream (`?` placeholders, CH casts, PREWHERE/FINAL) and sets
+        // `pre_lowered` — run it verbatim. Otherwise we keep the PR #9 path:
+        // translate just the PG `$N`(+cast) placeholders to `?` (the spec's SQL
+        // body must already be CH-compatible).
+        let ch_sql = if q.pre_lowered {
+            q.sql.to_string()
+        } else {
+            pg_placeholders_to_ch(q.sql)
+        };
         let mut query = self.client.query(&ch_sql);
         for b in q.binds {
             query = match b {
@@ -526,6 +533,7 @@ mod tests {
                 sql: "SELECT venue, px FROM md.phaseb_smoke LIMIT 1",
                 params: vec![],
                 binds: &[],
+                pre_lowered: false,
             })
             .await
             .expect("query_rows");
