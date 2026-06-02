@@ -112,6 +112,18 @@ pub struct EndpointSpec {
     /// Whether to cache responses (false for live/realtime-backed reads).
     #[serde(default = "default_true")]
     pub cache: bool,
+    /// Opt-in `FINAL` for a ClickHouse-backed read (`T-READ-IR-001`): forces
+    /// dedup-on-read for `ReplacingMergeTree` tables (exact, slower). Ignored on
+    /// Postgres. Off by default — most reads tolerate the transient pre-merge
+    /// duplicates, and `FINAL` is expensive.
+    #[serde(default)]
+    pub ch_final: bool,
+    /// Parsed backend-neutral query IR (`T-READ-IR-001`). Populated at spec-load
+    /// when `sql` fits the bounded read-only SELECT grammar; `None` ⇒ the spec
+    /// fell back to the raw-SQL Postgres path (the un-parseable construct was
+    /// logged at load). Not part of the TOML surface (`#[serde(skip)]`).
+    #[serde(skip)]
+    pub ir: Option<super::ir::QueryIr>,
 }
 
 impl EndpointSpec {
@@ -152,10 +164,49 @@ pub fn load(path: &str) -> Result<Vec<EndpointSpec>, ApiError> {
 pub fn parse(text: &str) -> Result<Vec<EndpointSpec>, ApiError> {
     let root: Root = toml::from_str(text)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("parse read config: {e}")))?;
-    for ep in &root.read.endpoint {
+    let mut specs = root.read.endpoint;
+    for ep in &specs {
         lint(ep)?;
     }
-    Ok(root.read.endpoint)
+    // Compile each spec's SQL to the backend-neutral query IR (`T-READ-IR-001`).
+    // A spec whose SQL fits the bounded read-only SELECT grammar gets an IR and
+    // can lower to ClickHouse as well as Postgres; one that uses an un-parseable
+    // construct falls back to the raw-SQL Postgres path with a `warn!` naming the
+    // construct. Either way the Postgres lowering is byte-equivalent to before —
+    // the IR never changes the PG output.
+    for ep in &mut specs {
+        match super::parse::parse_select(&ep.sql) {
+            super::parse::ParseOutcome::Ir(ir) => {
+                // Per-backend compile-time validation: if the spec targets a
+                // ClickHouse table but uses a construct the CH lowerer can't
+                // express, surface it now (loud, at load) rather than at request
+                // time. (We don't have the backend kind here — the registry
+                // resolves it at runtime — so we only warn; a hard CH-incompat
+                // error is raised when the request actually lowers for CH.)
+                if let Err(construct) = super::dialect::validate_clickhouse(&ir) {
+                    tracing::warn!(
+                        spec = %ep.id,
+                        "read spec '{}' IR uses a ClickHouse-incompatible construct ({}); \
+                         it will only serve on Postgres",
+                        ep.id,
+                        construct
+                    );
+                }
+                ep.ir = Some(*ir);
+            }
+            super::parse::ParseOutcome::Fallback(reason) => {
+                tracing::warn!(
+                    spec = %ep.id,
+                    "read spec '{}' uses {} — not representable in the query IR; \
+                     pinned to the raw-SQL Postgres path",
+                    ep.id,
+                    reason
+                );
+                ep.ir = None;
+            }
+        }
+    }
+    Ok(specs)
 }
 
 /// Startup lints: no `count(distinct` (TS); every `{{fragment}}` referenced by

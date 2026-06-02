@@ -94,11 +94,49 @@ async fn produce(
     bound: &bind::Bound,
     id_kv: Option<(String, String)>,
 ) -> ApiResult<Vec<u8>> {
+    use crate::backend::BackendKind;
+    use crate::read::dialect::{ClickHouseDialect, Dialect};
+
     let (schema, table) = read_target(spec);
     let backend = st.backends.get(&schema, &table).await?;
-    let mut objs = backend
-        .query_rows(&crate::backend::BoundQuery { sql: &bound.sql, params: bound.refs() })
-        .await?;
+
+    // Dialect lowering (`T-READ-IR-001`). Postgres uses the already-lowered
+    // `$N` SQL (byte-equivalent to legacy). ClickHouse, when the spec parsed to
+    // an IR, lowers the IR to CH SQL (`?` binds, CH casts, PREWHERE/FINAL); when
+    // it didn't, the CH backend falls back to translating the PG placeholders
+    // (PR #9 behaviour) — so we pass the PG-shaped SQL and let it translate.
+    let mut objs = match backend.kind() {
+        BackendKind::ClickHouse if spec.ir.is_some() => {
+            // Derive CH read knobs from the parsed IR: leading ORDER BY key for
+            // PREWHERE hoist; FINAL is opt-in via the spec's `ch_final` flag.
+            let ir = spec.ir.as_ref().unwrap();
+            let dialect = ClickHouseDialect {
+                final_: spec.ch_final,
+                order_key_cols: ir.order_by.iter().map(|o| o.expr.clone()).collect(),
+            };
+            let lowered = dialect.lower(&bound.substituted, &bound.value_map, spec.ir.as_ref())?;
+            backend
+                .query_rows(&crate::backend::BoundQuery {
+                    // Pre-lowered CH SQL — the backend must NOT re-translate it.
+                    sql: &lowered.sql,
+                    params: Vec::new(),
+                    binds: &lowered.values,
+                    pre_lowered: true,
+                })
+                .await?
+        }
+        _ => {
+            // Postgres (or CH-without-IR fallback): hand over the PG-shaped SQL.
+            backend
+                .query_rows(&crate::backend::BoundQuery {
+                    sql: &bound.sql,
+                    params: bound.refs(),
+                    binds: &bound.values,
+                    pre_lowered: false,
+                })
+                .await?
+        }
+    };
     if spec.strip_lineage {
         objs = strip_lineage_rows(objs);
     }

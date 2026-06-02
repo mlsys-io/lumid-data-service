@@ -40,9 +40,13 @@ async fn gate_target(
     schema: &str,
     table: &str,
 ) -> Result<bool, ApiError> {
-    let client = st.pool.get().await?;
-    let exists = introspect::table_exists(&client, schema, table).await?;
-    drop(client);
+    // Existence must be checked on the backend that OWNS the table — a
+    // ClickHouse-backed table is invisible to Postgres's information_schema, so
+    // a PG-only `table_exists` re-proposed every write to a CH table. `reg.get`
+    // defaults an unknown table to Postgres, so a genuinely-new shape still
+    // reports not-exists and enters the propose flow.
+    let backend = st.backends.get(schema, table).await?;
+    let exists = backend.table_meta(schema, table).await?.is_some();
     if exists {
         acl::check_can_write(&st.pool, &identity.role, schema, table).await?;
     } else if !acl::can_propose(&st.pool, &identity.role).await? {
