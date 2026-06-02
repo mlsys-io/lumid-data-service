@@ -10,7 +10,10 @@
 //!
 pub mod bind;
 pub mod cache;
+pub mod dialect;
 pub mod exec;
+pub mod ir;
+pub mod parse;
 pub mod spec;
 
 use std::collections::{HashMap, HashSet};
