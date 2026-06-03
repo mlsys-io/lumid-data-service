@@ -75,9 +75,14 @@ pub fn build_router(
         // LLM reverse proxy is now an opt-in plugin — apps merge
         // `lumid_platform::llm::routes()` (src/llm.rs). Not mounted by the platform.
 
+        // Direct SQL/storage retrieval — no LLM; same safety boundary as replay_retrieval_plan.
+        .route("/retrieve", post(handlers::retrieve::post_retrieve))
+
         // Blob serving (read side). The generic `/blobs/*key` is platform-owned;
         // any domain-named compatibility alias (e.g. a legacy `/storage/...` URL)
         // is app-contributed via `ServeParts.ext_routes` → `blobs::legacy_storage_alias`.
+        // Exact `/blobs` (list) and wildcard `/blobs/*key` (fetch) coexist in axum.
+        .route("/blobs", get(handlers::blobs::list_blobs))
         .route("/blobs/*key", get(handlers::blobs::serve_blob))
 
         // Realtime SSE routes (gated) are app-contributed via `ServeParts.ext_routes`

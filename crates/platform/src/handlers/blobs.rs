@@ -6,6 +6,9 @@
 //!   back to `application/octet-stream`. 404 if the file is missing; 400 on any
 //!   path-traversal attempt that escapes blob_root; 503 if blob_root unset.
 //!
+//! GET /blobs?prefix=…
+//!   List objects by prefix (flat or delimiter-bounded). See `list_blobs`.
+//!
 //! `legacy_storage_alias` — a generic blob-by-path handler that 302-redirects
 //!   to `/blobs/{path}`. The platform names no path for it; an app mounts it at
 //!   whatever legacy/compat URL it needs (e.g. an old `/storage/v1/object/<x>/{path}`
@@ -14,19 +17,30 @@
 use std::path::{Component, Path as FsPath};
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
+use futures_util::TryStreamExt;
 use object_store::{path::Path as ObjPath, Error as ObjError};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{ApiError, ApiResult};
 use crate::queries::blobs as q;
 use crate::state::AppState;
 
+/// Public wrapper around `sanitize_key` that returns an `ApiError::BadRequest`
+/// for traversal/empty keys instead of `None`. Used by the retrieval pipeline's
+/// `storage_get` op, which needs the same path-traversal guard the HTTP handler applies.
+pub fn sanitize_blob_key(key: &str) -> Result<String, ApiError> {
+    sanitize_key(key).ok_or_else(|| ApiError::BadRequest("invalid key".into()))
+}
+
 /// Lexically validate a blob key, rejecting any traversal (`..`, absolute or
 /// prefix components) and normalizing the remaining `/`-separated segments.
 /// Object keys are opaque (no filesystem resolution), so this is a pure
 /// sanitization step — the FS-specific `canonicalize` symlink guard is gone.
+/// Returns `None` for traversal attempts AND for empty keys (fetch requires a key).
 fn sanitize_key(key: &str) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
     for comp in FsPath::new(key).components() {
@@ -41,6 +55,127 @@ fn sanitize_key(key: &str) -> Option<String> {
         None
     } else {
         Some(parts.join("/"))
+    }
+}
+
+/// Validate a listing prefix: same traversal rules as `sanitize_key`, but an
+/// empty prefix is allowed (means "list from root").
+pub fn sanitize_prefix(prefix: &str) -> Result<Option<ObjPath>, ApiError> {
+    if prefix.is_empty() {
+        return Ok(None);
+    }
+    let clean =
+        sanitize_key(prefix).ok_or_else(|| ApiError::BadRequest("invalid prefix".into()))?;
+    Ok(Some(ObjPath::from(clean.as_str())))
+}
+
+/// Cap `limit` to [1, 10000]; absent → 1000.
+pub fn clamp_limit(opt: Option<usize>) -> usize {
+    match opt {
+        None => 1000,
+        Some(n) => n.clamp(1, 10_000),
+    }
+}
+
+// ── query params ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct ListParams {
+    pub prefix: Option<String>,
+    /// When present (any non-empty value), use `list_with_delimiter` for
+    /// folder-style results instead of a flat recursive listing.
+    pub delimiter: Option<String>,
+    pub limit: Option<usize>,
+}
+
+// ── response types ───────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct BlobItem {
+    pub key: String,
+    pub size: usize,
+    pub last_modified: String, // RFC 3339
+}
+
+#[derive(Serialize)]
+pub struct ListBlobsResponse {
+    pub objects: Vec<BlobItem>,
+    pub common_prefixes: Vec<String>,
+    pub truncated: bool,
+}
+
+// ── handler ──────────────────────────────────────────────────────────────────
+
+pub async fn list_blobs(
+    State(st): State<AppState>,
+    Query(params): Query<ListParams>,
+) -> ApiResult<Json<ListBlobsResponse>> {
+    if st.settings.blob_root.is_empty() {
+        return Err(ApiError::Unavailable("blob storage not configured".into()));
+    }
+
+    let prefix_path =
+        sanitize_prefix(params.prefix.as_deref().unwrap_or(""))?;
+    let limit = clamp_limit(params.limit);
+    let use_delimiter = params.delimiter.as_deref().is_some_and(|d| !d.is_empty());
+
+    if use_delimiter {
+        let result = st
+            .blob_store
+            .list_with_delimiter(prefix_path.as_ref())
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("blob list: {e}")))?;
+
+        let truncated = result.objects.len() > limit || result.common_prefixes.len() > limit;
+        let objects: Vec<BlobItem> = result
+            .objects
+            .into_iter()
+            .take(limit)
+            .map(|m| BlobItem {
+                key: m.location.to_string(),
+                size: m.size,
+                last_modified: m.last_modified.to_rfc3339(),
+            })
+            .collect();
+        let common_prefixes: Vec<String> = result
+            .common_prefixes
+            .into_iter()
+            .take(limit)
+            .map(|p| p.to_string())
+            .collect();
+
+        Ok(Json(ListBlobsResponse {
+            objects,
+            common_prefixes,
+            truncated,
+        }))
+    } else {
+        // Flat recursive listing — collect up to limit+1 to detect truncation.
+        let mut objects: Vec<BlobItem> = Vec::with_capacity(limit + 1);
+        let mut stream = st.blob_store.list(prefix_path.as_ref());
+        while let Some(meta) = stream
+            .try_next()
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("blob list: {e}")))?
+        {
+            objects.push(BlobItem {
+                key: meta.location.to_string(),
+                size: meta.size,
+                last_modified: meta.last_modified.to_rfc3339(),
+            });
+            if objects.len() > limit {
+                break;
+            }
+        }
+        let truncated = objects.len() > limit;
+        if truncated {
+            objects.truncate(limit);
+        }
+        Ok(Json(ListBlobsResponse {
+            objects,
+            common_prefixes: vec![],
+            truncated,
+        }))
     }
 }
 

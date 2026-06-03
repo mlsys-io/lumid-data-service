@@ -113,6 +113,25 @@ pub struct Settings {
     /// A request whose `model` matches one of these is proxied to that backend;
     /// everything else goes to the primary. `/v1/models` aggregates all backends.
     pub llm_backends: Vec<(String, String)>,
+    /// Optional bearer for upstream LLM calls. When non-empty, the platform
+    /// injects `Authorization: Bearer <key>` on requests it makes from the
+    /// agent loop (and on /v1/* proxy forwards). Required for hosted endpoints
+    /// like `https://api.anthropic.com` and `https://api.openai.com`.
+    pub llm_api_key: String,
+    /// Schemas the agent's tools surface. If unset, all non-system schemas.
+    pub user_schemas: Vec<String>,
+
+    // Retrieval pipeline knobs.
+    /// TTL for in-process schema-card cache (seconds). Default 300.
+    pub retrieval_card_ttl_s: u64,
+    /// Per-session `statement_timeout` for SQL ops (milliseconds). Default 30000.
+    pub retrieval_stmt_timeout_ms: u32,
+    /// Maximum rows a single SQL op may return before the call is rejected. Default 1_000_000.
+    pub retrieval_row_cap: u64,
+    /// Object-storage key prefix for materialised retrieval outputs. Default `"retrievals"`.
+    pub retrieval_prefix: String,
+    /// Number of sample values to include per column in schema cards. Default 5.
+    pub retrieval_sample_rows: usize,
 }
 
 impl Settings {
@@ -183,6 +202,17 @@ impl Settings {
                 .map(|(m, u)| (m.trim().to_string(), u.trim().trim_end_matches('/').to_string()))
                 .filter(|(m, u)| !m.is_empty() && !u.is_empty())
                 .collect(),
+            llm_api_key: env_str("LLM_API_KEY", ""),
+            user_schemas: env_str("USER_SCHEMAS", "")
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            retrieval_card_ttl_s: env_u64("RETRIEVAL_CARD_TTL_S", 300),
+            retrieval_stmt_timeout_ms: env_u32("RETRIEVAL_STMT_TIMEOUT_MS", 30_000),
+            retrieval_row_cap: env_u64("RETRIEVAL_ROW_CAP", 1_000_000),
+            retrieval_prefix: env_str("RETRIEVAL_PREFIX", "retrievals"),
+            retrieval_sample_rows: env_u32("RETRIEVAL_SAMPLE_ROWS", 5) as usize,
         }
     }
 }
