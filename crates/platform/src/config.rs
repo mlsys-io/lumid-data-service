@@ -113,10 +113,11 @@ pub struct Settings {
     /// A request whose `model` matches one of these is proxied to that backend;
     /// everything else goes to the primary. `/v1/models` aggregates all backends.
     pub llm_backends: Vec<(String, String)>,
-    /// Optional bearer for upstream LLM calls. When non-empty, the platform
-    /// injects `Authorization: Bearer <key>` on requests it makes from the
-    /// agent loop (and on /v1/* proxy forwards). Required for hosted endpoints
-    /// like `https://api.anthropic.com` and `https://api.openai.com`.
+    /// Optional bearer for upstream LLM calls made by the agent loop. When
+    /// non-empty, the platform injects `Authorization: Bearer <key>` on the
+    /// requests it originates from the agent loop. The `/v1/*` proxy does NOT
+    /// inject this key — it forwards client requests verbatim. Required for
+    /// hosted endpoints like `https://api.anthropic.com` reached by the agent.
     pub llm_api_key: String,
     /// Schemas the agent's tools surface. If unset, all non-system schemas.
     pub user_schemas: Vec<String>,

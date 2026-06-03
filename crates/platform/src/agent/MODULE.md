@@ -64,17 +64,19 @@ All tools are OpenAI function-call compatible (schema under `function.parameters
 
 | tool                    | required args | backed by                                | boundary                                   |
 |-------------------------|---------------|------------------------------------------|--------------------------------------------|
-| `get_schema_cards`      | — (`scope?`)  | `retrieve::card_builder` (+ TTL cache)   | scope limited to `LUMID_USER_SCHEMAS` / non-system schemas |
+| `get_schema_cards`      | — (`scope?`)  | `retrieve::card_builder` (+ TTL cache)   | card visibility capped to `LUMID_USER_SCHEMAS` (does NOT constrain SQL) |
 | `replay_retrieval_plan` | `plan`        | `retrieve::replayer::replay`             | SELECT-only parser + READ ONLY txn + row cap + key sanitization |
 
 ### get_schema_cards
 
 Returns compact schema cards (table/column names, types, stats, samples, FK hints) for SQL
-planning — never data rows. Optional comma-separated `scope` restricts which schemas are
-surfaced; empty scope falls back to `settings.user_schemas` (the `LUMID_USER_SCHEMAS`
-allowlist), and when that is also empty, to all non-system schemas (system schemas —
-`pg_*`, `information_schema`, `_timescaledb*` — are always excluded). Cards are cached in
-process with a TTL (`LUMID_RETRIEVAL_CARD_TTL_S`).
+planning — never data rows. `LUMID_USER_SCHEMAS` is a **card-visibility cap** only — it
+controls which schemas the agent is *shown*, not which schemas the SQL it generates may
+touch (the DB role's grants are the data-access boundary). When non-empty, the effective
+scope is `requested_scope ∩ user_schemas`; when the caller's `scope` arg is empty, the
+full allowlist is used. When `LUMID_USER_SCHEMAS` is unset, all non-system schemas are
+shown (system schemas — `pg_*`, `information_schema`, `_timescaledb*` — are always
+excluded). Cards are cached in process with a TTL (`LUMID_RETRIEVAL_CARD_TTL_S`).
 
 ### replay_retrieval_plan
 
@@ -117,7 +119,8 @@ and prefix traversal are rejected — and reads go through the bucket-scoped obj
 The agent uses the platform's general connection pool. Running it under a minimally-privileged
 role with `USAGE` on user schemas only (and no write grants) is recommended defense-in-depth;
 the READ ONLY transaction is the control that makes execution safe, but a least-privilege role
-is appropriate whenever a role touches production data.
+is appropriate whenever a role touches production data. Note: `LUMID_USER_SCHEMAS` caps card
+*visibility* only — the DB role is the authoritative data-access boundary for SQL execution.
 
 ## LLM integration
 

@@ -85,6 +85,18 @@ pub async fn replay(
                     .get(&path)
                     .await
                     .map_err(|e| ApiError::NotFound(format!("blob '{}' not found: {e}", sg_op.key)))?;
+
+                // Guard against unbounded buffering: check object size before reading
+                // the body. blob_max_bytes == 0 means no cap (skip the check).
+                let blob_max = st.settings.blob_max_bytes;
+                let object_size = result.meta.size as u64;
+                if blob_max > 0 && object_size > blob_max {
+                    return Err(ApiError::BadRequest(format!(
+                        "blob {} exceeds LUMID_BLOB_MAX_BYTES ({} bytes)",
+                        sg_op.key, object_size
+                    )));
+                }
+
                 let bytes_data = result
                     .bytes()
                     .await

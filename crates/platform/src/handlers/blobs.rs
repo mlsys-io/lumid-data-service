@@ -104,6 +104,46 @@ pub struct ListBlobsResponse {
     pub truncated: bool,
 }
 
+// ── retrieval-prefix filter ───────────────────────────────────────────────────
+
+/// Returns `true` when `key` falls under the retrieval-output prefix and should
+/// be hidden from general listing results.
+///
+/// Security: don't enumerate other runs' materialized outputs via `GET /blobs`.
+/// Fetch-by-key (`GET /blobs/<key>`) intentionally stays open — run IDs are
+/// unguessable UUIDs and are only handed to the run's own requester.
+///
+/// Matching is path-segment–bounded so `retrievals-archive/x` is NOT hidden
+/// when `retrieval_prefix` is `"retrievals"`.
+pub fn is_hidden_key(key: &str, retrieval_prefix: &str) -> bool {
+    if retrieval_prefix.is_empty() {
+        return false;
+    }
+    // Exact match OR starts with "<prefix>/"
+    key == retrieval_prefix || key.starts_with(&format!("{retrieval_prefix}/"))
+}
+
+/// Returns `true` when a `common_prefixes` entry should be hidden.
+///
+/// object_store may return the prefix with or without a trailing `/`; we
+/// normalise by stripping it before comparing.
+///
+/// Security: a delimiter-based listing for `?prefix=retrievals&delimiter=/`
+/// returns `common_prefixes` like `retrievals/<run_id>/`, which are nested UNDER
+/// the retrieval namespace — not equal to it.  Matching only the exact prefix
+/// would leak run IDs.  We therefore hide anything that equals OR is nested
+/// under the retrieval prefix (segment-bounded to avoid hiding siblings like
+/// `retrievals-archive/`).
+pub fn is_hidden_prefix(common_prefix: &str, retrieval_prefix: &str) -> bool {
+    if retrieval_prefix.is_empty() {
+        return false;
+    }
+    let norm = common_prefix.trim_end_matches('/');
+    // Hide the retrieval prefix itself AND any run-ID sub-prefixes beneath it,
+    // but NOT segment siblings like "retrievals-archive/".
+    norm == retrieval_prefix || norm.starts_with(&format!("{retrieval_prefix}/"))
+}
+
 // ── handler ──────────────────────────────────────────────────────────────────
 
 pub async fn list_blobs(
@@ -126,23 +166,29 @@ pub async fn list_blobs(
             .await
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("blob list: {e}")))?;
 
-        let truncated = result.objects.len() > limit || result.common_prefixes.len() > limit;
-        let objects: Vec<BlobItem> = result
+        // Filter hidden prefixes BEFORE limit/truncated accounting so the
+        // visible count is correct.
+        let rp = &st.settings.retrieval_prefix;
+        let visible_objects: Vec<BlobItem> = result
             .objects
             .into_iter()
-            .take(limit)
+            .filter(|m| !is_hidden_key(&m.location.to_string(), rp))
             .map(|m| BlobItem {
                 key: m.location.to_string(),
                 size: m.size,
                 last_modified: m.last_modified.to_rfc3339(),
             })
             .collect();
-        let common_prefixes: Vec<String> = result
+        let visible_prefixes: Vec<String> = result
             .common_prefixes
             .into_iter()
-            .take(limit)
             .map(|p| p.to_string())
+            .filter(|p| !is_hidden_prefix(p, rp))
             .collect();
+
+        let truncated = visible_objects.len() > limit || visible_prefixes.len() > limit;
+        let objects: Vec<BlobItem> = visible_objects.into_iter().take(limit).collect();
+        let common_prefixes: Vec<String> = visible_prefixes.into_iter().take(limit).collect();
 
         Ok(Json(ListBlobsResponse {
             objects,
@@ -150,7 +196,9 @@ pub async fn list_blobs(
             truncated,
         }))
     } else {
-        // Flat recursive listing — collect up to limit+1 to detect truncation.
+        // Flat recursive listing — filter hidden keys, then collect up to
+        // limit+1 to detect truncation.
+        let rp = &st.settings.retrieval_prefix;
         let mut objects: Vec<BlobItem> = Vec::with_capacity(limit + 1);
         let mut stream = st.blob_store.list(prefix_path.as_ref());
         while let Some(meta) = stream
@@ -158,8 +206,13 @@ pub async fn list_blobs(
             .await
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("blob list: {e}")))?
         {
+            let key = meta.location.to_string();
+            // Security: hide retrieval-output prefix from enumeration.
+            if is_hidden_key(&key, rp) {
+                continue;
+            }
             objects.push(BlobItem {
-                key: meta.location.to_string(),
+                key,
                 size: meta.size,
                 last_modified: meta.last_modified.to_rfc3339(),
             });

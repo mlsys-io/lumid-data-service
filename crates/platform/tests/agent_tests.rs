@@ -339,6 +339,29 @@ fn system_schemas_rejected_by_is_user_schema() {
     }
 }
 
+// ── effective_scope security: allowlist + non-permitted request → zero cards ──
+
+/// Critical security regression test: when the operator allowlist is non-empty
+/// and the agent requests a schema not in the allowlist, effective_scope must
+/// return Scope::Only([]) — NOT Scope::All — so that zero cards are returned
+/// rather than every schema being exposed.
+#[test]
+fn effective_scope_allowlist_with_non_permitted_request_yields_only_empty() {
+    use lumid_platform::agent::tools::schema_cards::{effective_scope, Scope};
+
+    let allowlist = vec!["market".to_string()];
+    let requested = vec!["secret".to_string()];
+    let result = effective_scope(&requested, &allowlist);
+
+    // Must be Only([]), never Scope::All.
+    assert_eq!(
+        result,
+        Scope::Only(vec![]),
+        "allowlist=[market] + requested=[secret] must yield Only([]), not All; \
+         Only([]) → 0 cards; Scope::All → all schemas exposed (security hole)"
+    );
+}
+
 // ── lineage stripping ─────────────────────────────────────────────────────────
 
 /// strip_lineage_rows must remove the four hidden columns from every row.

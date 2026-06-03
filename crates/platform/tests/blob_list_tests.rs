@@ -2,7 +2,7 @@
 //!
 //! All tests run in-memory; no live object store required.
 
-use lumid_platform::handlers::blobs::{clamp_limit, sanitize_prefix, ListParams};
+use lumid_platform::handlers::blobs::{clamp_limit, is_hidden_key, is_hidden_prefix, sanitize_prefix, ListParams};
 
 // ── clamp_limit ───────────────────────────────────────────────────────────────
 
@@ -112,4 +112,75 @@ fn list_params_empty_delimiter_does_not_trigger_folder_mode() {
     };
     let use_delimiter = params.delimiter.as_deref().is_some_and(|d| !d.is_empty());
     assert!(!use_delimiter);
+}
+
+// ── is_hidden_key ─────────────────────────────────────────────────────────────
+
+#[test]
+fn hidden_key_exact_prefix_is_hidden() {
+    assert!(is_hidden_key("retrievals", "retrievals"));
+}
+
+#[test]
+fn hidden_key_nested_under_prefix_is_hidden() {
+    assert!(is_hidden_key("retrievals/abc/result.jsonl", "retrievals"));
+}
+
+#[test]
+fn hidden_key_sibling_prefix_not_hidden() {
+    // "retrievals-archive/x" must NOT be hidden — segment-boundary check.
+    assert!(!is_hidden_key("retrievals-archive/x", "retrievals"));
+}
+
+#[test]
+fn hidden_key_unrelated_prefix_not_hidden() {
+    assert!(!is_hidden_key("demo/some/file.txt", "retrievals"));
+}
+
+#[test]
+fn hidden_key_empty_retrieval_prefix_hides_nothing() {
+    assert!(!is_hidden_key("retrievals/anything", ""));
+    assert!(!is_hidden_key("", ""));
+}
+
+// ── is_hidden_prefix ──────────────────────────────────────────────────────────
+
+#[test]
+fn hidden_prefix_with_trailing_slash_is_hidden() {
+    assert!(is_hidden_prefix("retrievals/", "retrievals"));
+}
+
+#[test]
+fn hidden_prefix_without_trailing_slash_is_hidden() {
+    assert!(is_hidden_prefix("retrievals", "retrievals"));
+}
+
+#[test]
+fn hidden_prefix_sibling_not_hidden() {
+    assert!(!is_hidden_prefix("retrievals-archive/", "retrievals"));
+}
+
+#[test]
+fn hidden_prefix_empty_retrieval_prefix_hides_nothing() {
+    assert!(!is_hidden_prefix("retrievals/", ""));
+    assert!(!is_hidden_prefix("anything/", ""));
+}
+
+#[test]
+fn hidden_prefix_nested_run_id_is_hidden() {
+    // Security: GET /blobs?prefix=retrievals&delimiter=/ returns common_prefixes
+    // like "retrievals/<run_id>/".  These must be hidden so run IDs don't leak.
+    assert!(is_hidden_prefix("retrievals/abc123/", "retrievals"));
+}
+
+#[test]
+fn hidden_prefix_deeply_nested_is_hidden() {
+    // A two-level nested prefix also falls under the retrieval namespace.
+    assert!(is_hidden_prefix("retrievals/abc/def/", "retrievals"));
+}
+
+#[test]
+fn hidden_prefix_sibling_with_hyphen_not_hidden() {
+    // Segment-boundary check: "retrievals-archive/" must NOT be hidden.
+    assert!(!is_hidden_prefix("retrievals-archive/", "retrievals"));
 }

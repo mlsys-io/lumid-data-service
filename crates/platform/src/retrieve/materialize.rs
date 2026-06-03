@@ -1,8 +1,9 @@
 //! Stream-writes retrieved rows to object storage.
 //!
 //! Supports `csv`, `jsonl`, and `raw` formats. Buffers output in memory
-//! (rows are already bounded by the row-cap in the replayer), then writes
-//! to the configured `Arc<dyn ObjectStore>`.
+//! (SQL rows are bounded by the row-cap in the replayer; storage_get objects
+//! are bounded by `LUMID_BLOB_MAX_BYTES`), then writes to the configured
+//! `Arc<dyn ObjectStore>`.
 
 use std::sync::Arc;
 
