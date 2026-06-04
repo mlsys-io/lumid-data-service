@@ -58,6 +58,14 @@ pub enum Scope {
 /// with it, not substituted for it.  This prevents the agent from requesting
 /// cards for schemas outside the operator's allowlist.
 ///
+/// NOTE — this is a *card-visibility* filter, NOT a query-execution boundary.
+/// `replay_retrieval_plan` / `POST /retrieve` run their SELECTs with whatever
+/// privileges the configured Postgres role holds; a caller that already knows a
+/// table name can read it regardless of `user_schemas`. To make the allowlist a
+/// true access boundary, the deployment must back it with a Postgres role whose
+/// grants are scoped to the same schemas (`REVOKE`/`GRANT` per schema). Treat
+/// `user_schemas` as "what the planner is told about", not "what can be read".
+///
 /// When `user_schemas` is empty, fall back to `requested` as-is (or `Scope::All`
 /// to signal "all non-system" to the card store).
 pub fn effective_scope(requested: &[String], allowlist: &[String]) -> Scope {

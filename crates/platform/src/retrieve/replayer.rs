@@ -169,6 +169,21 @@ pub async fn replay(
     })
 }
 
+/// Wrap a (parser-validated) SELECT as a row-capped subquery.
+///
+/// The user query is placed on its own line and the `LIMIT` suffix on a fresh
+/// line. This is load-bearing for the row cap: if the suffix were appended on
+/// the same line, a trailing `--` line comment in the user query would comment
+/// out the `LIMIT`, defeating the cap and letting an unbounded result set buffer
+/// into memory (OOM). With the newline, a `--` only comments to end-of-line and
+/// can't reach the suffix; a trailing *unterminated* block comment instead makes
+/// the whole statement invalid, so Postgres rejects it. Combined with
+/// `is_safe_select` (rejects multi-statement) and the `READ ONLY` txn, the cap
+/// can no longer be bypassed by comment injection.
+fn wrap_select_with_cap(cleaned: &str, probe_limit: u64) -> String {
+    format!("SELECT * FROM (\n{cleaned}\n) AS __retrieval_outer LIMIT {probe_limit}")
+}
+
 /// Execute a single SQL SELECT op and stream rows into the materializer.
 /// Returns `(rows_written, rowcount)`.
 ///
@@ -208,7 +223,7 @@ async fn execute_sql_op(
     // Wrap as a subquery so an existing LIMIT in the user query is respected
     // while still allowing us to detect cap exceedance at the DB level.
     let probe_limit = row_cap.saturating_add(1);
-    let limited = format!("SELECT * FROM ( {cleaned} ) AS __retrieval_outer LIMIT {probe_limit}");
+    let limited = wrap_select_with_cap(cleaned, probe_limit);
 
     let rows = tx.query(&limited, &[]).await.map_err(|e| {
         ApiError::BadRequest(format!("SQL execution failed: {e}"))
@@ -289,4 +304,34 @@ fn pg_value_to_json(row: &tokio_postgres::Row, col: &str) -> serde_json::Value {
         return v;
     }
     serde_json::Value::Null
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_select_with_cap;
+
+    /// A trailing `--` line comment in the user query must NOT be able to
+    /// comment out the injected `LIMIT` (row-cap bypass → unbounded buffering).
+    #[test]
+    fn cap_survives_trailing_line_comment() {
+        let w = wrap_select_with_cap("SELECT * FROM big_table) t --", 1000);
+        let last_line = w.lines().last().unwrap();
+        assert!(
+            last_line.contains("LIMIT 1000"),
+            "LIMIT must live on its own line, uncommentable; got: {w}"
+        );
+        assert!(
+            !last_line.trim_start().starts_with("--"),
+            "suffix line must not be inside a comment; got: {w}"
+        );
+    }
+
+    /// A normal query is wrapped with the cap intact.
+    #[test]
+    fn cap_wraps_plain_select() {
+        let w = wrap_select_with_cap("SELECT id FROM t", 50);
+        assert!(w.contains("SELECT id FROM t"));
+        assert!(w.trim_end().ends_with("LIMIT 50"));
+        assert!(w.contains("__retrieval_outer"));
+    }
 }

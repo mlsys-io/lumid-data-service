@@ -100,14 +100,32 @@ pub fn is_safe_select(query: &str) -> bool {
         return false;
     }
     let stmt = non_empty[0].trim();
-    if !stmt.starts_with("select") {
+    // Allow read-only CTEs (`WITH cte AS (...) SELECT ...`) in addition to a
+    // bare `SELECT`. A *data-modifying* CTE necessarily contains an
+    // insert/update/delete keyword (caught below) and is rejected anyway by the
+    // `READ ONLY` transaction at execution time — so admitting a leading `with`
+    // is safe and avoids rejecting the most common analytical query shape.
+    let starts_ok = is_word_prefix(stmt, "select") || is_word_prefix(stmt, "with");
+    if !starts_ok {
         return false;
     }
-    // Reject if a DML/DDL keyword appears right after `select` as a separate
-    // statement boundary isn't possible (we already ensured one stmt), but
-    // still guard against injected multi-statement via embedded semicolons
-    // inside string literals (best-effort: trust the DB role for the rest).
+    // Reject any DML/DDL keyword anywhere in the (single) statement. This guards
+    // writable CTEs and injected multi-statement via embedded semicolons inside
+    // string literals (best-effort: trust the DB role + READ ONLY txn for the rest).
     !contains_dml_keyword(stmt)
+}
+
+/// True when `stmt` begins with `word` followed by a word boundary (so `selection`
+/// or `withhold` don't count as `select` / `with`).
+fn is_word_prefix(stmt: &str, word: &str) -> bool {
+    match stmt.strip_prefix(word) {
+        Some(rest) => rest
+            .bytes()
+            .next()
+            .map(|b| !b.is_ascii_alphanumeric() && b != b'_')
+            .unwrap_or(true),
+        None => false,
+    }
 }
 
 const FORBIDDEN_KEYWORDS: &[&str] = &[
@@ -214,6 +232,34 @@ mod tests {
         assert!(is_safe_select("SELECT * FROM foo"));
         assert!(is_safe_select("  select id, name from bar where x = 1  "));
         assert!(is_safe_select("SELECT 1;"));
+    }
+
+    #[test]
+    fn safe_select_accepts_read_only_cte() {
+        assert!(is_safe_select(
+            "WITH recent AS (SELECT id FROM t WHERE x > 1) SELECT * FROM recent"
+        ));
+        assert!(is_safe_select(
+            "  with a as (select 1), b as (select 2) select * from a, b  "
+        ));
+    }
+
+    #[test]
+    fn safe_select_rejects_writable_cte() {
+        // Data-modifying CTEs still contain a forbidden keyword → rejected.
+        assert!(!is_safe_select(
+            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"
+        ));
+        assert!(!is_safe_select(
+            "WITH i AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM i"
+        ));
+    }
+
+    #[test]
+    fn safe_select_rejects_lookalike_prefixes() {
+        // `withhold` / `selection` must not be treated as `with` / `select` starts.
+        assert!(!is_safe_select("withhold tax FROM t"));
+        assert!(!is_safe_select("selection FROM t"));
     }
 
     #[test]

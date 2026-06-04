@@ -131,7 +131,9 @@ fn csv_escape(v: &serde_json::Value) -> String {
         serde_json::Value::String(s) => s.clone(),
         other => serde_json::to_string(other).unwrap_or_default(),
     };
-    if s.contains(',') || s.contains('"') || s.contains('\n') {
+    // Quote on `\r` as well as `\n`: a bare CR can otherwise be read as a row
+    // terminator by strict RFC-4180 parsers and corrupt row boundaries.
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
         s
@@ -207,6 +209,12 @@ mod tests {
     fn csv_escape_commas() {
         let v = serde_json::Value::String("a,b".to_string());
         assert_eq!(csv_escape(&v), "\"a,b\"");
+    }
+
+    #[test]
+    fn csv_escape_carriage_return() {
+        let v = serde_json::Value::String("a\rb".to_string());
+        assert_eq!(csv_escape(&v), "\"a\rb\"");
     }
 
     #[test]
