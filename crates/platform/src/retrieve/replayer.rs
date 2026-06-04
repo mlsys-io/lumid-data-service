@@ -61,6 +61,7 @@ pub async fn replay(
                     &sql_op.query,
                     stmt_timeout_ms,
                     row_cap,
+                    &st.settings.retrieval_db_role,
                     &mut materializer,
                 )
                 .await?;
@@ -184,6 +185,14 @@ fn wrap_select_with_cap(cleaned: &str, probe_limit: u64) -> String {
     format!("SELECT * FROM (\n{cleaned}\n) AS __retrieval_outer LIMIT {probe_limit}")
 }
 
+/// Quote an identifier for safe interpolation into SQL (e.g. a role name from
+/// config): wrap in double quotes and double any embedded double quotes. Mirrors
+/// Postgres `quote_ident`. Guards against a malformed/hostile `retrieval_db_role`
+/// breaking out of the `SET LOCAL ROLE` statement.
+fn quote_pg_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
 /// Execute a single SQL SELECT op and stream rows into the materializer.
 /// Returns `(rows_written, rowcount)`.
 ///
@@ -199,6 +208,7 @@ async fn execute_sql_op(
     query: &str,
     stmt_timeout_ms: u32,
     row_cap: u64,
+    db_role: &str,
     mat: &mut Materializer,
 ) -> ApiResult<(i64, i64)> {
     let mut client = pool.get().await?;
@@ -208,15 +218,25 @@ async fn execute_sql_op(
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("begin transaction: {e}")))?;
 
-    // READ ONLY enforces non-mutation at the DB level — a writable CTE
-    // (WITH t AS (DELETE ... RETURNING ...) SELECT ...) is rejected by Postgres
-    // even if the statement parser is bypassed. Defense-in-depth beyond the
-    // SELECT-only check in `plan::is_safe_select`.
-    tx.batch_execute(&format!(
+    // Configure the read txn. Order matters: SET TRANSACTION READ ONLY must
+    // precede any query.
+    // - READ ONLY blocks all mutation at the DB level — a writable CTE
+    //   (WITH t AS (DELETE ... RETURNING ...) SELECT ...) is rejected by Postgres
+    //   even if the statement parser is bypassed.
+    // - SET LOCAL ROLE (when `db_role` is configured) de-escalates privileges for
+    //   THIS transaction only, so retrieval SELECTs run as a NOSUPERUSER read-only
+    //   role even though the shared pool may connect as a write/superuser role.
+    //   Reverts automatically at txn end. The connecting role must be a member of
+    //   `db_role` (a superuser always is). Both are SET-scoped — no pool leakage.
+    let mut setup = format!(
         "SET TRANSACTION READ ONLY; SET LOCAL statement_timeout = {stmt_timeout_ms}"
-    ))
-    .await
-    .map_err(|e| ApiError::Internal(anyhow::anyhow!("configure read txn: {e}")))?;
+    );
+    if !db_role.trim().is_empty() {
+        setup.push_str(&format!("; SET LOCAL ROLE {}", quote_pg_ident(db_role.trim())));
+    }
+    tx.batch_execute(&setup)
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("configure read txn: {e}")))?;
 
     let cleaned = query.trim_end().trim_end_matches(';').trim_end();
 
@@ -333,5 +353,16 @@ mod tests {
         assert!(w.contains("SELECT id FROM t"));
         assert!(w.trim_end().ends_with("LIMIT 50"));
         assert!(w.contains("__retrieval_outer"));
+    }
+
+    #[test]
+    fn quote_ident_escapes_double_quotes() {
+        use super::quote_pg_ident;
+        assert_eq!(quote_pg_ident("lumid_reader"), "\"lumid_reader\"");
+        // A hostile role name can't break out of SET LOCAL ROLE "...".
+        assert_eq!(
+            quote_pg_ident("a\"; DROP ROLE x; --"),
+            "\"a\"\"; DROP ROLE x; --\""
+        );
     }
 }

@@ -133,6 +133,16 @@ pub struct Settings {
     pub retrieval_prefix: String,
     /// Number of sample values to include per column in schema cards. Default 5.
     pub retrieval_sample_rows: usize,
+    /// Optional Postgres role the retrieval SQL path de-escalates to via
+    /// `SET LOCAL ROLE` inside its `READ ONLY` transaction. The platform shares
+    /// one connection pool for reads, retrieval, ingest, and admin DDL — so the
+    /// pool role itself often has write/DDL (and, in many deployments, is a
+    /// superuser). Setting this to a NOSUPERUSER read-only role (e.g. one granted
+    /// only `pg_read_all_data`, or scoped per-schema SELECT) confines just the
+    /// retrieval/agent SELECTs: it removes the superuser file-read vector
+    /// (`pg_read_file`) and makes `user_schemas` a real access boundary when the
+    /// role's grants match it. Empty (default) = no `SET ROLE` (current behavior).
+    pub retrieval_db_role: String,
 }
 
 impl Settings {
@@ -214,6 +224,7 @@ impl Settings {
             retrieval_row_cap: env_u64("RETRIEVAL_ROW_CAP", 1_000_000),
             retrieval_prefix: env_str("RETRIEVAL_PREFIX", "retrievals"),
             retrieval_sample_rows: env_u32("RETRIEVAL_SAMPLE_ROWS", 5) as usize,
+            retrieval_db_role: env_str("RETRIEVAL_DB_ROLE", ""),
         }
     }
 }

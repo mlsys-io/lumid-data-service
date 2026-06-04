@@ -112,7 +112,17 @@ pub fn is_safe_select(query: &str) -> bool {
     // Reject any DML/DDL keyword anywhere in the (single) statement. This guards
     // writable CTEs and injected multi-statement via embedded semicolons inside
     // string literals (best-effort: trust the DB role + READ ONLY txn for the rest).
-    !contains_dml_keyword(stmt)
+    if contains_dml_keyword(stmt) {
+        return false;
+    }
+    // Reject superuser-only read primitives + sensitive catalogs. These are
+    // SELECT-shaped (so the checks above miss them) and the `READ ONLY` txn does
+    // NOT block reads — a superuser pool could otherwise exfiltrate host files
+    // (`pg_read_file`) or credential hashes (`pg_authid`). Defense-in-depth that
+    // matters most when the pool role is NOT de-escalated via `retrieval_db_role`
+    // (see replayer). Word-boundary matched, so `pg_authid` ≠ a column called
+    // `pg_authid_note`.
+    !contains_dangerous_read(stmt)
 }
 
 /// True when `stmt` begins with `word` followed by a word boundary (so `selection`
@@ -133,26 +143,47 @@ const FORBIDDEN_KEYWORDS: &[&str] = &[
     "truncate", "grant", "revoke", "call", "execute",
 ];
 
+/// Superuser-only read functions + sensitive system catalogs/views. SELECT-shaped,
+/// so the DML scan and `READ ONLY` txn don't catch them. Lower-case, matched on
+/// word boundaries.
+const FORBIDDEN_READ_TOKENS: &[&str] = &[
+    // Filesystem / server-side read primitives (superuser / pg_read_server_files).
+    "pg_read_file", "pg_read_binary_file", "pg_stat_file",
+    "pg_ls_dir", "pg_ls_logdir", "pg_ls_waldir", "pg_ls_tmpdir", "pg_ls_archive_statusdir",
+    // Large objects (can read server files via lo_import).
+    "lo_import", "lo_export", "lo_get",
+    // Outbound connections.
+    "dblink", "dblink_connect",
+    // Credential / secret-bearing catalogs.
+    "pg_authid", "pg_shadow", "pg_user_mappings", "pg_user_mapping", "pg_largeobject",
+];
+
 fn contains_dml_keyword(lowered_stmt: &str) -> bool {
-    for kw in FORBIDDEN_KEYWORDS {
-        // Check for keyword as a word boundary (space or start).
-        if let Some(pos) = lowered_stmt.find(kw) {
-            let before = if pos == 0 {
-                true
-            } else {
-                let ch = lowered_stmt.as_bytes()[pos - 1];
-                !ch.is_ascii_alphanumeric() && ch != b'_'
-            };
-            let after_pos = pos + kw.len();
-            let after = if after_pos >= lowered_stmt.len() {
-                true
-            } else {
-                let ch = lowered_stmt.as_bytes()[after_pos];
-                !ch.is_ascii_alphanumeric() && ch != b'_'
-            };
-            if before && after {
-                return true;
-            }
+    FORBIDDEN_KEYWORDS.iter().any(|kw| word_present(lowered_stmt, kw))
+}
+
+fn contains_dangerous_read(lowered_stmt: &str) -> bool {
+    FORBIDDEN_READ_TOKENS.iter().any(|kw| word_present(lowered_stmt, kw))
+}
+
+/// True if `word` appears in `lowered_stmt` at least once delimited by word
+/// boundaries (start/end or a non-`[A-Za-z0-9_]` char on each side). Scans every
+/// occurrence — not just the first — so a non-boundary hit early in the string
+/// doesn't mask a real one later (e.g. `xcopy ...; copy`).
+fn word_present(lowered_stmt: &str, word: &str) -> bool {
+    let bytes = lowered_stmt.as_bytes();
+    for (pos, _) in lowered_stmt.match_indices(word) {
+        let before = pos == 0 || {
+            let ch = bytes[pos - 1];
+            !ch.is_ascii_alphanumeric() && ch != b'_'
+        };
+        let after_pos = pos + word.len();
+        let after = after_pos >= bytes.len() || {
+            let ch = bytes[after_pos];
+            !ch.is_ascii_alphanumeric() && ch != b'_'
+        };
+        if before && after {
+            return true;
         }
     }
     false
@@ -260,6 +291,26 @@ mod tests {
         // `withhold` / `selection` must not be treated as `with` / `select` starts.
         assert!(!is_safe_select("withhold tax FROM t"));
         assert!(!is_safe_select("selection FROM t"));
+    }
+
+    #[test]
+    fn safe_select_rejects_dangerous_read_primitives() {
+        // Superuser file/secret reads are SELECT-shaped but must be rejected.
+        assert!(!is_safe_select("SELECT pg_read_file('/etc/passwd')"));
+        assert!(!is_safe_select("SELECT pg_read_binary_file('/etc/shadow')"));
+        assert!(!is_safe_select("SELECT * FROM pg_ls_dir('/')"));
+        assert!(!is_safe_select("SELECT rolpassword FROM pg_authid"));
+        assert!(!is_safe_select("SELECT * FROM pg_shadow"));
+        assert!(!is_safe_select("select lo_import('/etc/passwd')"));
+        assert!(!is_safe_select("SELECT dblink('...', 'select 1')"));
+    }
+
+    #[test]
+    fn safe_select_allows_lookalike_identifiers() {
+        // Word-boundary matching: a column whose name merely contains a token
+        // must not be rejected.
+        assert!(is_safe_select("SELECT pg_authid_note FROM app.t"));
+        assert!(is_safe_select("SELECT my_copy_count FROM app.t"));
     }
 
     #[test]
