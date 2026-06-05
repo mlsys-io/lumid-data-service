@@ -88,6 +88,17 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
     // Realtime SSE/WebSocket routes are app-contributed (the platform names no
     // such path) — see `extra_paths` below.
 
+    // --- Query cost profiling (EXPLAIN-based, no ANALYZE) ---
+    add(
+        "/profile",
+        "post",
+        "Query cost profile",
+        vec![],
+        "EXPLAIN-based query cost estimates for one or more planner-variant plans. \
+         Returns raw_cost, estimated_rows, and relation/index footprints per variant. \
+         The query is never executed (no ANALYZE). Same safety boundary as POST /retrieve.",
+    );
+
     // --- MCP + own usage ---
     add("/mcp", "post", "MCP JSON-RPC", vec![], "Model Context Protocol (JSON-RPC 2.0, Streamable-HTTP). One tool per read endpoint; tools/list + tools/call.");
     add("/usage/me", "get", "Your usage", vec![], "Calling identity's totals: total_calls, bytes_out, calls_last_24h, hourly_last_24h.");

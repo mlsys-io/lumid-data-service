@@ -30,6 +30,31 @@ The same `retrieve::replayer::replay` engine is also exposed without the LLM at
 `POST /retrieve` (gated, auth-required). Clients that already know the SQL or
 storage key can skip the agent loop entirely and get a deterministic `RetrievalResult`.
 
+## Query cost profiling endpoint
+
+`POST /profile` (gated, auth-required) returns EXPLAIN-based cost estimates for a
+SQL query across one or more planner-variant GUC sets. The query is **never executed**
+(plain EXPLAIN, no ANALYZE). Response feeds the HALO cost model in lumilake.
+
+```
+POST /profile
+{ "sql": "SELECT ...",
+  "plans": [{"plan_id": "default", "settings": {}},
+            {"plan_id": "prefer_index", "settings": {"enable_seqscan": "off"}}] }
+
+→ { "variants": [{"plan_id": "default", "raw_cost": 1234.56,
+                   "estimated_rows": 1000,
+                   "footprints": {"public.t": 450, "idx_x": 60},
+                   "explain_json": {...}}] }
+```
+
+Identical safety boundary as `/retrieve`:
+- `retrieve::plan::is_safe_select` rejects non-SELECT SQL.
+- `SET TRANSACTION READ ONLY` at the DB level.
+- `SET LOCAL statement_timeout` and optional `SET LOCAL ROLE` from config.
+- GUC keys restricted to `enable_*` planner toggles (explicit allowlist); values
+  restricted to `"on"` / `"off"`. Anything else is rejected 400.
+
 ## Wire protocol
 
 ```

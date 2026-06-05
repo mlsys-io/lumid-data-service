@@ -78,6 +78,11 @@ pub fn build_router(
         // Direct SQL/storage retrieval — no LLM; same safety boundary as replay_retrieval_plan.
         .route("/retrieve", post(handlers::retrieve::post_retrieve))
 
+        // EXPLAIN-based query cost estimation — feeds the HALO cost model in lumilake.
+        // Same safety boundary as /retrieve: SELECT-only parser, READ ONLY txn,
+        // statement timeout, optional db role. EXPLAIN is plain (no ANALYZE).
+        .route("/profile", post(handlers::profile::post_profile))
+
         // Blob serving (read side). The generic `/blobs/*key` is platform-owned;
         // any domain-named compatibility alias (e.g. a legacy `/storage/...` URL)
         // is app-contributed via `ServeParts.ext_routes` → `blobs::legacy_storage_alias`.

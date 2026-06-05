@@ -8,6 +8,7 @@ pub mod health;
 pub mod ingest;
 pub mod landing;
 pub mod llm;
+pub mod profile;
 pub mod retrieve;
 pub mod sse_quotes;
 pub mod usage;
