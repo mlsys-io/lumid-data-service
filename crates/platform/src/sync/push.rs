@@ -41,6 +41,26 @@ fn default_wm() -> String {
     "ingest_ts".to_string()
 }
 
+/// Strip the server-stamped columns from a record body. The inbox's ingest
+/// plane sets these server-side and **rejects** any record that carries one
+/// (422 "field '<col>' is set server-side"); they ride in the batch envelope /
+/// are re-derived on ingest. Uses the single-source-of-truth
+/// [`crate::validation::SERVER_STAMPED_COLS`] so the strip set can never drift
+/// from the validator's reject set (notably it includes `id` — every table with
+/// an `id bigint` PK would otherwise have every record rejected — and excludes
+/// `raw`, which the validator accepts, so the synced copy keeps its `raw`).
+fn strip_server_side_cols(rec: &Value) -> Value {
+    use crate::validation::SERVER_STAMPED_COLS;
+    match rec {
+        Value::Object(map) => {
+            let mut m = map.clone();
+            m.retain(|k, _| !SERVER_STAMPED_COLS.contains(k.as_str()));
+            Value::Object(m)
+        }
+        other => other.clone(),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct PushReq {
     pub schema: String,
@@ -194,7 +214,7 @@ pub async fn run_push(
         "SELECT to_jsonb(t) AS row, t.{wm} AS wm, t.ctid::text AS rk FROM {schema}.{table} t \
          WHERE ($1::timestamptz IS NULL \
                 OR t.{wm} > $1::timestamptz \
-                OR (t.{wm} = $1::timestamptz AND t.ctid > $2::tid)) \
+                OR (t.{wm} = $1::timestamptz AND t.ctid > $2::text::tid)) \
          ORDER BY t.{wm} ASC, t.ctid ASC LIMIT $3",
         wm = wm_col,
         schema = schema,
@@ -205,6 +225,13 @@ pub async fn run_push(
     let mut total = 0i64;
 
     loop {
+        // Param-type inference note: `$1::timestamptz` makes Postgres infer $1 as
+        // timestamptz (bind DateTime<Utc> — fine). The ctid tiebreaker uses
+        // `$2::text::tid`, NOT `$2::tid`: a bare `$2::tid` makes Postgres infer $2
+        // as `tid`, and binding the `String` ctid there fails with "error
+        // serializing parameter". Routing through `::text` infers $2 as text
+        // (String binds cleanly) and the chained `::tid` restores proper tid
+        // ordering for the keyset comparison.
         let rows = client
             .query(&select_sql, &[&cur_wm, &cur_key, &batch_rows])
             .await
@@ -232,16 +259,25 @@ pub async fn run_push(
         }
 
         for (run_id_str, group) in groups {
+            // Lineage is read from the raw row (which carries the provenance
+            // columns) BEFORE stripping.
             let (src, src_ep, run_id) = lineage_of(&group[0])?;
             let preamble = build_preamble(&client, &run_id).await?;
-            let batch_id = deterministic_batch_id(&peer, schema, table, &run_id_str, &group);
+            // The platform-filled provenance columns (source, source_endpoint,
+            // source_run_id, ingest_ts, raw) are server-side: the inbox's ingest
+            // plane REJECTS records that carry them (422 "field 'source' is set
+            // server-side"). They ride in the batch envelope above, so strip them
+            // from each record body. Strip before hashing so the batch_id matches
+            // exactly what's sent.
+            let clean: Vec<Value> = group.iter().map(strip_server_side_cols).collect();
+            let batch_id = deterministic_batch_id(&peer, schema, table, &run_id_str, &clean);
             let body = json!({
                 "batch_id": batch_id,
                 "source": src,
                 "source_endpoint": src_ep,
                 "source_run_id": run_id,
                 "provenance": preamble,
-                "records": group,
+                "records": clean,
             });
 
             match post_with_retry(st, &url, &token, &peer, &body).await {
