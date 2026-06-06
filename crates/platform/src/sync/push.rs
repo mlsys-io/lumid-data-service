@@ -281,10 +281,35 @@ pub async fn run_push(
             });
 
             match post_with_retry(st, &url, &token, &peer, &body).await {
-                Ok(failed) if failed > 0 => {
-                    tracing::warn!(
-                        "sync push {schema}.{table}: target rejected {failed} record(s) in batch {batch_id}"
-                    );
+                Ok(apply) if apply.rejected() > 0 => {
+                    // A per-record reject is DETERMINISTIC — the same row pushed
+                    // again alone won't pass validation, so retrying buys nothing.
+                    // Treating it as a clean push (advancing the cursor past these
+                    // rows) would silently drop them forever. Stop loud instead:
+                    // do NOT advance the cursor past this page, surface the reject
+                    // so the operator can fix the schema mismatch and re-push (the
+                    // deterministic batch_id makes the re-push idempotent).
+                    let detail = apply.reject_detail(batch_id);
+                    tracing::warn!("sync push {schema}.{table}: {detail}");
+                    save_cursor(
+                        &client,
+                        &target,
+                        schema,
+                        table,
+                        cur_wm,
+                        cur_key.clone(),
+                        total,
+                        &format!("partial: {detail}"),
+                    )
+                    .await?;
+                    return Ok(PushSummary {
+                        schema: schema.into(),
+                        table: table.into(),
+                        batches,
+                        rows_pushed: total,
+                        status: "partial".into(),
+                        last_error: Some(detail),
+                    });
                 }
                 Ok(_) => {}
                 Err(msg) => {
@@ -402,16 +427,80 @@ fn deterministic_batch_id(
     Uuid::from_bytes(bytes)
 }
 
-/// POST a batch with bounded exponential-backoff retry. `Ok(failed)` on a 2xx
-/// ACK (`failed` = records the target rejected at validation, 0 on a clean
-/// batch); `Err(msg)` once attempts are exhausted.
+/// Parsed `/sync/apply` ACK body. The inbox returns a per-batch apply summary;
+/// we care about how many records it rejected at validation so a partial reject
+/// can be surfaced as a hard push failure (rather than silently skipped).
+#[derive(Debug, Default, Clone)]
+struct ApplyAck {
+    /// Records the target rejected at validation (0 on a clean batch). The inbox
+    /// names this `failed`; older shapes used `rejected` — accept either.
+    failed: i64,
+    /// First reject reason, if the body carries one — surfaced in `last_error`.
+    sample_reason: Option<String>,
+}
+
+impl ApplyAck {
+    /// Extract the reject count + a sample reason from a 2xx ACK body.
+    fn from_value(ack: &Value) -> Self {
+        let failed = ack
+            .get("failed")
+            .or_else(|| ack.get("rejected"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        // Look for a sample reason under a few plausible shapes the inbox uses:
+        // `errors[0].reason` / `errors[0]` (string) / `rejects[0].reason` / `error`.
+        let sample_reason = ack
+            .get("errors")
+            .or_else(|| ack.get("rejects"))
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|e| {
+                e.get("reason")
+                    .and_then(|r| r.as_str())
+                    .or_else(|| e.as_str())
+                    .map(|s| s.to_string())
+            })
+            .or_else(|| ack.get("error").and_then(|v| v.as_str()).map(|s| s.to_string()));
+        ApplyAck { failed, sample_reason }
+    }
+
+    fn rejected(&self) -> i64 {
+        self.failed
+    }
+
+    /// Human-readable detail for a partial-reject push, used in logs +
+    /// `PushSummary.last_error` so the operator sees count + a sample reason.
+    fn reject_detail(&self, batch_id: Uuid) -> String {
+        match &self.sample_reason {
+            Some(r) => format!(
+                "target rejected {} record(s) in batch {batch_id}: {}",
+                self.failed,
+                r.chars().take(200).collect::<String>()
+            ),
+            None => format!("target rejected {} record(s) in batch {batch_id}", self.failed),
+        }
+    }
+}
+
+/// Classify a single non-success HTTP response into retry-vs-fail. A
+/// DETERMINISTIC 4xx (422 schema mismatch, 400, 401, …) will never succeed on
+/// retry, so it fast-fails; only 5xx is treated as transient and retried.
+/// Pure (no I/O) so it can be unit-tested without a live server.
+fn should_retry_status(code: u16) -> bool {
+    (500..600).contains(&code)
+}
+
+/// POST a batch with bounded exponential-backoff retry. `Ok(ApplyAck)` on a 2xx
+/// ACK (carries the reject count + a sample reason; 0 on a clean batch);
+/// `Err(msg)` on a deterministic 4xx (no retry) or once retries are exhausted on
+/// transient classes (5xx + transport/timeout/connection errors).
 async fn post_with_retry(
     st: &AppState,
     url: &str,
     token: &str,
     peer: &str,
     body: &Value,
-) -> Result<i64, String> {
+) -> Result<ApplyAck, String> {
     let max = st.settings.sync_max_attempts.max(1);
     let mut attempt = 0u32;
     loop {
@@ -423,20 +512,20 @@ async fn post_with_retry(
         match rb.send().await {
             Ok(resp) if resp.status().is_success() => {
                 let ack: Value = resp.json().await.unwrap_or(Value::Null);
-                let failed = ack.get("failed").and_then(|v| v.as_i64()).unwrap_or(0);
-                return Ok(failed);
+                return Ok(ApplyAck::from_value(&ack));
             }
             Ok(resp) => {
                 let code = resp.status().as_u16();
                 let txt = resp.text().await.unwrap_or_default();
-                if attempt >= max {
-                    return Err(format!(
-                        "target HTTP {code}: {}",
-                        txt.chars().take(200).collect::<String>()
-                    ));
+                let msg = format!("target HTTP {code}: {}", txt.chars().take(200).collect::<String>());
+                // Fast-fail deterministic 4xx — retrying just burns
+                // max_attempts × backoff for a response that can never succeed.
+                if !should_retry_status(code) || attempt >= max {
+                    return Err(msg);
                 }
             }
             Err(e) => {
+                // Transport/timeout/connection errors are genuinely transient.
                 if attempt >= max {
                     return Err(format!("send error: {e}"));
                 }
@@ -552,5 +641,106 @@ mod tests {
     fn lineage_of_rejects_missing_run() {
         let rec = json!({"source": "fmp", "source_endpoint": "x"});
         assert!(lineage_of(&rec).is_err());
+    }
+
+    // --- Bug 1: retry classification (4xx fast-fails, 5xx retries) ---
+
+    #[test]
+    fn retry_only_on_5xx_not_4xx() {
+        // Deterministic 4xx → never retry (would just burn backoff).
+        assert!(!should_retry_status(400), "400 must fast-fail");
+        assert!(!should_retry_status(401), "401 must fast-fail");
+        assert!(!should_retry_status(404), "404 must fast-fail");
+        assert!(!should_retry_status(422), "422 schema-mismatch must fast-fail");
+        assert!(!should_retry_status(429), "429 is 4xx, fast-fail (no retry budget)");
+        // Transient 5xx → retry.
+        assert!(should_retry_status(500), "500 is transient, retry");
+        assert!(should_retry_status(502), "502 is transient, retry");
+        assert!(should_retry_status(503), "503 is transient, retry");
+        // Boundaries: 3xx is not in the 5xx band; 600 is out of range.
+        assert!(!should_retry_status(399));
+        assert!(!should_retry_status(499));
+        assert!(!should_retry_status(600));
+    }
+
+    /// Mirrors `post_with_retry`'s attempt-loop control flow over a fixed
+    /// sequence of response status codes, so we can assert exactly how many
+    /// attempts a given outcome class costs WITHOUT a live HTTP server. Returns
+    /// `(attempts_made, succeeded)`.
+    fn simulate_attempts(statuses: &[u16], max: u32) -> (u32, bool) {
+        let max = max.max(1);
+        let mut attempt = 0u32;
+        loop {
+            let code = statuses.get((attempt) as usize).copied().unwrap_or(503);
+            attempt += 1;
+            if (200..300).contains(&code) {
+                return (attempt, true);
+            }
+            if !should_retry_status(code) || attempt >= max {
+                return (attempt, false);
+            }
+        }
+    }
+
+    #[test]
+    fn deterministic_4xx_fast_fails_in_one_attempt() {
+        // A 422 with plenty of retry budget still stops after the first attempt.
+        let (attempts, ok) = simulate_attempts(&[422], 5);
+        assert_eq!(attempts, 1, "4xx must not consume more than one attempt");
+        assert!(!ok);
+    }
+
+    #[test]
+    fn transient_5xx_retries_up_to_max() {
+        // Persistent 5xx burns the whole retry budget, then fails.
+        let (attempts, ok) = simulate_attempts(&[503, 503, 503, 503, 503], 4);
+        assert_eq!(attempts, 4, "5xx retries up to max_attempts");
+        assert!(!ok);
+        // A 5xx that recovers on the 3rd attempt succeeds without exhausting.
+        let (attempts, ok) = simulate_attempts(&[500, 502, 200], 5);
+        assert_eq!(attempts, 3);
+        assert!(ok);
+    }
+
+    // --- Bug 2: partial reject is a hard failure, clean push advances ---
+
+    #[test]
+    fn apply_ack_clean_response_has_no_rejects() {
+        let ack = ApplyAck::from_value(&json!({"applied": 10, "failed": 0}));
+        assert_eq!(ack.rejected(), 0, "clean push: status stays ok, cursor advances");
+        assert!(ack.sample_reason.is_none());
+
+        // Missing/absent fields default to a clean ACK (byte-equivalent to today).
+        let ack = ApplyAck::from_value(&json!({"applied": 10}));
+        assert_eq!(ack.rejected(), 0);
+        let ack = ApplyAck::from_value(&Value::Null);
+        assert_eq!(ack.rejected(), 0);
+    }
+
+    #[test]
+    fn apply_ack_partial_reject_is_surfaced() {
+        // Per-record reject → non-zero count drives the "partial" hard-failure
+        // path in run_push (cursor NOT advanced, status != "ok").
+        let ack = ApplyAck::from_value(&json!({
+            "applied": 8,
+            "failed": 2,
+            "errors": [{"reason": "field 'symbol' is required"}]
+        }));
+        assert_eq!(ack.rejected(), 2);
+        let detail = ack.reject_detail(Uuid::nil());
+        assert!(detail.contains("rejected 2 record(s)"), "detail has count: {detail}");
+        assert!(detail.contains("field 'symbol' is required"), "detail has reason: {detail}");
+
+        // Legacy `rejected` field name is accepted too.
+        let ack = ApplyAck::from_value(&json!({"rejected": 1}));
+        assert_eq!(ack.rejected(), 1);
+
+        // Reason can be a bare string in the array, or a top-level `error`.
+        let ack = ApplyAck::from_value(&json!({"failed": 1, "rejects": ["bad row 5"]}));
+        assert_eq!(ack.rejected(), 1);
+        assert!(ack.reject_detail(Uuid::nil()).contains("bad row 5"));
+
+        let ack = ApplyAck::from_value(&json!({"failed": 1, "error": "schema mismatch"}));
+        assert!(ack.reject_detail(Uuid::nil()).contains("schema mismatch"));
     }
 }
