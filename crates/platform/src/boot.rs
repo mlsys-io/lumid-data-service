@@ -18,6 +18,7 @@ use axum::Router;
 use tracing_subscriber::EnvFilter;
 
 use crate::realtime::upstream::UpstreamWorker;
+use crate::retrieve::card_store::CardStore;
 use crate::{app, auth, config, db, mcp, read, realtime, state};
 
 /// The only app-specific inputs: compiled ext routes + realtime workers.
@@ -48,6 +49,11 @@ pub struct ServeParts {
     /// `LUMID_LLM_BACKEND_URL`). The capability lives in the platform; only
     /// the decision to expose it is the app's.
     pub enable_llm: bool,
+    /// Enable the agent tool-use loop (`POST /agent/v1`). Requires `enable_llm`
+    /// to also be `true` — the loop calls the `/v1/chat/completions` proxy.
+    /// `serve()` returns an error at startup when `enable_agent=true` but
+    /// `enable_llm=false`.
+    pub enable_agent: bool,
     /// Enable the generic data-push plane: the inbox (`POST /sync/apply/...`) +
     /// admin push routes, and create the `sync` bookkeeping tables at boot. Off
     /// by default. A target (inbox) must enable this; a pure producer that only
@@ -65,14 +71,30 @@ impl Default for ServeParts {
             feed_liveness: None,
             workers: Vec::new(),
             enable_llm: false,
+            enable_agent: false,
             enable_sync: false,
         }
     }
 }
 
+/// Validate `ServeParts` for incompatible flag combinations.
+///
+/// Extracted so tests can call this without spinning up a full server.
+/// Returns an error when `enable_agent=true` but `enable_llm=false`.
+pub fn check_serve_parts(parts: &ServeParts) -> anyhow::Result<()> {
+    if parts.enable_agent && !parts.enable_llm {
+        anyhow::bail!(
+            "enable_agent requires enable_llm to be true \
+             (the agent loop calls the /v1/* proxy)"
+        );
+    }
+    Ok(())
+}
+
 /// Boot + serve until shutdown. Reads `LUMID_*` from env, incl.
 /// `LUMID_READ_CONFIG` for the read specs (default `read.toml`).
 pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
+    check_serve_parts(&parts)?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
@@ -199,9 +221,15 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         }
     }
 
+    let card_store = std::sync::Arc::new(CardStore::new(
+        pool.clone(),
+        settings.retrieval_card_ttl_s,
+        settings.retrieval_sample_rows,
+    ));
+
     let state = state::AppState {
         pool, settings, lumid, local_keys, rate, redis, redis_client, hub, http, read_cache, blob_store, backends,
-        feed_liveness,
+        feed_liveness, card_store,
     };
 
     // Auto-MCP: one tool per declarative read endpoint, merged into ext routes.
@@ -211,6 +239,10 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     if parts.enable_llm {
         ext_router = ext_router.merge(crate::llm::routes());
         tracing::info!("llm proxy enabled (/v1/*)");
+    }
+    if parts.enable_agent {
+        ext_router = ext_router.merge(crate::agent::routes());
+        tracing::info!("agent tool-use loop enabled (POST /agent/v1)");
     }
     if parts.enable_sync {
         // Inbox batches can exceed axum's 2 MB default; bound to the same limit

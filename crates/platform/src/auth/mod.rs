@@ -113,6 +113,7 @@ async fn resolve_identity(
             role: "local".to_string(),
             email: None,
             active: true,
+            scopes: Vec::new(),
         }));
     }
     match st.lumid.introspect(&token).await {
@@ -143,6 +144,7 @@ pub async fn resolve_bearer(
             role: "local".to_string(),
             email: None,
             active: true,
+            scopes: Vec::new(),
         }));
     }
     match st.lumid.introspect(token).await {
