@@ -20,6 +20,7 @@ pub struct Identity {
     pub role: String,
     pub email: Option<String>,
     pub active: bool,
+    pub scopes: Vec<String>,
 }
 
 /// Distinguishes "rejected" (cache & return None → 401) from "unreachable"
@@ -39,6 +40,8 @@ struct IntrospectData {
     email: Option<String>,
     #[serde(default)]
     active: bool,
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -53,6 +56,8 @@ struct IntrospectBody {
     email: Option<String>,
     #[serde(default)]
     active: bool,
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
 }
 
 pub struct LumidClient {
@@ -126,9 +131,9 @@ impl LumidClient {
             Ok(b) => b,
             Err(_) => return Ok(None),
         };
-        let (sub, role, email, active) = match body.data {
-            Some(d) => (d.sub, d.role, d.email, d.active),
-            None => (body.sub, body.role, body.email, body.active),
+        let (sub, role, email, active, scopes) = match body.data {
+            Some(d) => (d.sub, d.role, d.email, d.active, d.scopes),
+            None => (body.sub, body.role, body.email, body.active, body.scopes),
         };
         if !active {
             self.cache.insert(key, None).await;
@@ -139,6 +144,7 @@ impl LumidClient {
             role: role.unwrap_or_else(|| "user".to_string()),
             email,
             active: true,
+            scopes: scopes.unwrap_or_default(),
         };
         self.cache.insert(key, Some(ident.clone())).await;
         Ok(Some(ident))

@@ -1,8 +1,13 @@
-//! Unit tests for blob-listing helpers.
+//! Unit tests for blob-listing helpers and the KV write-plane guards.
 //!
 //! All tests run in-memory; no live object store required.
 
-use lumid_platform::handlers::blobs::{clamp_limit, is_hidden_key, is_hidden_prefix, sanitize_prefix, ListParams};
+use lumid_platform::auth::Identity;
+use lumid_platform::error::ApiError;
+use lumid_platform::handlers::blobs::{
+    clamp_limit, is_hidden_key, is_hidden_prefix, require_blob_write, sanitize_blob_key,
+    sanitize_prefix, ListParams,
+};
 
 // ── clamp_limit ───────────────────────────────────────────────────────────────
 
@@ -183,4 +188,110 @@ fn hidden_prefix_deeply_nested_is_hidden() {
 fn hidden_prefix_sibling_with_hyphen_not_hidden() {
     // Segment-boundary check: "retrievals-archive/" must NOT be hidden.
     assert!(!is_hidden_prefix("retrievals-archive/", "retrievals"));
+}
+
+// ── sanitize_blob_key — traversal rejection (the put_blob / delete_blob guard) ─
+
+#[test]
+fn sanitize_blob_key_rejects_parent_traversal() {
+    assert!(matches!(sanitize_blob_key("../etc/passwd"), Err(ApiError::BadRequest(_))));
+}
+
+#[test]
+fn sanitize_blob_key_rejects_double_dot_segment() {
+    assert!(matches!(sanitize_blob_key("jobs/../../secrets"), Err(ApiError::BadRequest(_))));
+}
+
+#[test]
+fn sanitize_blob_key_rejects_absolute_path() {
+    assert!(matches!(sanitize_blob_key("/etc/passwd"), Err(ApiError::BadRequest(_))));
+}
+
+#[test]
+fn sanitize_blob_key_rejects_empty_key() {
+    assert!(matches!(sanitize_blob_key(""), Err(ApiError::BadRequest(_))));
+}
+
+#[test]
+fn sanitize_blob_key_accepts_valid_nested_key() {
+    let key = sanitize_blob_key("jobs/abc-123/record.json").expect("valid nested key accepted");
+    assert_eq!(key, "jobs/abc-123/record.json");
+}
+
+// ── require_blob_write — PUT/DELETE gate: scope-based, not role-based ─────────
+
+fn make_identity(role: &str) -> Identity {
+    Identity {
+        sub: format!("test:{role}"),
+        role: role.to_string(),
+        email: None,
+        active: true,
+        scopes: Vec::new(),
+    }
+}
+
+fn make_scoped_identity(scopes: &[&str]) -> Identity {
+    Identity {
+        sub: "test:user".to_string(),
+        role: "user".to_string(),
+        email: None,
+        active: true,
+        scopes: scopes.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+#[test]
+fn require_blob_write_allows_lumilake_write_scope() {
+    require_blob_write(&make_scoped_identity(&["lumilake:write"])).expect("lumilake:write scope allowed");
+}
+
+#[test]
+fn require_blob_write_allows_admin_scope_lumilake_star() {
+    require_blob_write(&make_scoped_identity(&["lumilake:*"])).expect("lumilake:* admin scope allowed");
+}
+
+#[test]
+fn require_blob_write_allows_admin_scope_lumilake_admin() {
+    require_blob_write(&make_scoped_identity(&["lumilake:admin"])).expect("lumilake:admin scope allowed");
+}
+
+#[test]
+fn require_blob_write_allows_wildcard_scope() {
+    require_blob_write(&make_scoped_identity(&["*"])).expect("'*' wildcard scope allowed");
+}
+
+#[test]
+fn require_blob_write_allows_local_role_without_scopes() {
+    // Local API key: role="local", no scopes — must bypass the scope check entirely.
+    require_blob_write(&make_identity("local")).expect("local key allowed");
+}
+
+#[test]
+fn require_blob_write_rejects_unrelated_scope_only() {
+    // A PAT with only non-lumilake scopes must be denied.
+    assert!(matches!(
+        require_blob_write(&make_scoped_identity(&["flowmesh:results:write"])),
+        Err(ApiError::Forbidden(_))
+    ));
+}
+
+#[test]
+fn require_blob_write_rejects_user_with_no_scopes() {
+    // A regular authed reader (no scopes) must NOT be able to write/delete blobs.
+    assert!(matches!(
+        require_blob_write(&make_identity("user")),
+        Err(ApiError::Forbidden(_))
+    ));
+}
+
+// ── archive-prefix visibility — "jobs/" must survive the retrieval-output filter ─
+
+#[test]
+fn jobs_key_not_hidden_by_retrieval_filter() {
+    assert!(!is_hidden_key("jobs/abc/record.json", "retrievals"));
+}
+
+#[test]
+fn jobs_common_prefix_not_hidden_by_retrieval_filter() {
+    assert!(!is_hidden_prefix("jobs/", "retrievals"));
 }

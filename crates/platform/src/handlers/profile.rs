@@ -65,6 +65,9 @@ pub struct ProfileResponse {
 
 // ── GUC allowlist ─────────────────────────────────────────────────────────────
 
+/// Maximum number of plan variants accepted in a single `/profile` request.
+const MAX_PROFILE_PLANS: usize = 32;
+
 /// Allowed planner-toggle GUC names. Only `enable_*` planner booleans are
 /// permitted; arbitrary `SET LOCAL` injection is rejected with 400.
 const ALLOWED_GUC_KEYS: &[&str] = &[
@@ -137,6 +140,12 @@ pub fn parse_profile_request(body: &Value) -> ApiResult<ProfileRequest> {
                 return Err(ApiError::BadRequest(
                     "'plans' must have at least one entry".into(),
                 ));
+            }
+            if arr.len() > MAX_PROFILE_PLANS {
+                return Err(ApiError::BadRequest(format!(
+                    "'plans' must have at most {MAX_PROFILE_PLANS} entries; got {}",
+                    arr.len()
+                )));
             }
             let mut parsed: Vec<PlanVariant> = Vec::with_capacity(arr.len());
             for (i, item) in arr.iter().enumerate() {
@@ -547,6 +556,30 @@ mod tests {
         });
         let req = parse_profile_request(&body).unwrap();
         assert_eq!(req.plans.len(), 4);
+    }
+
+    #[test]
+    fn parse_request_exactly_max_plans_accepted() {
+        let plans: Vec<_> = (0..MAX_PROFILE_PLANS)
+            .map(|i| json!({"plan_id": format!("p{i}"), "settings": {}}))
+            .collect();
+        let body = json!({"sql": "SELECT 1", "plans": plans});
+        let req = parse_profile_request(&body).unwrap();
+        assert_eq!(req.plans.len(), MAX_PROFILE_PLANS);
+    }
+
+    #[test]
+    fn parse_request_too_many_plans_returns_error() {
+        let plans: Vec<_> = (0..=MAX_PROFILE_PLANS)
+            .map(|i| json!({"plan_id": format!("p{i}"), "settings": {}}))
+            .collect();
+        let body = json!({"sql": "SELECT 1", "plans": plans});
+        let err = parse_profile_request(&body).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("at most") && msg.contains("32"),
+            "error must mention 32-entry cap; got: {msg}"
+        );
     }
 
     // ── EXPLAIN JSON parsing ──────────────────────────────────────────────────

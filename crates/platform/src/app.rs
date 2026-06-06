@@ -86,9 +86,9 @@ pub fn build_router(
         // Blob serving (read side). The generic `/blobs/*key` is platform-owned;
         // any domain-named compatibility alias (e.g. a legacy `/storage/...` URL)
         // is app-contributed via `ServeParts.ext_routes` → `blobs::legacy_storage_alias`.
-        // Exact `/blobs` (list) and wildcard `/blobs/*key` (fetch) coexist in axum.
+        // Exact `/blobs` (list) here; wildcard `/blobs/*key` (fetch/write/delete) is
+        // merged below with a body limit — coexists with this exact route in axum.
         .route("/blobs", get(handlers::blobs::list_blobs))
-        .route("/blobs/*key", get(handlers::blobs::serve_blob))
 
         // Realtime SSE routes (gated) are app-contributed via `ServeParts.ext_routes`
         // — the platform exposes the generic `sse_quotes::quotes_stream` handler
@@ -103,6 +103,19 @@ pub fn build_router(
                 .route("/ingest/:schema/:table/file", post(handlers::ingest::post_file))
                 .route("/ingest/blob", post(handlers::ingest::post_blob))
                 .layer(axum::extract::DefaultBodyLimit::max(state.settings.ingest_max_bytes as usize)),
+        )
+        // Blob fetch/write/delete by key — bounded body limit (PUT bodies need
+        // more than axum's 2 MB default; capped at blob_max_bytes). PUT/DELETE are
+        // privileged (lumilake:write scope / local key); GET serves bytes (no body limit effect).
+        .merge(
+            Router::new()
+                .route(
+                    "/blobs/*key",
+                    get(handlers::blobs::serve_blob)
+                        .put(handlers::blobs::put_blob)
+                        .delete(handlers::blobs::delete_blob),
+                )
+                .layer(axum::extract::DefaultBodyLimit::max(state.settings.blob_max_bytes as usize)),
         )
         .merge(read_router)
         .merge(ext_router)

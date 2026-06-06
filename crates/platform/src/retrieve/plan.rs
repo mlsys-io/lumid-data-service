@@ -156,6 +156,16 @@ const FORBIDDEN_READ_TOKENS: &[&str] = &[
     "dblink", "dblink_connect",
     // Credential / secret-bearing catalogs.
     "pg_authid", "pg_shadow", "pg_user_mappings", "pg_user_mapping", "pg_largeobject",
+    // DoS via blocking.
+    "pg_sleep", "pg_sleep_for", "pg_sleep_until",
+    // Session advisory locks (survive txn rollback → poison the pooled connection).
+    "pg_advisory_lock", "pg_advisory_lock_shared",
+    "pg_try_advisory_lock", "pg_try_advisory_lock_shared",
+    "pg_advisory_unlock", "pg_advisory_unlock_shared", "pg_advisory_unlock_all",
+    "pg_advisory_xact_lock", "pg_advisory_xact_lock_shared",
+    "pg_try_advisory_xact_lock", "pg_try_advisory_xact_lock_shared",
+    // Backend / server control (defense-in-depth; NOSUPERUSER blocks them anyway).
+    "pg_terminate_backend", "pg_cancel_backend", "pg_reload_conf", "pg_rotate_logfile",
 ];
 
 fn contains_dml_keyword(lowered_stmt: &str) -> bool {
@@ -303,6 +313,47 @@ mod tests {
         assert!(!is_safe_select("SELECT * FROM pg_shadow"));
         assert!(!is_safe_select("select lo_import('/etc/passwd')"));
         assert!(!is_safe_select("SELECT dblink('...', 'select 1')"));
+    }
+
+    #[test]
+    fn safe_select_rejects_dos_sleep_functions() {
+        assert!(!is_safe_select("SELECT pg_sleep(10)"));
+        assert!(!is_safe_select("SELECT pg_sleep_for('5 seconds')"));
+        assert!(!is_safe_select("SELECT pg_sleep_until('2030-01-01')"));
+    }
+
+    #[test]
+    fn safe_select_rejects_advisory_lock_functions() {
+        assert!(!is_safe_select("SELECT pg_advisory_lock(1)"));
+        assert!(!is_safe_select("SELECT pg_advisory_lock_shared(1)"));
+        assert!(!is_safe_select("SELECT pg_try_advisory_lock(1)"));
+        assert!(!is_safe_select("SELECT pg_try_advisory_lock_shared(1)"));
+        assert!(!is_safe_select("SELECT pg_advisory_unlock(1)"));
+        assert!(!is_safe_select("SELECT pg_advisory_unlock_shared(1)"));
+        assert!(!is_safe_select("SELECT pg_advisory_unlock_all()"));
+        assert!(!is_safe_select("SELECT pg_advisory_xact_lock(1)"));
+        assert!(!is_safe_select("SELECT pg_advisory_xact_lock_shared(1)"));
+        assert!(!is_safe_select("SELECT pg_try_advisory_xact_lock(1)"));
+        assert!(!is_safe_select("SELECT pg_try_advisory_xact_lock_shared(1)"));
+    }
+
+    #[test]
+    fn safe_select_rejects_backend_control_functions() {
+        assert!(!is_safe_select("SELECT pg_terminate_backend(123)"));
+        assert!(!is_safe_select("SELECT pg_cancel_backend(123)"));
+        assert!(!is_safe_select("SELECT pg_reload_conf()"));
+        assert!(!is_safe_select("SELECT pg_rotate_logfile()"));
+    }
+
+    #[test]
+    fn safe_select_still_accepts_normal_queries() {
+        // Plain column query must not be affected by the new denylist entries.
+        assert!(is_safe_select("SELECT col FROM schema.tbl WHERE id = 1"));
+        // Read-only CTE must still be accepted.
+        assert!(is_safe_select(
+            "WITH recent AS (SELECT id, ts FROM events WHERE ts > NOW() - INTERVAL '1 day') \
+             SELECT * FROM recent ORDER BY ts DESC LIMIT 100"
+        ));
     }
 
     #[test]

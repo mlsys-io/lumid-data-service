@@ -20,11 +20,12 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use futures_util::TryStreamExt;
-use object_store::{path::Path as ObjPath, Error as ObjError};
+use object_store::{path::Path as ObjPath, Error as ObjError, PutPayload};
 use serde::{Deserialize, Serialize};
 
+use crate::auth::Identity;
 use crate::error::{ApiError, ApiResult};
 use crate::queries::blobs as q;
 use crate::state::AppState;
@@ -259,6 +260,81 @@ pub async fn serve_blob(
     )
         .into_response();
     Ok(resp)
+}
+
+// ── write side (privileged) ────────────────────────────────────────────────
+
+const ADMIN_SCOPES: &[&str] = &["*", "lumilake:*", "lumilake:admin"];
+
+/// Require the `lumilake:write` scope (or an admin scope / local API key).
+/// Exposed `pub` so tests can exercise the guard directly.
+pub fn require_blob_write(identity: &Identity) -> ApiResult<()> {
+    if identity.role == "local" { return Ok(()); }
+    if identity.scopes.iter().any(|s| s == "lumilake:write" || ADMIN_SCOPES.contains(&s.as_str())) { return Ok(()); }
+    Err(ApiError::Forbidden("lumilake:write scope required".into()))
+}
+
+#[derive(Serialize)]
+pub struct PutBlobResponse {
+    pub key: String,
+    pub size: usize,
+}
+
+/// PUT /blobs/{key:path}
+///   Write (overwrite) bytes at a caller-chosen key. Privileged: the
+///   `lumilake:write` scope (or an admin scope / local API key). Sanitizes the
+///   key (400 on traversal), caps the body at `settings.ingest_max_bytes`, then
+///   writes to the object store. No `raw.blobs` DB row — the archive reads bytes
+///   back directly by key.
+pub async fn put_blob(
+    State(st): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(key): Path<String>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<PutBlobResponse>> {
+    require_blob_write(&identity)?;
+    if st.settings.blob_root.is_empty() {
+        return Err(ApiError::Unavailable("blob storage not configured".into()));
+    }
+    let key = sanitize_key(&key).ok_or_else(|| ApiError::BadRequest("invalid key".into()))?;
+
+    let size = body.len();
+    if (size as u64) > st.settings.blob_max_bytes {
+        return Err(ApiError::BadRequest(format!(
+            "body too large ({size} > {} bytes)",
+            st.settings.blob_max_bytes
+        )));
+    }
+
+    st.blob_store
+        .put(&ObjPath::from(key.as_str()), PutPayload::from(body))
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("blob put: {e}")))?;
+    Ok(Json(PutBlobResponse { key, size }))
+}
+
+/// DELETE /blobs/{key:path}
+///   Delete the object at a caller-chosen key. Privileged: the `lumilake:write`
+///   scope (or an admin scope / local API key). Idempotent — an already-absent
+///   key is success. 204 No Content.
+pub async fn delete_blob(
+    State(st): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Path(key): Path<String>,
+) -> ApiResult<StatusCode> {
+    require_blob_write(&identity)?;
+    if st.settings.blob_root.is_empty() {
+        return Err(ApiError::Unavailable("blob storage not configured".into()));
+    }
+    let key = sanitize_key(&key).ok_or_else(|| ApiError::BadRequest("invalid key".into()))?;
+
+    match st.blob_store.delete(&ObjPath::from(key.as_str())).await {
+        Ok(_) => {}
+        // Idempotent: a missing key is success.
+        Err(ObjError::NotFound { .. }) => {}
+        Err(e) => return Err(ApiError::Internal(anyhow::anyhow!("blob delete: {e}"))),
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Back-compat alias → 302 redirect to `/blobs/{path}`.

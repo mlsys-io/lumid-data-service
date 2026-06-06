@@ -99,6 +99,25 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
          The query is never executed (no ANALYZE). Same safety boundary as POST /retrieve.",
     );
 
+    // --- Blob KV write plane (privileged: lumilake:write scope / local key) ---
+    add(
+        "/blobs/{key}",
+        "put",
+        "Write blob at key",
+        vec![p("key", "path", true)],
+        "Write (overwrite) the request body bytes to the object store at the caller-supplied key \
+         (path-style, may contain '/', e.g. jobs/<id>/record.json). Body capped at blob_max_bytes. \
+         Requires the `lumilake:write` scope (or an admin scope / local API key). Returns {\"key\", \"size\"}.",
+    );
+    add(
+        "/blobs/{key}",
+        "delete",
+        "Delete blob at key",
+        vec![p("key", "path", true)],
+        "Delete the object at the caller-supplied key (path-style, may contain '/'). Idempotent: \
+         already-absent keys succeed. Returns 204 No Content. Requires the `lumilake:write` scope (or an admin scope / local API key).",
+    );
+
     // --- MCP + own usage ---
     add("/mcp", "post", "MCP JSON-RPC", vec![], "Model Context Protocol (JSON-RPC 2.0, Streamable-HTTP). One tool per read endpoint; tools/list + tools/call.");
     add("/usage/me", "get", "Your usage", vec![], "Calling identity's totals: total_calls, bytes_out, calls_last_24h, hourly_last_24h.");

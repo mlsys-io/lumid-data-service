@@ -127,9 +127,10 @@ storage backend (no `s3://`, no bucket name); `access_chain` steps carry `key` b
 `retrieve::plan`):
 
 - **SELECT-only parser** (`plan::is_safe_select`): strips comments, requires a single statement
-  starting with `select`, and rejects DML/DDL keywords (`insert/update/delete/merge/copy/
-  create/drop/alter/truncate/grant/revoke/call/execute`). A leading `WITH` is rejected, so
-  writable CTEs cannot slip through.
+  starting with `select` or `with` (read-only CTEs — `WITH … SELECT` — are permitted), and
+  rejects DML/DDL keywords (`insert/update/delete/merge/copy/create/drop/alter/truncate/grant/
+  revoke/call/execute`). Writable CTEs (`INSERT`/`UPDATE`/`DELETE` inside the CTE body) are
+  rejected by the DML keyword scan; the `READ ONLY` transaction is the backstop.
 - **READ ONLY transaction**: each SELECT runs inside `BEGIN; SET TRANSACTION READ ONLY; SET
   LOCAL statement_timeout = …` so Postgres itself rejects any write (defense beyond the parser)
   and the statement timeout actually binds to the query's transaction.
