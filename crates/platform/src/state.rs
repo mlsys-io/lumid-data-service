@@ -8,6 +8,7 @@ use deadpool_postgres::Pool;
 use crate::auth::lumid::LumidClient;
 use crate::auth::ratelimit::RateLimiter;
 use crate::config::Settings;
+use crate::retrieve::card_store::CardStore;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -36,4 +37,6 @@ pub struct AppState {
     /// App-provided `/status` feed-liveness policy (grouping + expected-live).
     /// Defaults to `realtime`-group, always-expected-live.
     pub feed_liveness: Arc<dyn crate::realtime::FeedLiveness>,
+    /// In-process TTL cache for schema cards (built by the retrieval pipeline).
+    pub card_store: Arc<CardStore>,
 }

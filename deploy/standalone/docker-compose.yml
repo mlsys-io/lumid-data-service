@@ -24,6 +24,7 @@ services:
     volumes:
       - ./data/pgdata:/home/postgres/pgdata/data
       - ./schema.sql:/docker-entrypoint-initdb.d/10_schema.sql:ro   # runs once on fresh pgdata
+      - ./reader_role.sql:/docker-entrypoint-initdb.d/20_reader_role.sql:ro  # read-only role for retrieval SELECTs
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d ${DB_NAME:-appdb}"]
       interval: 5s
@@ -84,6 +85,10 @@ services:
       LUMID_DB_USER: postgres
       LUMID_DB_PASSWORD: ${DB_PASSWORD}
       LUMID_DB_NAME: ${DB_NAME:-appdb}
+      # Retrieval/agent SELECTs de-escalate to this NOSUPERUSER read-only role
+      # (created by reader_role.sql) via SET LOCAL ROLE. Blank → run with the
+      # pool's full privileges (no de-escalation). See reader_role.sql.
+      LUMID_RETRIEVAL_DB_ROLE: ${RETRIEVAL_DB_ROLE:-lumid_reader}
       LUMID_REDIS_URL: redis://redis:6379
       # Blobs → the in-folder MinIO (object storage stays inside the bundle).
       LUMID_BLOB_BACKEND: s3
