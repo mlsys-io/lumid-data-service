@@ -263,12 +263,12 @@ pub async fn run_push(
             // columns) BEFORE stripping.
             let (src, src_ep, run_id) = lineage_of(&group[0])?;
             let preamble = build_preamble(&client, &run_id).await?;
-            // The platform-filled provenance columns (source, source_endpoint,
-            // source_run_id, ingest_ts, raw) are server-side: the inbox's ingest
-            // plane REJECTS records that carry them (422 "field 'source' is set
-            // server-side"). They ride in the batch envelope above, so strip them
-            // from each record body. Strip before hashing so the batch_id matches
-            // exactly what's sent.
+            // The server-stamped columns (source, source_endpoint, source_run_id,
+            // ingest_ts, id) are set server-side: the inbox's ingest plane REJECTS
+            // records that carry them (422 "field 'source' is set server-side").
+            // They ride in the batch envelope above, so strip them from each record
+            // body. `raw` is NOT stripped — the validator accepts it, so the synced
+            // copy keeps it. Strip before hashing so the batch_id matches what's sent.
             let clean: Vec<Value> = group.iter().map(strip_server_side_cols).collect();
             let batch_id = deterministic_batch_id(&peer, schema, table, &run_id_str, &clean);
             let body = json!({
@@ -505,6 +505,32 @@ mod tests {
         // different content → different id
         let g2 = vec![json!({"id": 1, "v": "a"}), json!({"id": 3, "v": "c"})];
         assert_ne!(a, deterministic_batch_id("p", "market", "dividends", "run-1", &g2));
+    }
+
+    #[test]
+    fn strip_removes_server_cols_keeps_raw_and_data() {
+        let rec = json!({
+            "source": "fmp", "source_endpoint": "stable/x",
+            "source_run_id": "11111111-1111-1111-1111-111111111111",
+            "ingest_ts": "2026-01-01T00:00:00Z", "id": 42,
+            "raw": {"k": "v"}, "symbol": "AAPL", "val": 1.5
+        });
+        let out = strip_server_side_cols(&rec);
+        let m = out.as_object().unwrap();
+        // server-stamped cols rejected by the validator are stripped...
+        for k in ["source", "source_endpoint", "source_run_id", "ingest_ts", "id"] {
+            assert!(!m.contains_key(k), "{k} should be stripped");
+        }
+        // ...but `raw` (validator-accepted) and real data are kept.
+        assert_eq!(m.get("raw"), Some(&json!({"k": "v"})), "raw must be preserved");
+        assert_eq!(m.get("symbol"), Some(&json!("AAPL")));
+        assert_eq!(m.get("val"), Some(&json!(1.5)));
+    }
+
+    #[test]
+    fn strip_passes_through_non_objects() {
+        assert_eq!(strip_server_side_cols(&json!("scalar")), json!("scalar"));
+        assert_eq!(strip_server_side_cols(&json!([1, 2])), json!([1, 2]));
     }
 
     #[test]
