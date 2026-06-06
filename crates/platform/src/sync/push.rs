@@ -41,6 +41,26 @@ fn default_wm() -> String {
     "ingest_ts".to_string()
 }
 
+/// Strip the server-stamped columns from a record body. The inbox's ingest
+/// plane sets these server-side and **rejects** any record that carries one
+/// (422 "field '<col>' is set server-side"); they ride in the batch envelope /
+/// are re-derived on ingest. Uses the single-source-of-truth
+/// [`crate::validation::SERVER_STAMPED_COLS`] so the strip set can never drift
+/// from the validator's reject set (notably it includes `id` — every table with
+/// an `id bigint` PK would otherwise have every record rejected — and excludes
+/// `raw`, which the validator accepts, so the synced copy keeps its `raw`).
+fn strip_server_side_cols(rec: &Value) -> Value {
+    use crate::validation::SERVER_STAMPED_COLS;
+    match rec {
+        Value::Object(map) => {
+            let mut m = map.clone();
+            m.retain(|k, _| !SERVER_STAMPED_COLS.contains(k.as_str()));
+            Value::Object(m)
+        }
+        other => other.clone(),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct PushReq {
     pub schema: String,
@@ -194,7 +214,7 @@ pub async fn run_push(
         "SELECT to_jsonb(t) AS row, t.{wm} AS wm, t.ctid::text AS rk FROM {schema}.{table} t \
          WHERE ($1::timestamptz IS NULL \
                 OR t.{wm} > $1::timestamptz \
-                OR (t.{wm} = $1::timestamptz AND t.ctid > $2::tid)) \
+                OR (t.{wm} = $1::timestamptz AND t.ctid > $2::text::tid)) \
          ORDER BY t.{wm} ASC, t.ctid ASC LIMIT $3",
         wm = wm_col,
         schema = schema,
@@ -205,6 +225,13 @@ pub async fn run_push(
     let mut total = 0i64;
 
     loop {
+        // Param-type inference note: `$1::timestamptz` makes Postgres infer $1 as
+        // timestamptz (bind DateTime<Utc> — fine). The ctid tiebreaker uses
+        // `$2::text::tid`, NOT `$2::tid`: a bare `$2::tid` makes Postgres infer $2
+        // as `tid`, and binding the `String` ctid there fails with "error
+        // serializing parameter". Routing through `::text` infers $2 as text
+        // (String binds cleanly) and the chained `::tid` restores proper tid
+        // ordering for the keyset comparison.
         let rows = client
             .query(&select_sql, &[&cur_wm, &cur_key, &batch_rows])
             .await
@@ -232,16 +259,25 @@ pub async fn run_push(
         }
 
         for (run_id_str, group) in groups {
+            // Lineage is read from the raw row (which carries the provenance
+            // columns) BEFORE stripping.
             let (src, src_ep, run_id) = lineage_of(&group[0])?;
             let preamble = build_preamble(&client, &run_id).await?;
-            let batch_id = deterministic_batch_id(&peer, schema, table, &run_id_str, &group);
+            // The server-stamped columns (source, source_endpoint, source_run_id,
+            // ingest_ts, id) are set server-side: the inbox's ingest plane REJECTS
+            // records that carry them (422 "field 'source' is set server-side").
+            // They ride in the batch envelope above, so strip them from each record
+            // body. `raw` is NOT stripped — the validator accepts it, so the synced
+            // copy keeps it. Strip before hashing so the batch_id matches what's sent.
+            let clean: Vec<Value> = group.iter().map(strip_server_side_cols).collect();
+            let batch_id = deterministic_batch_id(&peer, schema, table, &run_id_str, &clean);
             let body = json!({
                 "batch_id": batch_id,
                 "source": src,
                 "source_endpoint": src_ep,
                 "source_run_id": run_id,
                 "provenance": preamble,
-                "records": group,
+                "records": clean,
             });
 
             match post_with_retry(st, &url, &token, &peer, &body).await {
@@ -469,6 +505,32 @@ mod tests {
         // different content → different id
         let g2 = vec![json!({"id": 1, "v": "a"}), json!({"id": 3, "v": "c"})];
         assert_ne!(a, deterministic_batch_id("p", "market", "dividends", "run-1", &g2));
+    }
+
+    #[test]
+    fn strip_removes_server_cols_keeps_raw_and_data() {
+        let rec = json!({
+            "source": "fmp", "source_endpoint": "stable/x",
+            "source_run_id": "11111111-1111-1111-1111-111111111111",
+            "ingest_ts": "2026-01-01T00:00:00Z", "id": 42,
+            "raw": {"k": "v"}, "symbol": "AAPL", "val": 1.5
+        });
+        let out = strip_server_side_cols(&rec);
+        let m = out.as_object().unwrap();
+        // server-stamped cols rejected by the validator are stripped...
+        for k in ["source", "source_endpoint", "source_run_id", "ingest_ts", "id"] {
+            assert!(!m.contains_key(k), "{k} should be stripped");
+        }
+        // ...but `raw` (validator-accepted) and real data are kept.
+        assert_eq!(m.get("raw"), Some(&json!({"k": "v"})), "raw must be preserved");
+        assert_eq!(m.get("symbol"), Some(&json!("AAPL")));
+        assert_eq!(m.get("val"), Some(&json!(1.5)));
+    }
+
+    #[test]
+    fn strip_passes_through_non_objects() {
+        assert_eq!(strip_server_side_cols(&json!("scalar")), json!("scalar"));
+        assert_eq!(strip_server_side_cols(&json!([1, 2])), json!([1, 2]));
     }
 
     #[test]
