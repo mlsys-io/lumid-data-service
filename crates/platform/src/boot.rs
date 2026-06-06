@@ -54,6 +54,11 @@ pub struct ServeParts {
     /// `serve()` returns an error at startup when `enable_agent=true` but
     /// `enable_llm=false`.
     pub enable_agent: bool,
+    /// Enable the generic data-push plane: the inbox (`POST /sync/apply/...`) +
+    /// admin push routes, and create the `sync` bookkeeping tables at boot. Off
+    /// by default. A target (inbox) must enable this; a pure producer that only
+    /// uses the push helper can also enable it to expose `/admin/sync/*`.
+    pub enable_sync: bool,
 }
 
 impl Default for ServeParts {
@@ -67,6 +72,7 @@ impl Default for ServeParts {
             workers: Vec::new(),
             enable_llm: false,
             enable_agent: false,
+            enable_sync: false,
         }
     }
 }
@@ -201,6 +207,20 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         .feed_liveness
         .unwrap_or_else(|| Arc::new(realtime::DefaultFeedLiveness));
 
+    // Data-push plane: create the `sync` bookkeeping tables (idempotent) when
+    // enabled. A target that can't migrate its inbox shouldn't start.
+    if parts.enable_sync {
+        crate::sync::migrate(&pool).await?;
+        if settings.sync_target_url.is_empty() {
+            tracing::info!("sync: inbox enabled (/sync/apply); no push target configured");
+        } else {
+            tracing::info!(
+                "sync: inbox + push enabled (target {})",
+                settings.sync_target_url
+            );
+        }
+    }
+
     let card_store = std::sync::Arc::new(CardStore::new(
         pool.clone(),
         settings.retrieval_card_ttl_s,
@@ -223,6 +243,15 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     if parts.enable_agent {
         ext_router = ext_router.merge(crate::agent::routes());
         tracing::info!("agent tool-use loop enabled (POST /agent/v1)");
+    }
+    if parts.enable_sync {
+        // Inbox batches can exceed axum's 2 MB default; bound to the same limit
+        // as the ingest write plane.
+        ext_router = ext_router.merge(
+            crate::sync::routes()
+                .layer(axum::extract::DefaultBodyLimit::max(state.settings.ingest_max_bytes as usize)),
+        );
+        tracing::info!("sync plane enabled (POST /sync/apply, /admin/sync/*)");
     }
 
     let read_router = read::exec::build_router(&specs);

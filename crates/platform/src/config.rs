@@ -143,6 +143,26 @@ pub struct Settings {
     /// (`pg_read_file`) and makes `user_schemas` a real access boundary when the
     /// role's grants match it. Empty (default) = no `SET ROLE` (current behavior).
     pub retrieval_db_role: String,
+
+    // Data-push / sync plane (generic). `enable_sync` (ServeParts) mounts the
+    // inbox + admin routes; these knobs drive the optional push helper and the
+    // inbox peer gate. Empty `sync_target_url` ⇒ the push helper is a no-op.
+    /// Target instance base URL the push helper POSTs to (no trailing slash).
+    pub sync_target_url: String,
+    /// Bearer token presented to the target's `/sync/apply` (a local key on the
+    /// target labelled `sync:<peer>`).
+    pub sync_target_token: String,
+    /// This instance's peer id, sent as `X-Lumid-Sync-Peer` by the push helper.
+    pub sync_peer_id: String,
+    /// Inbox allowlist: local-key labels (without the `local:` prefix) permitted
+    /// to call `/sync/apply`. Empty ⇒ any label starting with `sync:` is allowed.
+    pub sync_peer_labels: Vec<String>,
+    /// Rows per push batch (push helper). Default 1000.
+    pub sync_batch_rows: u64,
+    /// Max delivery attempts before the push helper gives up a batch. Default 5.
+    pub sync_max_attempts: u32,
+    /// Base backoff (ms) for push retries; doubles per attempt. Default 500.
+    pub sync_backoff_ms: u64,
 }
 
 impl Settings {
@@ -225,6 +245,17 @@ impl Settings {
             retrieval_prefix: env_str("RETRIEVAL_PREFIX", "retrievals"),
             retrieval_sample_rows: env_u32("RETRIEVAL_SAMPLE_ROWS", 5) as usize,
             retrieval_db_role: env_str("RETRIEVAL_DB_ROLE", ""),
+            sync_target_url: env_str("SYNC_TARGET_URL", "").trim_end_matches('/').to_string(),
+            sync_target_token: env_str("SYNC_TARGET_TOKEN", ""),
+            sync_peer_id: env_str("SYNC_PEER_ID", ""),
+            sync_peer_labels: env_str("SYNC_PEER_LABELS", "")
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            sync_batch_rows: env_u64("SYNC_BATCH_ROWS", 1000),
+            sync_max_attempts: env_u32("SYNC_MAX_ATTEMPTS", 5),
+            sync_backoff_ms: env_u64("SYNC_BACKOFF_MS", 500),
         }
     }
 }

@@ -25,6 +25,7 @@ pub mod read;
 pub mod realtime;
 pub mod retrieve;
 pub mod state;
+pub mod sync;
 pub mod validation;
 pub mod write;
 

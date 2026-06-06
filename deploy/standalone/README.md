@@ -90,5 +90,11 @@ Reads serve whatever is in the DB. Load it however you like:
   backend alongside Postgres (`LUMID_CLICKHOUSE_*`, per-table routing via
   `provenance.table_backend`); realtime channel kinds for a bespoke app's workers
   (`LUMID_RT_CHANNEL_KINDS`, default `tick,news`). See the platform README's Config section.
+- **Data-push / sync**: to make this instance a sync **target**, issue the producer a
+  `sync:<peer>` local key (`API_KEYS=...,synctoken:sync:findata`); to make it a **producer**,
+  set `LUMID_SYNC_TARGET_URL`/`_TOKEN`/`LUMID_SYNC_PEER_ID` in the app `environment:`. Both need an
+  app image built with `ServeParts.enable_sync` (the generic `mint` image ships it off). The `sync`
+  bookkeeping tables are created automatically at boot — no DDL to add to `schema.sql`. Full recipe
+  in the platform README's **Data migration / cross-instance sync** section.
 - **First boot only**: `schema.sql` runs only when `./data/pgdata` is empty. To re-init,
   stop and delete `./data/pgdata`. Schema changes after that are manual DDL (`psql`).
