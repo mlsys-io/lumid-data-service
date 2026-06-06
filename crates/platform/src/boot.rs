@@ -48,6 +48,11 @@ pub struct ServeParts {
     /// `LUMID_LLM_BACKEND_URL`). The capability lives in the platform; only
     /// the decision to expose it is the app's.
     pub enable_llm: bool,
+    /// Enable the generic data-push plane: the inbox (`POST /sync/apply/...`) +
+    /// admin push routes, and create the `sync` bookkeeping tables at boot. Off
+    /// by default. A target (inbox) must enable this; a pure producer that only
+    /// uses the push helper can also enable it to expose `/admin/sync/*`.
+    pub enable_sync: bool,
 }
 
 impl Default for ServeParts {
@@ -60,6 +65,7 @@ impl Default for ServeParts {
             feed_liveness: None,
             workers: Vec::new(),
             enable_llm: false,
+            enable_sync: false,
         }
     }
 }
@@ -179,6 +185,20 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         .feed_liveness
         .unwrap_or_else(|| Arc::new(realtime::DefaultFeedLiveness));
 
+    // Data-push plane: create the `sync` bookkeeping tables (idempotent) when
+    // enabled. A target that can't migrate its inbox shouldn't start.
+    if parts.enable_sync {
+        crate::sync::migrate(&pool).await?;
+        if settings.sync_target_url.is_empty() {
+            tracing::info!("sync: inbox enabled (/sync/apply); no push target configured");
+        } else {
+            tracing::info!(
+                "sync: inbox + push enabled (target {})",
+                settings.sync_target_url
+            );
+        }
+    }
+
     let state = state::AppState {
         pool, settings, lumid, local_keys, rate, redis, redis_client, hub, http, read_cache, blob_store, backends,
         feed_liveness,
@@ -191,6 +211,15 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     if parts.enable_llm {
         ext_router = ext_router.merge(crate::llm::routes());
         tracing::info!("llm proxy enabled (/v1/*)");
+    }
+    if parts.enable_sync {
+        // Inbox batches can exceed axum's 2 MB default; bound to the same limit
+        // as the ingest write plane.
+        ext_router = ext_router.merge(
+            crate::sync::routes()
+                .layer(axum::extract::DefaultBodyLimit::max(state.settings.ingest_max_bytes as usize)),
+        );
+        tracing::info!("sync plane enabled (POST /sync/apply, /admin/sync/*)");
     }
 
     let read_router = read::exec::build_router(&specs);

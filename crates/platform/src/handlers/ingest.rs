@@ -553,7 +553,7 @@ pub async fn get_table_schema_json(
 // ---------------------------------------------------------------------------
 // Admin: ACL grant/revoke + cache refresh (super_admin / local only)
 // ---------------------------------------------------------------------------
-fn require_admin(identity: &Identity) -> ApiResult<()> {
+pub(crate) fn require_admin(identity: &Identity) -> ApiResult<()> {
     if identity.role == "super_admin" || identity.role == "local" {
         Ok(())
     } else {

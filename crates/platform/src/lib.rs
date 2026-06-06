@@ -23,6 +23,7 @@ pub mod queries;
 pub mod read;
 pub mod realtime;
 pub mod state;
+pub mod sync;
 pub mod validation;
 pub mod write;
 

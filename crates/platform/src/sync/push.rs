@@ -1,0 +1,494 @@
+//! Optional push helper (Mode 1): drain a local table to a target's inbox.
+//!
+//! Pages rows since a durable per-(target,table) watermark cursor, groups each
+//! page by `source_run_id` so every pushed batch is lineage-homogeneous, ships
+//! each group (with its provenance preamble) to `{target}/sync/apply/...`, and
+//! advances the cursor only after a durable ACK. Runs to completion and returns;
+//! re-running resumes from the cursor and is idempotent at the inbox.
+//!
+//! Producers without a local table (stateless workers) skip this entirely and
+//! POST batches to the inbox directly.
+
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use axum::extract::State;
+use axum::{Extension, Json};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tokio_postgres::Client;
+use uuid::Uuid;
+
+use crate::auth::Identity;
+use crate::error::{ApiError, ApiResult};
+use crate::handlers::ingest::require_admin;
+use crate::state::AppState;
+
+/// SQL-identifier guard for interpolated schema/table/column names.
+fn valid_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn dberr(e: tokio_postgres::Error) -> ApiError {
+    ApiError::Internal(anyhow::anyhow!("{e}"))
+}
+
+fn default_wm() -> String {
+    "ingest_ts".to_string()
+}
+
+#[derive(Deserialize)]
+pub struct PushReq {
+    pub schema: String,
+    pub table: String,
+    /// Timestamp-typed watermark column to page + checkpoint on. Default `ingest_ts`.
+    #[serde(default = "default_wm")]
+    pub watermark_col: String,
+}
+
+#[derive(Serialize)]
+pub struct PushSummary {
+    pub schema: String,
+    pub table: String,
+    pub batches: u64,
+    pub rows_pushed: i64,
+    pub status: String,
+    pub last_error: Option<String>,
+}
+
+/// `POST /admin/sync/push` — drain `schema.table` to the configured target.
+pub async fn admin_push(
+    State(st): State<AppState>,
+    Extension(identity): Extension<Identity>,
+    Json(req): Json<PushReq>,
+) -> ApiResult<Json<PushSummary>> {
+    require_admin(&identity)?;
+    Ok(Json(run_push(&st, &req.schema, &req.table, &req.watermark_col).await?))
+}
+
+/// `GET /admin/sync/status` — per-table push cursors.
+pub async fn admin_status(
+    State(st): State<AppState>,
+    Extension(identity): Extension<Identity>,
+) -> ApiResult<Json<Value>> {
+    require_admin(&identity)?;
+    let client = st.pool.get().await?;
+    let rows = client
+        .query(
+            "SELECT target_url, schema_name, table_name, watermark, rows_pushed, last_result, updated_at \
+             FROM sync.push_cursor ORDER BY updated_at DESC",
+            &[],
+        )
+        .await
+        .map_err(dberr)?;
+    let cursors: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "target_url": r.get::<_, String>("target_url"),
+                "schema": r.get::<_, String>("schema_name"),
+                "table": r.get::<_, String>("table_name"),
+                "watermark": r.get::<_, Option<String>>("watermark"),
+                "rows_pushed": r.get::<_, i64>("rows_pushed"),
+                "last_result": r.get::<_, Option<String>>("last_result"),
+                "updated_at": r.get::<_, DateTime<Utc>>("updated_at").to_rfc3339(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "target_url": st.settings.sync_target_url, "cursors": cursors })))
+}
+
+/// Drain `schema.table` (rows with `wm_col > cursor`) to the target inbox,
+/// grouped by `source_run_id` so each pushed batch is lineage-homogeneous.
+pub async fn run_push(
+    st: &AppState,
+    schema: &str,
+    table: &str,
+    wm_col: &str,
+) -> ApiResult<PushSummary> {
+    if st.settings.sync_target_url.is_empty() {
+        return Err(ApiError::BadRequest("LUMID_SYNC_TARGET_URL not configured".into()));
+    }
+    if !valid_ident(schema) || !valid_ident(table) || !valid_ident(wm_col) {
+        return Err(ApiError::BadRequest("invalid schema/table/watermark identifier".into()));
+    }
+
+    let target = st.settings.sync_target_url.clone();
+    let token = st.settings.sync_target_token.clone();
+    let peer = if st.settings.sync_peer_id.is_empty() {
+        "default".to_string()
+    } else {
+        st.settings.sync_peer_id.clone()
+    };
+    let batch_rows = st.settings.sync_batch_rows as i64;
+    let url = format!("{target}/sync/apply/{schema}/{table}");
+
+    let client = st.pool.get().await?;
+
+    // The watermark column must be timestamp-typed (we cast `$1::timestamptz`
+    // and read it as a DateTime). Validate up front so a wrong/absent column is
+    // a clear 400, not a runtime 500 mid-drain.
+    let wm_type: Option<String> = client
+        .query_opt(
+            "SELECT data_type FROM information_schema.columns \
+             WHERE table_schema=$1 AND table_name=$2 AND column_name=$3",
+            &[&schema, &table, &wm_col],
+        )
+        .await
+        .map_err(dberr)?
+        .map(|r| r.get::<_, String>("data_type"));
+    match wm_type.as_deref() {
+        Some("timestamp with time zone") | Some("timestamp without time zone") => {}
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!(
+                "watermark column {schema}.{table}.{wm_col} is `{other}`, must be a timestamp"
+            )))
+        }
+        None => {
+            return Err(ApiError::BadRequest(format!(
+                "watermark column {schema}.{table}.{wm_col} does not exist"
+            )))
+        }
+    }
+
+    // Keyset cursor: (watermark, ctid). The ctid tiebreaker makes paging total
+    // and unique even when many rows share one watermark timestamp (the common
+    // case — a COPY/merge stamps one `ingest_ts` per batch); strict `>` on the
+    // timestamp alone would silently drop ties that straddle a page boundary.
+    let cur_row = client
+        .query_opt(
+            "SELECT watermark, watermark_key FROM sync.push_cursor \
+             WHERE target_url=$1 AND schema_name=$2 AND table_name=$3",
+            &[&target, &schema, &table],
+        )
+        .await
+        .map_err(dberr)?;
+    let (mut cur_wm, mut cur_key): (Option<DateTime<Utc>>, Option<String>) = match cur_row {
+        None => (None, None),
+        Some(r) => {
+            let wm_text: Option<String> = r.get("watermark");
+            let key: Option<String> = r.get("watermark_key");
+            match wm_text {
+                None => (None, None),
+                Some(s) => {
+                    let parsed = DateTime::parse_from_rfc3339(&s)
+                        .map(|d| d.with_timezone(&Utc))
+                        .map_err(|e| {
+                            // Surface corruption instead of silently resetting to
+                            // NULL (which would re-drain the whole table).
+                            ApiError::Internal(anyhow::anyhow!(
+                                "corrupt push_cursor watermark {s:?}: {e}"
+                            ))
+                        })?;
+                    (Some(parsed), key)
+                }
+            }
+        }
+    };
+
+    let select_sql = format!(
+        "SELECT to_jsonb(t) AS row, t.{wm} AS wm, t.ctid::text AS rk FROM {schema}.{table} t \
+         WHERE ($1::timestamptz IS NULL \
+                OR t.{wm} > $1::timestamptz \
+                OR (t.{wm} = $1::timestamptz AND t.ctid > $2::tid)) \
+         ORDER BY t.{wm} ASC, t.ctid ASC LIMIT $3",
+        wm = wm_col,
+        schema = schema,
+        table = table
+    );
+
+    let mut batches = 0u64;
+    let mut total = 0i64;
+
+    loop {
+        let rows = client
+            .query(&select_sql, &[&cur_wm, &cur_key, &batch_rows])
+            .await
+            .map_err(dberr)?;
+        if rows.is_empty() {
+            break;
+        }
+        let page_wm: DateTime<Utc> = rows.last().unwrap().get("wm");
+        let page_key: String = rows.last().unwrap().get("rk");
+        let records: Vec<Value> = rows.iter().map(|r| r.get::<_, Value>("row")).collect();
+
+        // Group the page by source_run_id so each batch is lineage-homogeneous.
+        let mut groups: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+        for rec in records {
+            let run = rec
+                .get("source_run_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    ApiError::BadRequest(format!(
+                        "{schema}.{table} row missing string source_run_id; not syncable"
+                    ))
+                })?
+                .to_string();
+            groups.entry(run).or_default().push(rec);
+        }
+
+        for (run_id_str, group) in groups {
+            let (src, src_ep, run_id) = lineage_of(&group[0])?;
+            let preamble = build_preamble(&client, &run_id).await?;
+            let batch_id = deterministic_batch_id(&peer, schema, table, &run_id_str, &group);
+            let body = json!({
+                "batch_id": batch_id,
+                "source": src,
+                "source_endpoint": src_ep,
+                "source_run_id": run_id,
+                "provenance": preamble,
+                "records": group,
+            });
+
+            match post_with_retry(st, &url, &token, &peer, &body).await {
+                Ok(failed) if failed > 0 => {
+                    tracing::warn!(
+                        "sync push {schema}.{table}: target rejected {failed} record(s) in batch {batch_id}"
+                    );
+                }
+                Ok(_) => {}
+                Err(msg) => {
+                    save_cursor(&client, &target, schema, table, cur_wm, cur_key.clone(), total, &format!("failed: {msg}")).await?;
+                    return Ok(PushSummary {
+                        schema: schema.into(),
+                        table: table.into(),
+                        batches,
+                        rows_pushed: total,
+                        status: "failed".into(),
+                        last_error: Some(msg),
+                    });
+                }
+            }
+            total += group.len() as i64;
+            batches += 1;
+        }
+
+        // Whole page delivered → advance the durable keyset cursor.
+        cur_wm = Some(page_wm);
+        cur_key = Some(page_key);
+        save_cursor(&client, &target, schema, table, cur_wm, cur_key.clone(), total, "ok").await?;
+    }
+
+    Ok(PushSummary {
+        schema: schema.into(),
+        table: table.into(),
+        batches,
+        rows_pushed: total,
+        status: "ok".into(),
+        last_error: None,
+    })
+}
+
+/// Extract the lineage triplet from a row's JSON.
+fn lineage_of(rec: &Value) -> ApiResult<(String, String, Uuid)> {
+    let src = rec.get("source").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let ep = rec.get("source_endpoint").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let run = rec
+        .get("source_run_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .ok_or_else(|| ApiError::BadRequest("row has no valid source_run_id".into()))?;
+    if src.is_empty() || ep.is_empty() {
+        return Err(ApiError::BadRequest("row missing source/source_endpoint".into()));
+    }
+    Ok((src, ep, run))
+}
+
+/// Build the provenance preamble for one run: its run row + endpoint + api_source.
+async fn build_preamble(client: &Client, run_id: &Uuid) -> ApiResult<super::Preamble> {
+    let mut pre = super::Preamble::default();
+    let run_row = client
+        .query_opt(
+            "SELECT to_jsonb(r) AS j, r.endpoint_id FROM provenance.runs r WHERE r.run_id=$1",
+            &[run_id],
+        )
+        .await
+        .map_err(dberr)?;
+    if let Some(rr) = run_row {
+        pre.runs.push(rr.get::<_, Value>("j"));
+        let endpoint_id: String = rr.get("endpoint_id");
+        if let Some(er) = client
+            .query_opt(
+                "SELECT to_jsonb(e) AS j, e.source FROM provenance.endpoints e WHERE e.endpoint_id=$1",
+                &[&endpoint_id],
+            )
+            .await
+            .map_err(dberr)?
+        {
+            pre.endpoints.push(er.get::<_, Value>("j"));
+            let source: String = er.get("source");
+            if let Some(sr) = client
+                .query_opt(
+                    "SELECT to_jsonb(s) AS j FROM provenance.api_sources s WHERE s.source=$1",
+                    &[&source],
+                )
+                .await
+                .map_err(dberr)?
+            {
+                pre.api_sources.push(sr.get::<_, Value>("j"));
+            }
+        }
+    }
+    Ok(pre)
+}
+
+/// Deterministic batch id over (peer, table, run, and EVERY row's content) so a
+/// re-run before cursor-advance redelivers the SAME batch_id (the inbox dedups
+/// it) while any change to the group's contents yields a different id. Hashing
+/// the full content — not just first/last+len — prevents a distinct group from
+/// colliding with an already-applied batch_id and being silently dropped.
+fn deterministic_batch_id(
+    peer: &str,
+    schema: &str,
+    table: &str,
+    run_id: &str,
+    group: &[Value],
+) -> Uuid {
+    let mut h = Sha256::new();
+    h.update(peer.as_bytes());
+    h.update(b"|");
+    h.update(format!("{schema}.{table}").as_bytes());
+    h.update(b"|");
+    h.update(run_id.as_bytes());
+    h.update(b"|");
+    h.update((group.len() as u64).to_le_bytes());
+    for row in group {
+        h.update(b"\x1e"); // record separator
+        h.update(row.to_string().as_bytes());
+    }
+    let digest = h.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+/// POST a batch with bounded exponential-backoff retry. `Ok(failed)` on a 2xx
+/// ACK (`failed` = records the target rejected at validation, 0 on a clean
+/// batch); `Err(msg)` once attempts are exhausted.
+async fn post_with_retry(
+    st: &AppState,
+    url: &str,
+    token: &str,
+    peer: &str,
+    body: &Value,
+) -> Result<i64, String> {
+    let max = st.settings.sync_max_attempts.max(1);
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let mut rb = st.http.post(url).json(body).header("X-Lumid-Sync-Peer", peer);
+        if !token.is_empty() {
+            rb = rb.bearer_auth(token);
+        }
+        match rb.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let ack: Value = resp.json().await.unwrap_or(Value::Null);
+                let failed = ack.get("failed").and_then(|v| v.as_i64()).unwrap_or(0);
+                return Ok(failed);
+            }
+            Ok(resp) => {
+                let code = resp.status().as_u16();
+                let txt = resp.text().await.unwrap_or_default();
+                if attempt >= max {
+                    return Err(format!(
+                        "target HTTP {code}: {}",
+                        txt.chars().take(200).collect::<String>()
+                    ));
+                }
+            }
+            Err(e) => {
+                if attempt >= max {
+                    return Err(format!("send error: {e}"));
+                }
+            }
+        }
+        let backoff = st.settings.sync_backoff_ms.saturating_mul(1u64 << (attempt - 1).min(16));
+        tokio::time::sleep(Duration::from_millis(backoff)).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn save_cursor(
+    client: &Client,
+    target_url: &str,
+    schema: &str,
+    table: &str,
+    cur_wm: Option<DateTime<Utc>>,
+    cur_key: Option<String>,
+    rows_pushed: i64,
+    result: &str,
+) -> ApiResult<()> {
+    let wm = cur_wm.map(|d| d.to_rfc3339());
+    client
+        .execute(
+            "INSERT INTO sync.push_cursor \
+               (target_url, schema_name, table_name, watermark, watermark_key, rows_pushed, last_result, updated_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7, now()) \
+             ON CONFLICT (target_url, schema_name, table_name) DO UPDATE \
+               SET watermark=EXCLUDED.watermark, watermark_key=EXCLUDED.watermark_key, \
+                   rows_pushed=EXCLUDED.rows_pushed, last_result=EXCLUDED.last_result, updated_at=now()",
+            &[&target_url, &schema, &table, &wm, &cur_key, &rows_pushed, &result],
+        )
+        .await
+        .map_err(dberr)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ident_guard_rejects_injection() {
+        assert!(valid_ident("market"));
+        assert!(valid_ident("ohlc_1min"));
+        assert!(valid_ident("ingest_ts"));
+        assert!(!valid_ident("market; drop table x"));
+        assert!(!valid_ident("a.b"));
+        assert!(!valid_ident("\"quoted\""));
+        assert!(!valid_ident(""));
+    }
+
+    #[test]
+    fn batch_id_is_deterministic_and_run_scoped() {
+        let g = vec![json!({"id": 1, "v": "a"}), json!({"id": 2, "v": "b"})];
+        let a = deterministic_batch_id("p", "market", "dividends", "run-1", &g);
+        let b = deterministic_batch_id("p", "market", "dividends", "run-1", &g);
+        assert_eq!(a, b, "same inputs → same batch_id (redelivery dedups)");
+
+        // different run → different id
+        let c = deterministic_batch_id("p", "market", "dividends", "run-2", &g);
+        assert_ne!(a, c);
+        // different peer → different id
+        let d = deterministic_batch_id("q", "market", "dividends", "run-1", &g);
+        assert_ne!(a, d);
+        // different content → different id
+        let g2 = vec![json!({"id": 1, "v": "a"}), json!({"id": 3, "v": "c"})];
+        assert_ne!(a, deterministic_batch_id("p", "market", "dividends", "run-1", &g2));
+    }
+
+    #[test]
+    fn lineage_of_extracts_triplet() {
+        let run = uuid::Uuid::new_v4();
+        let rec = json!({
+            "source": "fmp",
+            "source_endpoint": "stable/dividends",
+            "source_run_id": run.to_string(),
+            "symbol": "AAPL"
+        });
+        let (s, e, r) = lineage_of(&rec).unwrap();
+        assert_eq!(s, "fmp");
+        assert_eq!(e, "stable/dividends");
+        assert_eq!(r, run);
+    }
+
+    #[test]
+    fn lineage_of_rejects_missing_run() {
+        let rec = json!({"source": "fmp", "source_endpoint": "x"});
+        assert!(lineage_of(&rec).is_err());
+    }
+}
