@@ -174,15 +174,13 @@ pub async fn gate(
     let ident = resolve_identity(&st, &headers).await?;
 
     // Rate-limit key + tier (mirrors _rate_limit_key / _dynamic_limit).
+    // Rate-limit key: only a *successfully resolved* identity earns the authed
+    // tier. An invalid/unknown token that was rejected by resolve_identity falls
+    // through to Err and is handled above; if we're here with None it means no
+    // token was presented at all, which is the anonymous tier regardless.
     let key = match &ident {
         Some(id) => format!("id:{}", id.sub),
-        None => {
-            if headers.contains_key("authorization") || headers.contains_key("x-api-key") {
-                format!("presented:{}", client_ip(&headers))
-            } else {
-                format!("ip:{}", client_ip(&headers))
-            }
-        }
+        None => format!("ip:{}", client_ip(&headers)),
     };
     let decision = st.rate.check(&key);
     let (rl_limit, rl_remaining, rl_reset) = (decision.limit, decision.remaining, decision.reset_s);

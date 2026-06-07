@@ -91,6 +91,32 @@ pub fn check_serve_parts(parts: &ServeParts) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate critical settings before starting the server. Fails fast with a
+/// clear message rather than surfacing misconfiguration on the first real request.
+fn validate_settings(s: &config::Settings) -> anyhow::Result<()> {
+    if s.db_password.is_empty() {
+        anyhow::bail!("LUMID_DB_PASSWORD is required but not set");
+    }
+    if s.db_name.is_empty() {
+        anyhow::bail!("LUMID_DB_NAME is required but not set");
+    }
+    if s.blob_backend == "s3" {
+        if s.blob_s3_bucket.is_empty() {
+            anyhow::bail!("LUMID_BLOB_S3_BUCKET is required when LUMID_BLOB_BACKEND=s3");
+        }
+        if s.blob_s3_endpoint.is_empty() {
+            anyhow::bail!("LUMID_BLOB_S3_ENDPOINT is required when LUMID_BLOB_BACKEND=s3");
+        }
+    }
+    if !s.lumid_enabled && s.api_keys_raw.is_empty() {
+        tracing::warn!(
+            "LUMID_AUTH_ENABLED=false and no LUMID_API_KEYS configured — \
+             all authenticated requests will return 401"
+        );
+    }
+    Ok(())
+}
+
 /// Boot + serve until shutdown. Reads `LUMID_*` from env, incl.
 /// `LUMID_READ_CONFIG` for the read specs (default `read.toml`).
 pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
@@ -107,6 +133,7 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let settings = Arc::new(config::Settings::from_env());
+    validate_settings(&settings)?;
     let bind_addr = settings.bind_addr.clone();
     let pool = db::build_pool(&settings)?;
     let lumid = Arc::new(auth::lumid::LumidClient::new(&settings));
@@ -155,6 +182,7 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     };
 
     let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -266,8 +294,29 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     );
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!("listening on {bind_addr}");
-    axum::serve(listener, router).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    use tokio::signal;
+    let ctrl_c = async { signal::ctrl_c().await.expect("ctrl-c handler") };
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown signal received, draining in-flight requests");
 }
 
 /// Build the blob object-store backend from settings. Default is the local

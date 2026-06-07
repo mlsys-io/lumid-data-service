@@ -44,7 +44,7 @@ pub fn submit_after_ingest(result: &IngestResult, info: LumilakeInfo) {
         "data": [{
             "workflow": workflow,
             "inputs": {
-                "run_id": [result.run_id.clone()],
+                "run_id": [result.run_id.clone().unwrap_or_default()],
                 "target_schema": [info.target_schema],
                 "target_table": [info.target_table],
                 "rows_inserted": [result.inserted.to_string()],

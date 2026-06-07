@@ -8,6 +8,7 @@
 use axum::middleware::from_fn_with_state;
 use axum::routing::{get, post};
 use axum::Router;
+use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::handlers;
@@ -24,16 +25,15 @@ pub fn build_router(
     let public = Router::new()
         .route("/health", get(handlers::health::health))
         .route("/health/db", get(handlers::health::health_db))
+        .route("/health/ready", get(handlers::health::health_ready))
         .merge(openapi_router) // GET /openapi.json (public)
         .merge(public_ext_router) // app-contributed public routes (e.g. /usage.md)
         // Public landing surfaces (no auth) — app-contributed (`ServeParts.landing`)
         // or the platform's generic fallback (`GET /`). The platform names no
         // domain, so the app-provided landing/reference/llm pages live in the app.
         .merge(landing_router)
-        // Status board + usage dashboard: browsable HTML, public.
+        // Status board: browsable HTML, intentionally public (aggregate counts only).
         .route("/status", get(handlers::freshness::status))
-        .route("/usage", get(handlers::usage::usage))
-        .route("/freshness", get(handlers::freshness::freshness))
         // Webhook ingress: HMAC-authenticated, mounted OUTSIDE the gate.
         .route("/webhook/:webhook_id", post(handlers::ingest::post_webhook));
         // Realtime WebSocket routes (self-authenticating, outside the gate) are
@@ -55,8 +55,12 @@ pub fn build_router(
 
         // Ingress write plane is merged below with a bounded body limit.
 
-        // Caller's own usage (authed; the public /usage is the global board).
+        // Usage dashboard (global board + per-caller view) — gated: principal IDs
+        // and pipeline health counts shouldn't be unauthenticated (SEC-004).
+        .route("/usage", get(handlers::usage::usage))
         .route("/usage/me", get(handlers::usage::usage_me))
+        // Freshness JSON — gated: exposes endpoint SLA health details.
+        .route("/freshness", get(handlers::freshness::freshness))
         // Ingress proposals: write to an unknown table → infer schema + stage a
         // proposal; admin lists/approves (creates the table + grants ACL).
         .route("/catalog/ingress/proposals", get(handlers::ingest::list_proposals))
@@ -123,6 +127,7 @@ pub fn build_router(
 
     public
         .merge(gated)
+        .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

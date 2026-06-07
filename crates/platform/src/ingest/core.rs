@@ -31,7 +31,8 @@ fn valid_source_endpoint(s: &str) -> bool {
 
 #[derive(Serialize, Clone)]
 pub struct IngestResult {
-    pub run_id: String,
+    /// `None` when all records were rejected before a run row was opened.
+    pub run_id: Option<String>,
     pub target_schema: String,
     pub target_table: String,
     pub received: usize,
@@ -168,10 +169,10 @@ pub async fn ingest_records(
         (records.to_vec(), Vec::new())
     };
 
-    // All rejected, none parsed → short-circuit (route maps to 422).
+    // All rejected, none parsed → short-circuit before opening a run row (422).
     if p.validate && parsed.is_empty() && !rejected.is_empty() {
         return Ok(IngestResult {
-            run_id: String::new(),
+            run_id: None,
             target_schema: p.target_schema.to_string(),
             target_table: p.target_table.to_string(),
             received,
@@ -241,7 +242,7 @@ pub async fn ingest_records(
         Ok((inserted, updated)) => {
             let status = if rejected.is_empty() { "ok" } else { "partial" };
             if owned_run {
-                let _ = run::close_run(
+                if let Err(e) = run::close_run(
                     &client,
                     &run_id,
                     status,
@@ -250,10 +251,13 @@ pub async fn ingest_records(
                     rejected.len() as i64,
                     None,
                 )
-                .await;
+                .await
+                {
+                    tracing::error!("close_run failed for {run_id}: {e}");
+                }
             }
             let out = IngestResult {
-                run_id: run_id.to_string(),
+                run_id: Some(run_id.to_string()),
                 target_schema: p.target_schema.to_string(),
                 target_table: p.target_table.to_string(),
                 received,
@@ -279,9 +283,10 @@ pub async fn ingest_records(
         }
         Err(e) => {
             let error_text = format!("{e:#}");
-            let trunc = &error_text[error_text.len().saturating_sub(4000)..];
+            // Keep the head (root cause first in anyhow's {:#} format).
+            let trunc = &error_text[..error_text.len().min(4000)];
             if owned_run {
-                let _ = run::close_run(
+                if let Err(ce) = run::close_run(
                     &client,
                     &run_id,
                     "failed",
@@ -290,15 +295,20 @@ pub async fn ingest_records(
                     rejected.len() as i64,
                     Some(trunc),
                 )
-                .await;
+                .await
+                {
+                    tracing::error!("close_run failed for {run_id}: {ce}");
+                }
             }
             tracing::error!(
                 "ingest_records to {}.{} failed: {error_text}",
                 p.target_schema,
                 p.target_table
             );
-            Err(IngestErr::Failed(ApiError::BadRequest(format!(
-                "ingest failed: {e}"
+            // Log the raw error but return a sanitised message so DB internals
+            // (constraint names, column types) don't leak to the caller.
+            Err(IngestErr::Failed(ApiError::Internal(anyhow::anyhow!(
+                "ingest write failed; check server logs for run {run_id}"
             ))))
         }
     }

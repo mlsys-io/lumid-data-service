@@ -92,6 +92,10 @@ fn decimal_to_json(d: Decimal) -> Value {
         if let Some(i) = d.to_i64() {
             return Value::from(i);
         }
+        // Whole number but overflows i64 (e.g. market_cap for large companies).
+        // Emit as a decimal string to preserve exact digits — f64 only has 53-bit
+        // mantissa and would silently round e.g. 10_000_000_000_000_001 → …000.
+        return Value::String(d.normalize().to_string());
     }
     // Fractional: parse the exact decimal digits via std str→f64 (correctly
     // rounded, IEEE round-to-nearest) to match Python's float(Decimal) exactly.

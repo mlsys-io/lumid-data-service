@@ -22,7 +22,14 @@ CREATE ROLE lumid_reader WITH
 
 -- Broad read access without superuser. `pg_read_all_data` (PG14+) grants SELECT
 -- on every table/view + USAGE on every schema, but NOT the server-side file
--- functions. This removes the host-file / credential-hash exfiltration vector.
+-- functions (pg_read_file, pg_ls_dir — those require superuser or
+-- pg_read_server_files). This closes the host-file exfiltration vector.
+--
+-- KNOWN LIMITATION: pg_read_all_data also covers pg_catalog tables including
+-- pg_authid (password hashes, stored as scram-sha-256). The REVOKE below has
+-- no effect because the grant derives from role membership, not a table ACL.
+-- If you need to exclude pg_authid, use the per-schema grant block below
+-- instead of pg_read_all_data.
 GRANT pg_read_all_data TO lumid_reader;
 
 -- ── Stricter alternative: make LUMID_USER_SCHEMAS a real access boundary ───────

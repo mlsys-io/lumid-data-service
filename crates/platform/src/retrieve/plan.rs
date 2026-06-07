@@ -177,24 +177,54 @@ fn contains_dangerous_read(lowered_stmt: &str) -> bool {
 }
 
 /// True if `word` appears in `lowered_stmt` at least once delimited by word
-/// boundaries (start/end or a non-`[A-Za-z0-9_]` char on each side). Scans every
-/// occurrence — not just the first — so a non-boundary hit early in the string
-/// doesn't mask a real one later (e.g. `xcopy ...; copy`).
+/// boundaries (start/end or a non-`[A-Za-z0-9_]` char on each side), and the
+/// occurrence is **outside** a single-quoted string literal. Scans every
+/// occurrence so a non-boundary hit early in the string doesn't mask a real one
+/// later (e.g. `xcopy ...; copy`).
 fn word_present(lowered_stmt: &str, word: &str) -> bool {
     let bytes = lowered_stmt.as_bytes();
-    for (pos, _) in lowered_stmt.match_indices(word) {
-        let before = pos == 0 || {
-            let ch = bytes[pos - 1];
-            !ch.is_ascii_alphanumeric() && ch != b'_'
-        };
-        let after_pos = pos + word.len();
-        let after = after_pos >= bytes.len() || {
-            let ch = bytes[after_pos];
-            !ch.is_ascii_alphanumeric() && ch != b'_'
-        };
-        if before && after {
-            return true;
+    let n = bytes.len();
+    // Track whether we're inside a single-quoted string literal so that e.g.
+    // `WHERE action = 'delete'` doesn't trigger the DML-keyword check.
+    let mut in_string = false;
+    let mut i = 0;
+    while i < n {
+        if in_string {
+            if bytes[i] == b'\'' {
+                // Handle escaped quote ('' inside a string).
+                if i + 1 < n && bytes[i + 1] == b'\'' {
+                    i += 2;
+                } else {
+                    in_string = false;
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+            continue;
         }
+        if bytes[i] == b'\'' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        // Try to match `word` at position `i`.
+        if lowered_stmt[i..].starts_with(word) {
+            let pos = i;
+            let before = pos == 0 || {
+                let ch = bytes[pos - 1];
+                !ch.is_ascii_alphanumeric() && ch != b'_'
+            };
+            let after_pos = pos + word.len();
+            let after = after_pos >= n || {
+                let ch = bytes[after_pos];
+                !ch.is_ascii_alphanumeric() && ch != b'_'
+            };
+            if before && after {
+                return true;
+            }
+        }
+        i += 1;
     }
     false
 }

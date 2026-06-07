@@ -15,8 +15,19 @@ use tokio_postgres::types::ToSql;
 use crate::db::rows::rows_to_objects;
 use crate::error::{ApiError, ApiResult};
 
-/// User schemas we surface — matches the 12 named in CLAUDE.md plus provenance.
-/// Other schemas (pg_*, information_schema, _timescaledb_*) are hidden.
+/// Returns true when a `tokio_postgres::Error` is an `UndefinedTable` (42P01),
+/// which happens when `_timescaledb_catalog.hypertable` doesn't exist (vanilla PG).
+fn is_undefined_table(e: &tokio_postgres::Error) -> bool {
+    use tokio_postgres::error::SqlState;
+    e.as_db_error()
+        .map(|db| *db.code() == SqlState::UNDEFINED_TABLE)
+        .unwrap_or(false)
+}
+
+/// Compile-time allowlist of schemas this platform knows about.
+/// Used as both the security whitelist (identifiers safe to interpolate) and
+/// the default display list when `LUMID_USER_SCHEMAS` is not set.
+/// Other schemas (pg_*, information_schema, _timescaledb_*) are always hidden.
 pub const USER_SCHEMAS: &[&str] = &[
     "reference",
     "market",
@@ -32,8 +43,39 @@ pub const USER_SCHEMAS: &[&str] = &[
     "provenance",
 ];
 
-pub fn is_user_schema(schema: &str) -> bool {
-    USER_SCHEMAS.contains(&schema)
+/// Always-blocked Postgres system schema prefixes/names. These are never
+/// surfaced regardless of what `LUMID_USER_SCHEMAS` says, so an accidental
+/// `USER_SCHEMAS=pg_catalog` can't expose credential catalogs.
+fn is_system_schema(s: &str) -> bool {
+    s.starts_with("pg_")
+        || s.starts_with("_timescaledb")
+        || s.starts_with("timescaledb")
+        || matches!(s, "information_schema" | "public")
+}
+
+/// Resolve the effective schema list from the runtime configuration.
+///
+/// - When `configured` is empty the compile-time `USER_SCHEMAS` default is returned.
+/// - When `configured` is non-empty it is trusted directly — operators can expose
+///   custom schemas not in `USER_SCHEMAS` without a code change. System schemas
+///   (`pg_*`, `_timescaledb*`, `information_schema`, `public`) are stripped
+///   regardless.
+pub fn effective_schemas(configured: &[String]) -> Vec<String> {
+    if configured.is_empty() {
+        USER_SCHEMAS.iter().map(|s| s.to_string()).collect()
+    } else {
+        configured
+            .iter()
+            .filter(|s| !is_system_schema(s))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Returns true only when `schema` is in the effective schema list and is not
+/// a system schema. Used as a 404 gate and before identifier interpolation.
+pub fn is_user_schema(schema: &str, effective: &[String]) -> bool {
+    !is_system_schema(schema) && effective.iter().any(|s| s == schema)
 }
 
 /// A pg identifier (schema/table name) is safe to interpolate when it is a
@@ -50,7 +92,7 @@ fn ident_ok(s: &str) -> bool {
 // --------------------------------------------------------------------- core
 
 /// Per-schema stats: table count, total estimated rows, size on disk.
-pub async fn list_schemas(pool: &Pool) -> ApiResult<Vec<Map<String, Value>>> {
+pub async fn list_schemas(pool: &Pool, effective: &[String]) -> ApiResult<Vec<Map<String, Value>>> {
     let sql = "
     SELECT n.nspname AS schema,
            count(*) FILTER (WHERE c.relkind = 'r')  AS tables,
@@ -63,7 +105,7 @@ pub async fn list_schemas(pool: &Pool) -> ApiResult<Vec<Map<String, Value>>> {
      WHERE n.nspname = ANY($1)
      GROUP BY n.nspname
      ORDER BY n.nspname";
-    let schemas: Vec<String> = USER_SCHEMAS.iter().map(|s| s.to_string()).collect();
+    let schemas: Vec<String> = effective.to_vec();
     let client = pool.get().await?;
     let rows = client.query(sql, &[&schemas]).await?;
     Ok(rows_to_objects(&rows))
@@ -71,7 +113,7 @@ pub async fn list_schemas(pool: &Pool) -> ApiResult<Vec<Map<String, Value>>> {
 
 /// Per-table stats inside one schema.
 pub async fn list_tables(pool: &Pool, schema: &str) -> ApiResult<Vec<Map<String, Value>>> {
-    let sql = "
+    let sql_ts = "
     SELECT c.relname AS table,
            c.reltuples::bigint AS est_rows,
            pg_total_relation_size(c.oid)::bigint AS size_bytes,
@@ -85,8 +127,25 @@ pub async fn list_tables(pool: &Pool, schema: &str) -> ApiResult<Vec<Map<String,
      WHERE n.nspname = $1
        AND c.relkind IN ('r', 'm')
      ORDER BY c.relname";
+    // Vanilla Postgres without TimescaleDB: fall back to a version without the
+    // _timescaledb_catalog reference (returns is_hypertable=false for all tables).
+    let sql_plain = "
+    SELECT c.relname AS table,
+           c.reltuples::bigint AS est_rows,
+           pg_total_relation_size(c.oid)::bigint AS size_bytes,
+           false AS is_hypertable,
+           obj_description(c.oid, 'pg_class') AS comment
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = $1
+       AND c.relkind IN ('r', 'm')
+     ORDER BY c.relname";
     let client = pool.get().await?;
-    let rows = client.query(sql, &[&schema]).await?;
+    let rows = match client.query(sql_ts, &[&schema]).await {
+        Ok(r) => r,
+        Err(ref e) if is_undefined_table(e) => client.query(sql_plain, &[&schema]).await?,
+        Err(e) => return Err(e.into()),
+    };
     Ok(rows_to_objects(&rows))
 }
 
@@ -101,9 +160,8 @@ pub async fn table_profile(
     let client = pool.get().await?;
 
     // Table meta — also tells us whether the relation exists at all.
-    let meta = client
-        .query_opt(
-            "
+    // Two SQL variants: TimescaleDB-aware (with hypertable check) and plain fallback.
+    let meta_ts = "
     SELECT pg_total_relation_size(c.oid)::bigint AS size_bytes,
            c.reltuples::bigint                   AS est_rows,
            obj_description(c.oid, 'pg_class')    AS comment,
@@ -113,10 +171,22 @@ pub async fn table_profile(
            ) AS is_hypertable
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
-     WHERE n.nspname = $1 AND c.relname = $2",
-            &[&schema, &table],
-        )
-        .await?;
+     WHERE n.nspname = $1 AND c.relname = $2";
+    let meta_plain = "
+    SELECT pg_total_relation_size(c.oid)::bigint AS size_bytes,
+           c.reltuples::bigint                   AS est_rows,
+           obj_description(c.oid, 'pg_class')    AS comment,
+           false                                 AS is_hypertable
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = $1 AND c.relname = $2";
+    let meta = match client.query_opt(meta_ts, &[&schema, &table]).await {
+        Ok(r) => r,
+        Err(ref e) if is_undefined_table(e) => {
+            client.query_opt(meta_plain, &[&schema, &table]).await?
+        }
+        Err(e) => return Err(e.into()),
+    };
     let meta = match meta {
         Some(m) => m,
         None => return Ok(None),
@@ -314,7 +384,7 @@ pub async fn list_writable_for_role(pool: &Pool, role: &str) -> ApiResult<Vec<Va
         )
         .await?;
 
-    let schemas: Vec<String> = USER_SCHEMAS.iter().map(|s| s.to_string()).collect();
+    let schemas: Vec<String> = USER_SCHEMAS.iter().map(|s| s.to_string()).collect(); // ACL expansion uses full whitelist
     let mut out: Vec<Value> = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
 
@@ -470,15 +540,29 @@ pub async fn list_runs_for(
         params.push(Box::new(s.to_string()));
         where_.push(format!("r.status = ${}", params.len()));
     }
-    if target_schema.is_some() || target_table.is_some() {
-        // Both placeholders bind the same two values, as in the Python.
-        params.push(Box::new(target_schema.map(|s| s.to_string())));
-        let i_schema = params.len();
-        params.push(Box::new(target_table.map(|s| s.to_string())));
-        let i_table = params.len();
+    // Generate only the conditions for filters actually supplied. Using `= NULL`
+    // (SQL null equality) always returns false — use separate clauses so a caller
+    // that supplies only target_schema still matches runs without a table constraint.
+    if let Some(s) = target_schema {
+        params.push(Box::new(s.to_string()));
+        let i = params.len();
+        if let Some(t) = target_table {
+            params.push(Box::new(t.to_string()));
+            let j = params.len();
+            where_.push(format!(
+                "((e.target_schema = ${i} AND e.target_table = ${j}) \
+                 OR (r.args->>'target_schema' = ${i} AND r.args->>'target_table' = ${j}))"
+            ));
+        } else {
+            where_.push(format!(
+                "(e.target_schema = ${i} OR r.args->>'target_schema' = ${i})"
+            ));
+        }
+    } else if let Some(t) = target_table {
+        params.push(Box::new(t.to_string()));
+        let j = params.len();
         where_.push(format!(
-            "((e.target_schema = ${i_schema} AND e.target_table = ${i_table}) \
-             OR (r.args->>'target_schema' = ${i_schema} AND r.args->>'target_table' = ${i_table}))"
+            "(e.target_table = ${j} OR r.args->>'target_table' = ${j})"
         ));
     }
     if let Some(s) = since {
@@ -565,8 +649,9 @@ pub async fn trace_by_natural_key(
     schema: &str,
     table: &str,
     key_filters: &BTreeMap<String, String>,
+    effective: &[String],
 ) -> ApiResult<Option<Value>> {
-    if !is_user_schema(schema) {
+    if !is_user_schema(schema, effective) {
         return Ok(None);
     }
     if !ident_ok(schema) || !ident_ok(table) {
