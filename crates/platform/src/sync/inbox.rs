@@ -13,18 +13,6 @@
 //! Ordering note: the ledger is written AFTER a successful apply (never before),
 //! so a crash between apply and ledger only causes an idempotent re-apply on
 //! redelivery — never a "ledger says applied but data missing" loss.
-//!
-//! Terminal-only ledgering (the partial-reject contract): the `(peer, batch_id)`
-//! ledger row is written ONLY when the batch applied with ZERO rejects — i.e. a
-//! terminally-complete outcome. A PARTIAL reject (some rows applied, some
-//! rejected at validation) leaves NO ledger row, so the producer's re-push of the
-//! same deterministic `batch_id` (after the target-side schema is fixed) is NOT
-//! deduped away — it re-runs apply: the already-applied rows re-upsert harmlessly
-//! via the newest-wins `ON CONFLICT … WHERE IS DISTINCT` merge, and the
-//! now-fixable rows finally land. This is the inbox-side half of PR #18's
-//! non-advance contract: the producer keeps its cursor parked AND the inbox keeps
-//! the batch re-attemptable. A fully-successful batch DOES get ledgered, so true
-//! duplicate delivery / retry storms still dedup (exactly-once-effective holds).
 
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
@@ -135,34 +123,26 @@ pub async fn post_sync_apply(
         st.read_cache.invalidate_table(&schema, &table).await;
     }
 
-    // 5b. Record the ledger (idempotency for redelivery) — but ONLY for a
-    //     terminally-complete batch (0 rejects). A PARTIAL reject must NOT be
-    //     ledgered: doing so would dedup the producer's re-push (same
-    //     deterministic batch_id) to a no-op, stranding the rejected rows forever
-    //     — exactly the silent skip PR #18 set out to kill. Leaving no ledger row
-    //     keeps the batch re-attemptable; the applied rows re-upsert harmlessly
-    //     (newest-wins merge), the now-fixable rows finally land. DO NOTHING
-    //     covers a concurrent duplicate that applied first.
-    if should_ledger(result.failed) {
-        client
-            .execute(
-                "INSERT INTO sync.inbox_ledger \
-                   (peer, batch_id, source_run_id, target_schema, target_table, inserted, updated, n_rows) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (peer, batch_id) DO NOTHING",
-                &[
-                    &peer,
-                    &body.batch_id,
-                    &body.source_run_id,
-                    &schema,
-                    &table,
-                    &result.inserted,
-                    &result.updated,
-                    &(result.received as i64),
-                ],
-            )
-            .await
-            .map_err(|e| ApiError::Internal(anyhow::anyhow!("ledger insert: {e}")))?;
-    }
+    // 5b. Record the ledger (idempotency for redelivery). DO NOTHING covers a
+    //     concurrent duplicate that applied first.
+    client
+        .execute(
+            "INSERT INTO sync.inbox_ledger \
+               (peer, batch_id, source_run_id, target_schema, target_table, inserted, updated, n_rows) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (peer, batch_id) DO NOTHING",
+            &[
+                &peer,
+                &body.batch_id,
+                &body.source_run_id,
+                &schema,
+                &table,
+                &result.inserted,
+                &result.updated,
+                &(result.received as i64),
+            ],
+        )
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("ledger insert: {e}")))?;
 
     Ok(Json(SyncAck {
         batch_id: body.batch_id,
@@ -171,21 +151,6 @@ pub async fn post_sync_apply(
         failed: result.failed as i64,
         duplicate: false,
     }))
-}
-
-/// Whether a successfully-returning apply should write a terminal
-/// `(peer, batch_id)` dedup ledger row.
-///
-/// Ledger ONLY a fully-complete batch (`failed == 0`). A partial reject
-/// (`failed > 0`, with some rows applied) is intentionally NOT ledgered so the
-/// producer's idempotent re-push (same deterministic `batch_id`, cursor parked by
-/// PR #18) re-runs apply rather than dedup-short-circuiting to a no-op. Pure (no
-/// I/O) so the dedup-vs-reattempt decision is unit-testable without a live DB.
-///
-/// Note: a *fully*-rejected batch never reaches here — it returns
-/// `ApiError::Validation` earlier (and so is never ledgered either).
-fn should_ledger(failed: usize) -> bool {
-    failed == 0
 }
 
 /// Upsert verbatim provenance rows into `table` (a trusted `provenance.<t>`
@@ -209,33 +174,4 @@ async fn upsert_prov(client: &Client, table: &str, pk: &str, rows: &[Value]) -> 
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("preamble upsert {table}: {e}")))?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::should_ledger;
-
-    /// Terminal-only ledgering — the dedup-vs-reattempt seam.
-    ///
-    /// This pins the inbox half of PR #18's non-advance contract: only a
-    /// fully-complete apply (0 rejects) records the `(peer, batch_id)` dedup row.
-    /// A partial reject leaves no terminal row, so the producer's idempotent
-    /// re-push (same deterministic batch_id) re-runs apply instead of dedup-ing
-    /// to a no-op — the previously-rejected rows finally land once the target
-    /// schema is fixed.
-    #[test]
-    fn ledger_only_on_zero_rejects() {
-        // Clean batch → ledger it (true duplicate delivery / retry storms dedup;
-        // exactly-once-effective holds).
-        assert!(should_ledger(0), "0 rejects is terminal → ledger for dedup");
-
-        // Partial reject → do NOT ledger, so a re-push after the target-side fix
-        // re-runs apply and the rejected rows land (cursor stays parked by #18).
-        assert!(!should_ledger(1), "1 reject is non-terminal → must NOT ledger");
-        assert!(!should_ledger(5), "any reject is non-terminal → must NOT ledger");
-        assert!(
-            !should_ledger(usize::MAX),
-            "a near-total reject is still non-terminal → must NOT ledger"
-        );
-    }
 }

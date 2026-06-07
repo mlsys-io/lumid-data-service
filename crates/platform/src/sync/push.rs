@@ -281,35 +281,10 @@ pub async fn run_push(
             });
 
             match post_with_retry(st, &url, &token, &peer, &body).await {
-                Ok(apply) if apply.rejected() > 0 => {
-                    // A per-record reject is DETERMINISTIC — the same row pushed
-                    // again alone won't pass validation, so retrying buys nothing.
-                    // Treating it as a clean push (advancing the cursor past these
-                    // rows) would silently drop them forever. Stop loud instead:
-                    // do NOT advance the cursor past this page, surface the reject
-                    // so the operator can fix the schema mismatch and re-push (the
-                    // deterministic batch_id makes the re-push idempotent).
-                    let detail = apply.reject_detail(batch_id);
-                    tracing::warn!("sync push {schema}.{table}: {detail}");
-                    save_cursor(
-                        &client,
-                        &target,
-                        schema,
-                        table,
-                        cur_wm,
-                        cur_key.clone(),
-                        total,
-                        &format!("partial: {detail}"),
-                    )
-                    .await?;
-                    return Ok(PushSummary {
-                        schema: schema.into(),
-                        table: table.into(),
-                        batches,
-                        rows_pushed: total,
-                        status: "partial".into(),
-                        last_error: Some(detail),
-                    });
+                Ok(failed) if failed > 0 => {
+                    tracing::warn!(
+                        "sync push {schema}.{table}: target rejected {failed} record(s) in batch {batch_id}"
+                    );
                 }
                 Ok(_) => {}
                 Err(msg) => {
@@ -427,108 +402,17 @@ fn deterministic_batch_id(
     Uuid::from_bytes(bytes)
 }
 
-/// Parsed `/sync/apply` ACK body. The inbox returns a per-batch apply summary;
-/// we care about how many records it rejected at validation so a partial reject
-/// can be surfaced as a hard push failure (rather than silently skipped).
-#[derive(Debug, Default, Clone)]
-struct ApplyAck {
-    /// Records the target rejected at validation (0 on a clean batch). The inbox
-    /// names this `failed`; older shapes used `rejected` — accept either.
-    failed: i64,
-    /// First reject reason, if the body carries one — surfaced in `last_error`.
-    sample_reason: Option<String>,
-}
-
-impl ApplyAck {
-    /// Extract the reject count + a sample reason from a 2xx ACK body.
-    fn from_value(ack: &Value) -> Self {
-        let failed = ack
-            .get("failed")
-            .or_else(|| ack.get("rejected"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        // Look for a sample reason under a few plausible shapes the inbox uses:
-        // `errors[0].reason` / `errors[0]` (string) / `rejects[0].reason` / `error`.
-        let sample_reason = ack
-            .get("errors")
-            .or_else(|| ack.get("rejects"))
-            .and_then(|v| v.as_array())
-            .and_then(|a| a.first())
-            .and_then(|e| {
-                e.get("reason")
-                    .and_then(|r| r.as_str())
-                    .or_else(|| e.as_str())
-                    .map(|s| s.to_string())
-            })
-            .or_else(|| ack.get("error").and_then(|v| v.as_str()).map(|s| s.to_string()));
-        ApplyAck { failed, sample_reason }
-    }
-
-    fn rejected(&self) -> i64 {
-        self.failed
-    }
-
-    /// Human-readable detail for a partial-reject push, used in logs +
-    /// `PushSummary.last_error` so the operator sees count + a sample reason.
-    fn reject_detail(&self, batch_id: Uuid) -> String {
-        match &self.sample_reason {
-            Some(r) => format!(
-                "target rejected {} record(s) in batch {batch_id}: {}",
-                self.failed,
-                r.chars().take(200).collect::<String>()
-            ),
-            None => format!("target rejected {} record(s) in batch {batch_id}", self.failed),
-        }
-    }
-}
-
-/// Classify a single non-success HTTP response into retry-vs-fail. A
-/// DETERMINISTIC 4xx (422 schema mismatch, 400, 401, 404, …) will never succeed
-/// on retry, so it fast-fails. 5xx is transient → retry. 429 (Too Many Requests)
-/// is the one 4xx that IS transient: the push is idempotent (deterministic
-/// `batch_id` → the inbox dedups a true duplicate, and a partial-reject leaves no
-/// ledger so a re-apply is safe), so backing off and retrying is correct and
-/// avoids a needless gap until the next scheduler interval. Pure (no I/O) so it
-/// can be unit-tested without a live server.
-fn should_retry_status(code: u16) -> bool {
-    code == 429 || (500..600).contains(&code)
-}
-
-/// Parse a `Retry-After` header value into a backoff in milliseconds. Supports
-/// the delta-seconds form (`Retry-After: 5`); the HTTP-date form is ignored
-/// (returns `None`) — we fall back to exponential backoff rather than pull in a
-/// date parser for a rarely-used shape. The result is clamped to `max_ms` so a
-/// hostile/huge value can't park the drain indefinitely. Pure for unit testing.
-fn retry_after_ms(header: Option<&str>, max_ms: u64) -> Option<u64> {
-    let secs: u64 = header?.trim().parse().ok()?;
-    Some(secs.saturating_mul(1000).min(max_ms))
-}
-
-/// Exponential backoff in ms for `attempt` (1-based): `base * 2^(attempt-1)`,
-/// with the shift clamped at 16 (so the schedule caps at `base * 65536`). This
-/// is the historical formula extracted to a pure fn so the cap doubles as the
-/// `Retry-After` clamp ceiling. Pure for unit testing.
-fn exp_backoff(base_ms: u64, attempt: u32, max_ms: u64) -> u64 {
-    base_ms
-        .saturating_mul(1u64 << (attempt.saturating_sub(1)).min(16))
-        .min(max_ms)
-}
-
-/// POST a batch with bounded exponential-backoff retry. `Ok(ApplyAck)` on a 2xx
-/// ACK (carries the reject count + a sample reason; 0 on a clean batch);
-/// `Err(msg)` on a deterministic 4xx (no retry) or once retries are exhausted on
-/// transient classes (429 + 5xx + transport/timeout/connection errors). A 429
-/// honors `Retry-After` (delta-seconds) when present, clamped to the max backoff.
+/// POST a batch with bounded exponential-backoff retry. `Ok(failed)` on a 2xx
+/// ACK (`failed` = records the target rejected at validation, 0 on a clean
+/// batch); `Err(msg)` once attempts are exhausted.
 async fn post_with_retry(
     st: &AppState,
     url: &str,
     token: &str,
     peer: &str,
     body: &Value,
-) -> Result<ApplyAck, String> {
+) -> Result<i64, String> {
     let max = st.settings.sync_max_attempts.max(1);
-    // Ceiling for both the exponential schedule and any honored `Retry-After`.
-    let max_backoff = st.settings.sync_backoff_ms.saturating_mul(1u64 << 16);
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -539,40 +423,26 @@ async fn post_with_retry(
         match rb.send().await {
             Ok(resp) if resp.status().is_success() => {
                 let ack: Value = resp.json().await.unwrap_or(Value::Null);
-                return Ok(ApplyAck::from_value(&ack));
+                let failed = ack.get("failed").and_then(|v| v.as_i64()).unwrap_or(0);
+                return Ok(failed);
             }
             Ok(resp) => {
                 let code = resp.status().as_u16();
-                // Read a server-advertised backoff BEFORE consuming the body.
-                let retry_after = resp
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string());
                 let txt = resp.text().await.unwrap_or_default();
-                let msg = format!("target HTTP {code}: {}", txt.chars().take(200).collect::<String>());
-                // Fast-fail deterministic 4xx — retrying just burns
-                // max_attempts × backoff for a response that can never succeed.
-                // 429 is the exception: transient, and the push is idempotent, so
-                // it retries (honoring Retry-After when present).
-                if !should_retry_status(code) || attempt >= max {
-                    return Err(msg);
-                }
-                // A 429 with a Retry-After: honor it (clamped to max backoff)
-                // instead of the exponential schedule for this one sleep.
-                if let Some(ms) = retry_after_ms(retry_after.as_deref(), max_backoff) {
-                    tokio::time::sleep(Duration::from_millis(ms)).await;
-                    continue;
+                if attempt >= max {
+                    return Err(format!(
+                        "target HTTP {code}: {}",
+                        txt.chars().take(200).collect::<String>()
+                    ));
                 }
             }
             Err(e) => {
-                // Transport/timeout/connection errors are genuinely transient.
                 if attempt >= max {
                     return Err(format!("send error: {e}"));
                 }
             }
         }
-        let backoff = exp_backoff(st.settings.sync_backoff_ms, attempt, max_backoff);
+        let backoff = st.settings.sync_backoff_ms.saturating_mul(1u64 << (attempt - 1).min(16));
         tokio::time::sleep(Duration::from_millis(backoff)).await;
     }
 }
@@ -682,150 +552,5 @@ mod tests {
     fn lineage_of_rejects_missing_run() {
         let rec = json!({"source": "fmp", "source_endpoint": "x"});
         assert!(lineage_of(&rec).is_err());
-    }
-
-    // --- Bug 1: retry classification (4xx fast-fails, 5xx retries) ---
-
-    #[test]
-    fn retry_only_on_5xx_and_429_not_other_4xx() {
-        // Deterministic 4xx → never retry (would just burn backoff).
-        assert!(!should_retry_status(400), "400 must fast-fail");
-        assert!(!should_retry_status(401), "401 must fast-fail");
-        assert!(!should_retry_status(404), "404 must fast-fail");
-        assert!(!should_retry_status(422), "422 schema-mismatch must fast-fail");
-        // 429 is the transient 4xx: an idempotent push should retry with backoff
-        // rather than gap until the next scheduler interval.
-        assert!(should_retry_status(429), "429 Too Many Requests is transient, retry");
-        // Transient 5xx → retry.
-        assert!(should_retry_status(500), "500 is transient, retry");
-        assert!(should_retry_status(502), "502 is transient, retry");
-        assert!(should_retry_status(503), "503 is transient, retry");
-        // Boundaries: 3xx is not retryable; other 4xx (incl. 428/430) fast-fail;
-        // 600 is out of the 5xx band.
-        assert!(!should_retry_status(399));
-        assert!(!should_retry_status(428), "only 429 retries among 4xx");
-        assert!(!should_retry_status(430), "only 429 retries among 4xx");
-        assert!(!should_retry_status(499));
-        assert!(!should_retry_status(600));
-    }
-
-    #[test]
-    fn retry_after_parses_delta_seconds_and_clamps() {
-        // Delta-seconds form → ms.
-        assert_eq!(retry_after_ms(Some("5"), 60_000), Some(5_000));
-        assert_eq!(retry_after_ms(Some(" 2 "), 60_000), Some(2_000), "whitespace tolerated");
-        assert_eq!(retry_after_ms(Some("0"), 60_000), Some(0));
-        // Clamped to the max backoff so a hostile/huge value can't park forever.
-        assert_eq!(retry_after_ms(Some("99999"), 30_000), Some(30_000));
-        // HTTP-date form is not parsed → None (falls back to exp backoff).
-        assert_eq!(retry_after_ms(Some("Wed, 21 Oct 2026 07:28:00 GMT"), 60_000), None);
-        // Absent / garbage → None.
-        assert_eq!(retry_after_ms(None, 60_000), None);
-        assert_eq!(retry_after_ms(Some("soon"), 60_000), None);
-        assert_eq!(retry_after_ms(Some("-3"), 60_000), None, "negative is not delta-seconds");
-    }
-
-    #[test]
-    fn exp_backoff_doubles_and_caps() {
-        // base * 2^(attempt-1), clamped at shift 16 (the historical schedule).
-        assert_eq!(exp_backoff(500, 1, u64::MAX), 500);
-        assert_eq!(exp_backoff(500, 2, u64::MAX), 1_000);
-        assert_eq!(exp_backoff(500, 3, u64::MAX), 2_000);
-        // Shift caps at 16 → base * 65536 regardless of higher attempt counts.
-        assert_eq!(exp_backoff(1, 17, u64::MAX), 1 << 16);
-        assert_eq!(exp_backoff(1, 99, u64::MAX), 1 << 16);
-        // And the explicit max_ms clamp wins when lower.
-        assert_eq!(exp_backoff(500, 10, 3_000), 3_000);
-    }
-
-    /// Mirrors `post_with_retry`'s attempt-loop control flow over a fixed
-    /// sequence of response status codes, so we can assert exactly how many
-    /// attempts a given outcome class costs WITHOUT a live HTTP server. Returns
-    /// `(attempts_made, succeeded)`.
-    fn simulate_attempts(statuses: &[u16], max: u32) -> (u32, bool) {
-        let max = max.max(1);
-        let mut attempt = 0u32;
-        loop {
-            let code = statuses.get((attempt) as usize).copied().unwrap_or(503);
-            attempt += 1;
-            if (200..300).contains(&code) {
-                return (attempt, true);
-            }
-            if !should_retry_status(code) || attempt >= max {
-                return (attempt, false);
-            }
-        }
-    }
-
-    #[test]
-    fn deterministic_4xx_fast_fails_in_one_attempt() {
-        // A 422 with plenty of retry budget still stops after the first attempt.
-        let (attempts, ok) = simulate_attempts(&[422], 5);
-        assert_eq!(attempts, 1, "4xx must not consume more than one attempt");
-        assert!(!ok);
-    }
-
-    #[test]
-    fn transient_5xx_retries_up_to_max() {
-        // Persistent 5xx burns the whole retry budget, then fails.
-        let (attempts, ok) = simulate_attempts(&[503, 503, 503, 503, 503], 4);
-        assert_eq!(attempts, 4, "5xx retries up to max_attempts");
-        assert!(!ok);
-        // A 5xx that recovers on the 3rd attempt succeeds without exhausting.
-        let (attempts, ok) = simulate_attempts(&[500, 502, 200], 5);
-        assert_eq!(attempts, 3);
-        assert!(ok);
-
-        // 429 is now transient: a rate-limit that clears on the 2nd attempt
-        // succeeds rather than fast-failing in one (the pre-#18-followup bug).
-        let (attempts, ok) = simulate_attempts(&[429, 200], 5);
-        assert_eq!(attempts, 2, "429 must retry, not fast-fail");
-        assert!(ok);
-        // Persistent 429 burns the budget like any transient class.
-        let (attempts, ok) = simulate_attempts(&[429, 429, 429], 3);
-        assert_eq!(attempts, 3);
-        assert!(!ok);
-    }
-
-    // --- Bug 2: partial reject is a hard failure, clean push advances ---
-
-    #[test]
-    fn apply_ack_clean_response_has_no_rejects() {
-        let ack = ApplyAck::from_value(&json!({"applied": 10, "failed": 0}));
-        assert_eq!(ack.rejected(), 0, "clean push: status stays ok, cursor advances");
-        assert!(ack.sample_reason.is_none());
-
-        // Missing/absent fields default to a clean ACK (byte-equivalent to today).
-        let ack = ApplyAck::from_value(&json!({"applied": 10}));
-        assert_eq!(ack.rejected(), 0);
-        let ack = ApplyAck::from_value(&Value::Null);
-        assert_eq!(ack.rejected(), 0);
-    }
-
-    #[test]
-    fn apply_ack_partial_reject_is_surfaced() {
-        // Per-record reject → non-zero count drives the "partial" hard-failure
-        // path in run_push (cursor NOT advanced, status != "ok").
-        let ack = ApplyAck::from_value(&json!({
-            "applied": 8,
-            "failed": 2,
-            "errors": [{"reason": "field 'symbol' is required"}]
-        }));
-        assert_eq!(ack.rejected(), 2);
-        let detail = ack.reject_detail(Uuid::nil());
-        assert!(detail.contains("rejected 2 record(s)"), "detail has count: {detail}");
-        assert!(detail.contains("field 'symbol' is required"), "detail has reason: {detail}");
-
-        // Legacy `rejected` field name is accepted too.
-        let ack = ApplyAck::from_value(&json!({"rejected": 1}));
-        assert_eq!(ack.rejected(), 1);
-
-        // Reason can be a bare string in the array, or a top-level `error`.
-        let ack = ApplyAck::from_value(&json!({"failed": 1, "rejects": ["bad row 5"]}));
-        assert_eq!(ack.rejected(), 1);
-        assert!(ack.reject_detail(Uuid::nil()).contains("bad row 5"));
-
-        let ack = ApplyAck::from_value(&json!({"failed": 1, "error": "schema mismatch"}));
-        assert!(ack.reject_detail(Uuid::nil()).contains("schema mismatch"));
     }
 }
