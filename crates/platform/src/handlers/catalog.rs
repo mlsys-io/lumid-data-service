@@ -20,7 +20,8 @@ use crate::state::AppState;
 
 /// GET /catalog/schemas
 pub async fn get_schemas(State(st): State<AppState>) -> ApiResult<Json<Value>> {
-    let schemas = q::list_schemas(&st.pool).await?;
+    let effective = q::effective_schemas(&st.settings.user_schemas);
+    let schemas = q::list_schemas(&st.pool, &effective).await?;
     Ok(Json(json!({ "schemas": schemas })))
 }
 
@@ -29,7 +30,8 @@ pub async fn get_schema_tables(
     State(st): State<AppState>,
     Path(schema): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    if !q::is_user_schema(&schema) {
+    let effective = q::effective_schemas(&st.settings.user_schemas);
+    if !q::is_user_schema(&schema, &effective) {
         return Err(ApiError::NotFound(format!("unknown schema '{schema}'")));
     }
     let tables = q::list_tables(&st.pool, &schema).await?;
@@ -41,6 +43,10 @@ pub async fn get_table_profile(
     State(st): State<AppState>,
     Path((schema, table)): Path<(String, String)>,
 ) -> ApiResult<Json<Value>> {
+    let effective = q::effective_schemas(&st.settings.user_schemas);
+    if !q::is_user_schema(&schema, &effective) {
+        return Err(ApiError::NotFound(format!("unknown table {schema}.{table}")));
+    }
     match q::table_profile(&st.pool, &schema, &table).await? {
         Some(profile) => Ok(Json(profile)),
         None => Err(ApiError::NotFound(format!("unknown table {schema}.{table}"))),
@@ -134,7 +140,11 @@ pub async fn get_lineage_row(
             "supply at least one <column>=<value> query parameter (natural key)".into(),
         ));
     }
-    match q::trace_by_natural_key(&st.pool, &schema, &table, &raw).await? {
+    let effective = q::effective_schemas(&st.settings.user_schemas);
+    if !q::is_user_schema(&schema, &effective) {
+        return Err(ApiError::NotFound(format!("unknown schema '{schema}'")));
+    }
+    match q::trace_by_natural_key(&st.pool, &schema, &table, &raw, &effective).await? {
         Some(out) => Ok(Json(out)),
         None => Err(ApiError::NotFound(format!(
             "no rows in {schema}.{table} match the supplied key (or schema/columns invalid)"
@@ -153,6 +163,12 @@ pub async fn get_sources(
     State(st): State<AppState>,
     Query(p): Query<SourcesParams>,
 ) -> ApiResult<Json<Value>> {
+    let effective = q::effective_schemas(&st.settings.user_schemas);
+    if let Some(schema) = p.schema.as_deref() {
+        if !schema.is_empty() && !q::is_user_schema(schema, &effective) {
+            return Err(ApiError::NotFound(format!("unknown schema '{schema}'")));
+        }
+    }
     let sources = q::list_sources(&st.pool, p.schema.as_deref(), p.table.as_deref()).await?;
     Ok(Json(json!({ "sources": sources })))
 }

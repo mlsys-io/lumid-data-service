@@ -41,9 +41,14 @@ impl TableMeta {
     }
 }
 
-// 256 tables, mirroring the Python `@lru_cache(256)`.
-static META_CACHE: Lazy<Cache<String, Arc<TableMeta>>> =
-    Lazy::new(|| Cache::new(256));
+// 256 tables with a 5-minute TTL so DDL changes made outside the app are
+// picked up within minutes (without needing a manual /admin/ingest/schemas/refresh).
+static META_CACHE: Lazy<Cache<String, Arc<TableMeta>>> = Lazy::new(|| {
+    Cache::builder()
+        .max_capacity(256)
+        .time_to_live(std::time::Duration::from_secs(300))
+        .build()
+});
 
 fn key(schema: &str, table: &str) -> String {
     format!("{schema}.{table}")

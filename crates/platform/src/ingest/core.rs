@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::backend::{Registry, WriteRequest};
 use crate::error::ApiError;
 use crate::validation::{self, Rejected};
-use crate::write::{introspect, run};
+use crate::write::run;
 
 use super::lumilake::{self, LumilakeInfo};
 
@@ -31,7 +31,8 @@ fn valid_source_endpoint(s: &str) -> bool {
 
 #[derive(Serialize, Clone)]
 pub struct IngestResult {
-    pub run_id: String,
+    /// `None` when all records were rejected before a run row was opened.
+    pub run_id: Option<String>,
     pub target_schema: String,
     pub target_table: String,
     pub received: usize,
@@ -133,11 +134,24 @@ pub async fn ingest_records(
         .await
         .map_err(|e| IngestErr::Failed(e.into()))?;
 
-    // Introspect target (also confirms existence). Done before opening a run.
-    let meta = introspect::table_meta(&client, p.target_schema, p.target_table)
+    // Resolve the backend that OWNS this table (Phase B/C: Postgres or
+    // ClickHouse, per the `provenance.table_backend` registry; an unknown table
+    // defaults to Postgres, preserving the net-new-table → proposal flow).
+    // Introspect existence + columns through THAT backend — a ClickHouse-backed
+    // table isn't visible in Postgres's information_schema, so the prior
+    // PG-only introspect re-proposed every write to a CH table instead of
+    // upserting it.
+    let backend = reg
+        .get(p.target_schema, p.target_table)
         .await
-        .map_err(|e| IngestErr::Failed(e.into()))?;
-    let meta = match meta {
+        .map_err(IngestErr::Failed)?;
+
+    // Introspect target (also confirms existence). Done before opening a run.
+    let meta = match backend
+        .table_meta(p.target_schema, p.target_table)
+        .await
+        .map_err(IngestErr::Failed)?
+    {
         Some(m) => m,
         None => {
             return Err(IngestErr::UnknownTable(format!(
@@ -155,10 +169,10 @@ pub async fn ingest_records(
         (records.to_vec(), Vec::new())
     };
 
-    // All rejected, none parsed → short-circuit (route maps to 422).
+    // All rejected, none parsed → short-circuit before opening a run row (422).
     if p.validate && parsed.is_empty() && !rejected.is_empty() {
         return Ok(IngestResult {
-            run_id: String::new(),
+            run_id: None,
             target_schema: p.target_schema.to_string(),
             target_table: p.target_table.to_string(),
             received,
@@ -203,34 +217,32 @@ pub async fn ingest_records(
         }
     };
 
-    // Dispatch the upsert through the resolved backend (Phase A: Postgres).
-    // Surface the inner anyhow message for `ApiError::Internal` (the write
-    // engine's bail strings) so the failed-run error_text stays identical.
+    // Dispatch the upsert through the backend resolved above (Postgres or
+    // ClickHouse). Surface the inner anyhow message for `ApiError::Internal`
+    // (the write engine's bail strings) so the failed-run error_text stays
+    // identical.
     let to_anyhow = |e: ApiError| match e {
         ApiError::Internal(inner) => inner,
         other => anyhow::anyhow!("{other}"),
     };
-    let result = match reg.get(p.target_schema, p.target_table).await {
-        Ok(backend) => backend
-            .write_records(&WriteRequest {
-                schema: p.target_schema,
-                table: p.target_table,
-                meta: &meta,
-                records: &parsed,
-                source: p.source,
-                source_endpoint: p.source_endpoint,
-                source_run_id: &run_id,
-            })
-            .await
-            .map_err(to_anyhow),
-        Err(e) => Err(to_anyhow(e)),
-    };
+    let result = backend
+        .write_records(&WriteRequest {
+            schema: p.target_schema,
+            table: p.target_table,
+            meta: &meta,
+            records: &parsed,
+            source: p.source,
+            source_endpoint: p.source_endpoint,
+            source_run_id: &run_id,
+        })
+        .await
+        .map_err(to_anyhow);
 
     match result {
         Ok((inserted, updated)) => {
             let status = if rejected.is_empty() { "ok" } else { "partial" };
             if owned_run {
-                let _ = run::close_run(
+                if let Err(e) = run::close_run(
                     &client,
                     &run_id,
                     status,
@@ -239,10 +251,13 @@ pub async fn ingest_records(
                     rejected.len() as i64,
                     None,
                 )
-                .await;
+                .await
+                {
+                    tracing::error!("close_run failed for {run_id}: {e}");
+                }
             }
             let out = IngestResult {
-                run_id: run_id.to_string(),
+                run_id: Some(run_id.to_string()),
                 target_schema: p.target_schema.to_string(),
                 target_table: p.target_table.to_string(),
                 received,
@@ -268,9 +283,10 @@ pub async fn ingest_records(
         }
         Err(e) => {
             let error_text = format!("{e:#}");
-            let trunc = &error_text[error_text.len().saturating_sub(4000)..];
+            // Keep the head (root cause first in anyhow's {:#} format).
+            let trunc = &error_text[..error_text.len().min(4000)];
             if owned_run {
-                let _ = run::close_run(
+                if let Err(ce) = run::close_run(
                     &client,
                     &run_id,
                     "failed",
@@ -279,15 +295,20 @@ pub async fn ingest_records(
                     rejected.len() as i64,
                     Some(trunc),
                 )
-                .await;
+                .await
+                {
+                    tracing::error!("close_run failed for {run_id}: {ce}");
+                }
             }
             tracing::error!(
                 "ingest_records to {}.{} failed: {error_text}",
                 p.target_schema,
                 p.target_table
             );
-            Err(IngestErr::Failed(ApiError::BadRequest(format!(
-                "ingest failed: {e}"
+            // Log the raw error but return a sanitised message so DB internals
+            // (constraint names, column types) don't leak to the caller.
+            Err(IngestErr::Failed(ApiError::Internal(anyhow::anyhow!(
+                "ingest write failed; check server logs for run {run_id}"
             ))))
         }
     }

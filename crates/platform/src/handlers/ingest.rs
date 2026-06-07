@@ -40,9 +40,13 @@ async fn gate_target(
     schema: &str,
     table: &str,
 ) -> Result<bool, ApiError> {
-    let client = st.pool.get().await?;
-    let exists = introspect::table_exists(&client, schema, table).await?;
-    drop(client);
+    // Existence must be checked on the backend that OWNS the table — a
+    // ClickHouse-backed table is invisible to Postgres's information_schema, so
+    // a PG-only `table_exists` re-proposed every write to a CH table. `reg.get`
+    // defaults an unknown table to Postgres, so a genuinely-new shape still
+    // reports not-exists and enters the propose flow.
+    let backend = st.backends.get(schema, table).await?;
+    let exists = backend.table_meta(schema, table).await?.is_some();
     if exists {
         acl::check_can_write(&st.pool, &identity.role, schema, table).await?;
     } else if !acl::can_propose(&st.pool, &identity.role).await? {
@@ -209,7 +213,8 @@ pub async fn post_stream(
             Err(e) => {
                 status = "failed".to_string();
                 let msg = format!("{}", ApiError::from(e));
-                error_text = Some(msg[msg.len().saturating_sub(4000)..].to_string());
+                // Keep the head (root cause is first).
+                error_text = Some(msg[..msg.len().min(4000)].to_string());
                 break;
             }
         }
@@ -222,7 +227,7 @@ pub async fn post_stream(
     };
 
     let client = st.pool.get().await?;
-    let _ = run::close_run(
+    if let Err(e) = run::close_run(
         &client,
         &run_id,
         &final_status,
@@ -231,7 +236,10 @@ pub async fn post_stream(
         failed as i64,
         error_text.as_deref(),
     )
-    .await;
+    .await
+    {
+        tracing::error!("stream close_run failed for {run_id}: {e}");
+    }
     drop(client);
 
     if inserted + updated > 0 {
@@ -254,14 +262,19 @@ pub async fn post_stream(
     });
 
     if status == "failed" {
-        return Err(ApiError::BadRequest(
-            serde_json::to_string(&body_out).unwrap_or_default(),
-        ));
+        // Use Validation so the result object lands at {"detail": {...}} not
+        // double-encoded as {"detail": "{\"run_id\":...}"} (ERR-001).
+        // Use Internal (500) rather than BadRequest (400) since stream failures
+        // are engine/DB errors, not client payload problems (F05).
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "stream ingest failed; see run {} for details",
+            run_id
+        )));
     }
     if (inserted + updated) > 0 {
         lumilake::submit_after_ingest(
             &IngestResult {
-                run_id: run_id.to_string(),
+                run_id: Some(run_id.to_string()),
                 target_schema: schema.clone(),
                 target_table: table.clone(),
                 received,
@@ -549,7 +562,7 @@ pub async fn get_table_schema_json(
 // ---------------------------------------------------------------------------
 // Admin: ACL grant/revoke + cache refresh (super_admin / local only)
 // ---------------------------------------------------------------------------
-fn require_admin(identity: &Identity) -> ApiResult<()> {
+pub(crate) fn require_admin(identity: &Identity) -> ApiResult<()> {
     if identity.role == "super_admin" || identity.role == "local" {
         Ok(())
     } else {

@@ -113,6 +113,56 @@ pub struct Settings {
     /// A request whose `model` matches one of these is proxied to that backend;
     /// everything else goes to the primary. `/v1/models` aggregates all backends.
     pub llm_backends: Vec<(String, String)>,
+    /// Optional bearer for upstream LLM calls made by the agent loop. When
+    /// non-empty, the platform injects `Authorization: Bearer <key>` on the
+    /// requests it originates from the agent loop. The `/v1/*` proxy does NOT
+    /// inject this key — it forwards client requests verbatim. Required for
+    /// hosted endpoints like `https://api.anthropic.com` reached by the agent.
+    pub llm_api_key: String,
+    /// Schemas the agent's tools surface. If unset, all non-system schemas.
+    pub user_schemas: Vec<String>,
+
+    // Retrieval pipeline knobs.
+    /// TTL for in-process schema-card cache (seconds). Default 300.
+    pub retrieval_card_ttl_s: u64,
+    /// Per-session `statement_timeout` for SQL ops (milliseconds). Default 30000.
+    pub retrieval_stmt_timeout_ms: u32,
+    /// Maximum rows a single SQL op may return before the call is rejected. Default 1_000_000.
+    pub retrieval_row_cap: u64,
+    /// Object-storage key prefix for materialised retrieval outputs. Default `"retrievals"`.
+    pub retrieval_prefix: String,
+    /// Number of sample values to include per column in schema cards. Default 5.
+    pub retrieval_sample_rows: usize,
+    /// Optional Postgres role the retrieval SQL path de-escalates to via
+    /// `SET LOCAL ROLE` inside its `READ ONLY` transaction. The platform shares
+    /// one connection pool for reads, retrieval, ingest, and admin DDL — so the
+    /// pool role itself often has write/DDL (and, in many deployments, is a
+    /// superuser). Setting this to a NOSUPERUSER read-only role (e.g. one granted
+    /// only `pg_read_all_data`, or scoped per-schema SELECT) confines just the
+    /// retrieval/agent SELECTs: it removes the superuser file-read vector
+    /// (`pg_read_file`) and makes `user_schemas` a real access boundary when the
+    /// role's grants match it. Empty (default) = no `SET ROLE` (current behavior).
+    pub retrieval_db_role: String,
+
+    // Data-push / sync plane (generic). `enable_sync` (ServeParts) mounts the
+    // inbox + admin routes; these knobs drive the optional push helper and the
+    // inbox peer gate. Empty `sync_target_url` ⇒ the push helper is a no-op.
+    /// Target instance base URL the push helper POSTs to (no trailing slash).
+    pub sync_target_url: String,
+    /// Bearer token presented to the target's `/sync/apply` (a local key on the
+    /// target labelled `sync:<peer>`).
+    pub sync_target_token: String,
+    /// This instance's peer id, sent as `X-Lumid-Sync-Peer` by the push helper.
+    pub sync_peer_id: String,
+    /// Inbox allowlist: local-key labels (without the `local:` prefix) permitted
+    /// to call `/sync/apply`. Empty ⇒ any label starting with `sync:` is allowed.
+    pub sync_peer_labels: Vec<String>,
+    /// Rows per push batch (push helper). Default 1000.
+    pub sync_batch_rows: u64,
+    /// Max delivery attempts before the push helper gives up a batch. Default 5.
+    pub sync_max_attempts: u32,
+    /// Base backoff (ms) for push retries; doubles per attempt. Default 500.
+    pub sync_backoff_ms: u64,
 }
 
 impl Settings {
@@ -183,6 +233,29 @@ impl Settings {
                 .map(|(m, u)| (m.trim().to_string(), u.trim().trim_end_matches('/').to_string()))
                 .filter(|(m, u)| !m.is_empty() && !u.is_empty())
                 .collect(),
+            llm_api_key: env_str("LLM_API_KEY", ""),
+            user_schemas: env_str("USER_SCHEMAS", "")
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            retrieval_card_ttl_s: env_u64("RETRIEVAL_CARD_TTL_S", 300),
+            retrieval_stmt_timeout_ms: env_u32("RETRIEVAL_STMT_TIMEOUT_MS", 30_000),
+            retrieval_row_cap: env_u64("RETRIEVAL_ROW_CAP", 1_000_000),
+            retrieval_prefix: env_str("RETRIEVAL_PREFIX", "retrievals"),
+            retrieval_sample_rows: env_u32("RETRIEVAL_SAMPLE_ROWS", 5) as usize,
+            retrieval_db_role: env_str("RETRIEVAL_DB_ROLE", ""),
+            sync_target_url: env_str("SYNC_TARGET_URL", "").trim_end_matches('/').to_string(),
+            sync_target_token: env_str("SYNC_TARGET_TOKEN", ""),
+            sync_peer_id: env_str("SYNC_PEER_ID", ""),
+            sync_peer_labels: env_str("SYNC_PEER_LABELS", "")
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            sync_batch_rows: env_u64("SYNC_BATCH_ROWS", 1000),
+            sync_max_attempts: env_u32("SYNC_MAX_ATTEMPTS", 5),
+            sync_backoff_ms: env_u64("SYNC_BACKOFF_MS", 500),
         }
     }
 }

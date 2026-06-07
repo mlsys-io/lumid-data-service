@@ -6,6 +6,7 @@
 //! the read-config TOML (declarative reads) + the bespoke handlers/upstreams that
 //! register into it (the `my_ext` boundary, established incrementally).
 
+pub mod agent;
 pub mod app;
 pub mod auth;
 pub mod backend;
@@ -22,8 +23,10 @@ pub mod parsers;
 pub mod queries;
 pub mod read;
 pub mod realtime;
+pub mod retrieve;
 pub mod state;
+pub mod sync;
 pub mod validation;
 pub mod write;
 
-pub use boot::{serve, ServeParts};
+pub use boot::{check_serve_parts, serve, ServeParts};

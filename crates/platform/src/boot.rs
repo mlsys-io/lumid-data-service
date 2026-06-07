@@ -18,6 +18,7 @@ use axum::Router;
 use tracing_subscriber::EnvFilter;
 
 use crate::realtime::upstream::UpstreamWorker;
+use crate::retrieve::card_store::CardStore;
 use crate::{app, auth, config, db, mcp, read, realtime, state};
 
 /// The only app-specific inputs: compiled ext routes + realtime workers.
@@ -48,6 +49,16 @@ pub struct ServeParts {
     /// `LUMID_LLM_BACKEND_URL`). The capability lives in the platform; only
     /// the decision to expose it is the app's.
     pub enable_llm: bool,
+    /// Enable the agent tool-use loop (`POST /agent/v1`). Requires `enable_llm`
+    /// to also be `true` — the loop calls the `/v1/chat/completions` proxy.
+    /// `serve()` returns an error at startup when `enable_agent=true` but
+    /// `enable_llm=false`.
+    pub enable_agent: bool,
+    /// Enable the generic data-push plane: the inbox (`POST /sync/apply/...`) +
+    /// admin push routes, and create the `sync` bookkeeping tables at boot. Off
+    /// by default. A target (inbox) must enable this; a pure producer that only
+    /// uses the push helper can also enable it to expose `/admin/sync/*`.
+    pub enable_sync: bool,
 }
 
 impl Default for ServeParts {
@@ -60,13 +71,56 @@ impl Default for ServeParts {
             feed_liveness: None,
             workers: Vec::new(),
             enable_llm: false,
+            enable_agent: false,
+            enable_sync: false,
         }
     }
+}
+
+/// Validate `ServeParts` for incompatible flag combinations.
+///
+/// Extracted so tests can call this without spinning up a full server.
+/// Returns an error when `enable_agent=true` but `enable_llm=false`.
+pub fn check_serve_parts(parts: &ServeParts) -> anyhow::Result<()> {
+    if parts.enable_agent && !parts.enable_llm {
+        anyhow::bail!(
+            "enable_agent requires enable_llm to be true \
+             (the agent loop calls the /v1/* proxy)"
+        );
+    }
+    Ok(())
+}
+
+/// Validate critical settings before starting the server. Fails fast with a
+/// clear message rather than surfacing misconfiguration on the first real request.
+fn validate_settings(s: &config::Settings) -> anyhow::Result<()> {
+    if s.db_password.is_empty() {
+        anyhow::bail!("LUMID_DB_PASSWORD is required but not set");
+    }
+    if s.db_name.is_empty() {
+        anyhow::bail!("LUMID_DB_NAME is required but not set");
+    }
+    if s.blob_backend == "s3" {
+        if s.blob_s3_bucket.is_empty() {
+            anyhow::bail!("LUMID_BLOB_S3_BUCKET is required when LUMID_BLOB_BACKEND=s3");
+        }
+        if s.blob_s3_endpoint.is_empty() {
+            anyhow::bail!("LUMID_BLOB_S3_ENDPOINT is required when LUMID_BLOB_BACKEND=s3");
+        }
+    }
+    if !s.lumid_enabled && s.api_keys_raw.is_empty() {
+        tracing::warn!(
+            "LUMID_AUTH_ENABLED=false and no LUMID_API_KEYS configured — \
+             all authenticated requests will return 401"
+        );
+    }
+    Ok(())
 }
 
 /// Boot + serve until shutdown. Reads `LUMID_*` from env, incl.
 /// `LUMID_READ_CONFIG` for the read specs (default `read.toml`).
 pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
+    check_serve_parts(&parts)?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
@@ -79,6 +133,7 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let settings = Arc::new(config::Settings::from_env());
+    validate_settings(&settings)?;
     let bind_addr = settings.bind_addr.clone();
     let pool = db::build_pool(&settings)?;
     let lumid = Arc::new(auth::lumid::LumidClient::new(&settings));
@@ -127,6 +182,7 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     };
 
     let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -179,9 +235,29 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         .feed_liveness
         .unwrap_or_else(|| Arc::new(realtime::DefaultFeedLiveness));
 
+    // Data-push plane: create the `sync` bookkeeping tables (idempotent) when
+    // enabled. A target that can't migrate its inbox shouldn't start.
+    if parts.enable_sync {
+        crate::sync::migrate(&pool).await?;
+        if settings.sync_target_url.is_empty() {
+            tracing::info!("sync: inbox enabled (/sync/apply); no push target configured");
+        } else {
+            tracing::info!(
+                "sync: inbox + push enabled (target {})",
+                settings.sync_target_url
+            );
+        }
+    }
+
+    let card_store = std::sync::Arc::new(CardStore::new(
+        pool.clone(),
+        settings.retrieval_card_ttl_s,
+        settings.retrieval_sample_rows,
+    ));
+
     let state = state::AppState {
         pool, settings, lumid, local_keys, rate, redis, redis_client, hub, http, read_cache, blob_store, backends,
-        feed_liveness,
+        feed_liveness, card_store,
     };
 
     // Auto-MCP: one tool per declarative read endpoint, merged into ext routes.
@@ -191,6 +267,19 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     if parts.enable_llm {
         ext_router = ext_router.merge(crate::llm::routes());
         tracing::info!("llm proxy enabled (/v1/*)");
+    }
+    if parts.enable_agent {
+        ext_router = ext_router.merge(crate::agent::routes());
+        tracing::info!("agent tool-use loop enabled (POST /agent/v1)");
+    }
+    if parts.enable_sync {
+        // Inbox batches can exceed axum's 2 MB default; bound to the same limit
+        // as the ingest write plane.
+        ext_router = ext_router.merge(
+            crate::sync::routes()
+                .layer(axum::extract::DefaultBodyLimit::max(state.settings.ingest_max_bytes as usize)),
+        );
+        tracing::info!("sync plane enabled (POST /sync/apply, /admin/sync/*)");
     }
 
     let read_router = read::exec::build_router(&specs);
@@ -205,8 +294,29 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     );
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!("listening on {bind_addr}");
-    axum::serve(listener, router).await?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    use tokio::signal;
+    let ctrl_c = async { signal::ctrl_c().await.expect("ctrl-c handler") };
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown signal received, draining in-flight requests");
 }
 
 /// Build the blob object-store backend from settings. Default is the local

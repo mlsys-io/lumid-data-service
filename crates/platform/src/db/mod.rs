@@ -30,6 +30,9 @@ pub fn build_pool(s: &Settings) -> anyhow::Result<Pool> {
     });
     let mut pool_cfg = deadpool_postgres::PoolConfig::default();
     pool_cfg.max_size = s.pool_max;
+    // Bound pool-acquire so exhaustion returns 503 instead of hanging forever.
+    pool_cfg.timeouts.wait = Some(std::time::Duration::from_secs(5));
+    pool_cfg.timeouts.create = Some(std::time::Duration::from_secs(10));
     cfg.pool = Some(pool_cfg);
 
     let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;

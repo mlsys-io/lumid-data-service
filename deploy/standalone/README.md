@@ -79,9 +79,22 @@ Reads serve whatever is in the DB. Load it however you like:
   plain folder instead, set `LUMID_BLOB_BACKEND=localfs` and bind-mount a blobs dir.
 - **Auth**: standalone uses local keys (`LUMID_API_KEYS`, `LUMID_AUTH_ENABLED=false`).
   Point at a real introspection service by flipping those.
+- **Retrieval privileges**: `POST /retrieve` and the data agent run caller-shaped
+  `SELECT`s. They share the app's pool, which has write/DDL (and, against a default
+  Postgres, is a superuser). `reader_role.sql` creates a NOSUPERUSER `lumid_reader`
+  role and `RETRIEVAL_DB_ROLE=lumid_reader` makes the retrieval path `SET LOCAL ROLE`
+  into it per-transaction — so those SELECTs can't call `pg_read_file()` or read
+  `pg_authid`. Edit `reader_role.sql` to scope its grants per-schema if you want
+  `LUMID_USER_SCHEMAS` to be a hard read boundary. Blank `RETRIEVAL_DB_ROLE` to opt out.
 - **Optional platform features** (set in the compose `environment:` block): a ClickHouse
   backend alongside Postgres (`LUMID_CLICKHOUSE_*`, per-table routing via
   `provenance.table_backend`); realtime channel kinds for a bespoke app's workers
   (`LUMID_RT_CHANNEL_KINDS`, default `tick,news`). See the platform README's Config section.
+- **Data-push / sync**: to make this instance a sync **target**, issue the producer a
+  `sync:<peer>` local key (`API_KEYS=...,synctoken:sync:findata`); to make it a **producer**,
+  set `LUMID_SYNC_TARGET_URL`/`_TOKEN`/`LUMID_SYNC_PEER_ID` in the app `environment:`. Both need an
+  app image built with `ServeParts.enable_sync` (the generic `mint` image ships it off). The `sync`
+  bookkeeping tables are created automatically at boot — no DDL to add to `schema.sql`. Full recipe
+  in the platform README's **Data migration / cross-instance sync** section.
 - **First boot only**: `schema.sql` runs only when `./data/pgdata` is empty. To re-init,
   stop and delete `./data/pgdata`. Schema changes after that are manual DDL (`psql`).

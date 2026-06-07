@@ -16,9 +16,10 @@
 //! | POST /v1/messages               | Anthropic   | SSE       |
 //! | POST /v1/messages/count_tokens  | Anthropic   | —         |
 //!
-//! We do NOT inject auth into upstream calls — the backend is on the private
-//! network and trusts its caller. Lineage-stripping doesn't apply (the upstream
-//! is an LLM, not Postgres); payloads pass through verbatim.
+//! When `LUMID_LLM_API_KEY` is set the platform injects `Authorization: Bearer
+//! <key>` on all outbound upstream calls, enabling use of hosted endpoints like
+//! `https://api.anthropic.com` that require a bearer token. For private-network
+//! backends leave the key unset and the header is not injected.
 
 use axum::body::Body;
 use axum::extract::State;
@@ -95,6 +96,9 @@ async fn proxy_json(
     if let Some(b) = body {
         req = req.json(&b);
     }
+    if !st.settings.llm_api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", st.settings.llm_api_key));
+    }
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
@@ -144,7 +148,11 @@ async fn proxy_json(
 /// chunked JSONLs; bytes pass through unchanged with no buffering.
 async fn proxy_stream(st: &AppState, base: &str, path: &str, body: Value) -> Response {
     let url = format!("{base}{path}");
-    let resp = match st.http.post(&url).json(&body).send().await {
+    let mut req = st.http.post(&url).json(&body);
+    if !st.settings.llm_api_key.is_empty() {
+        req = req.header("Authorization", format!("Bearer {}", st.settings.llm_api_key));
+    }
+    let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
             // Forward a single SSE error frame (matches the Python behaviour).
