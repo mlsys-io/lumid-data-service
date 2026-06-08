@@ -23,6 +23,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::Response;
 use axum::Extension;
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio_postgres::types::ToSql;
@@ -85,16 +86,23 @@ pub async fn get_export(
     let mut next_param = 3usize;
 
     let status_val = q.status;
-    let after_val  = q.after;
+    // Parse after= into a typed timestamp so tokio-postgres can bind it as timestamptz.
+    let after_val: Option<DateTime<Utc>> = match q.after {
+        Some(ref s) => s.parse().ok().or_else(|| {
+            // accept bare date "YYYY-MM-DD" too
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .ok()
+                .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc())
+        }),
+        None => None,
+    };
 
     if status_val.is_some() {
         where_parts.push(format!("status = ${next_param}"));
         next_param += 1;
     }
     if after_val.is_some() {
-        // Cast via SQL so the caller can pass any ISO-8601 string without us
-        // needing to parse it into a chrono type here.
-        where_parts.push(format!("created_at > ${}::timestamptz", next_param));
+        where_parts.push(format!("created_at > ${next_param}"));
     }
 
     let where_sql = if where_parts.is_empty() {
