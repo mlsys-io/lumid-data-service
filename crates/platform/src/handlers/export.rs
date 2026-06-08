@@ -43,6 +43,11 @@ pub struct ExportQuery {
     pub offset: Option<i64>,
     /// Rows per page (default 10 000, max 100 000).
     pub limit: Option<i64>,
+    /// Filter rows by `status` column value, e.g. `?status=pending`.
+    pub status: Option<String>,
+    /// Return only rows with `created_at` strictly after this ISO-8601 timestamp,
+    /// e.g. `?after=2026-06-08T03:00:00Z`. Useful for incremental polling.
+    pub after: Option<String>,
 }
 
 /// `GET /admin/export/:schema/:table`
@@ -50,6 +55,10 @@ pub struct ExportQuery {
 /// Returns the requested page as NDJSON (one JSON object per line).
 /// An empty body signals the end of the table — stop paging when you get it.
 /// Requires a local key or `super_admin` role.
+///
+/// Optional query params:
+/// - `?status=pending`  — filter by the `status` column (for mailbox tables)
+/// - `?after=<iso8601>` — return only rows with `created_at` after the given timestamp
 pub async fn get_export(
     State(st): State<AppState>,
     Extension(identity): Extension<Identity>,
@@ -71,15 +80,54 @@ pub async fn get_export(
     let limit: i64 = q.limit.unwrap_or(10_000).clamp(1, 100_000);
     let offset: i64 = q.offset.unwrap_or(0).max(0);
 
-    let sql = format!(r#"SELECT * FROM "{schema_n}"."{table_n}" LIMIT $1 OFFSET $2"#);
-    let binds = [BindValue::Int(limit), BindValue::Int(offset)];
-    let params: Vec<&(dyn ToSql + Sync)> = vec![&limit, &offset];
+    // Build optional WHERE clauses. $1/$2 are reserved for LIMIT/OFFSET.
+    let mut where_parts: Vec<String> = Vec::new();
+    let mut next_param = 3usize;
+
+    let status_val = q.status;
+    let after_val  = q.after;
+
+    if status_val.is_some() {
+        where_parts.push(format!("status = ${next_param}"));
+        next_param += 1;
+    }
+    if after_val.is_some() {
+        // Cast via SQL so the caller can pass any ISO-8601 string without us
+        // needing to parse it into a chrono type here.
+        where_parts.push(format!("created_at > ${}::timestamptz", next_param));
+    }
+
+    let where_sql = if where_parts.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", where_parts.join(" AND "))
+    };
+
+    // When filtering, impose a stable order so cursor-based polling is consistent.
+    let order_sql = if where_parts.is_empty() {
+        String::new()
+    } else {
+        " ORDER BY created_at, msg_id".to_string()
+    };
+
+    let sql = format!(
+        r#"SELECT * FROM "{schema_n}"."{table_n}"{where_sql}{order_sql} LIMIT $1 OFFSET $2"#
+    );
+
+    // Postgres backend only uses `params` (ignores `binds`).
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![&limit, &offset];
+    if let Some(ref s) = status_val {
+        params.push(s);
+    }
+    if let Some(ref a) = after_val {
+        params.push(a);
+    }
 
     let rows = backend
         .query_rows(&BoundQuery {
             sql: &sql,
             params,
-            binds: &binds,
+            binds: &[BindValue::Int(limit), BindValue::Int(offset)],
             pre_lowered: false,
         })
         .await?;
