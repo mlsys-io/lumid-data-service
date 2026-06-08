@@ -49,7 +49,7 @@ fn default_wm() -> String {
 /// from the validator's reject set (notably it includes `id` — every table with
 /// an `id bigint` PK would otherwise have every record rejected — and excludes
 /// `raw`, which the validator accepts, so the synced copy keeps its `raw`).
-fn strip_server_side_cols(rec: &Value) -> Value {
+pub(crate) fn strip_server_side_cols(rec: &Value) -> Value {
     use crate::validation::SERVER_STAMPED_COLS;
     match rec {
         Value::Object(map) => {
