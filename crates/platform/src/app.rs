@@ -32,8 +32,9 @@ pub fn build_router(
         // or the platform's generic fallback (`GET /`). The platform names no
         // domain, so the app-provided landing/reference/llm pages live in the app.
         .merge(landing_router)
-        // Status board: browsable HTML, intentionally public (aggregate counts only).
+        // Status board + usage dashboard: browsable HTML, intentionally public.
         .route("/status", get(handlers::freshness::status))
+        .route("/usage", get(handlers::usage::usage))
         // Webhook ingress: HMAC-authenticated, mounted OUTSIDE the gate.
         .route("/webhook/:webhook_id", post(handlers::ingest::post_webhook));
         // Realtime WebSocket routes (self-authenticating, outside the gate) are
@@ -55,9 +56,7 @@ pub fn build_router(
 
         // Ingress write plane is merged below with a bounded body limit.
 
-        // Usage dashboard (global board + per-caller view) — gated: principal IDs
-        // and pipeline health counts shouldn't be unauthenticated (SEC-004).
-        .route("/usage", get(handlers::usage::usage))
+        // Per-caller usage (requires identity).
         .route("/usage/me", get(handlers::usage::usage_me))
         // Freshness JSON — gated: exposes endpoint SLA health details.
         .route("/freshness", get(handlers::freshness::freshness))
