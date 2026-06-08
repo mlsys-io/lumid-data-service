@@ -2,6 +2,7 @@
 //! `my_ext` crate.
 
 pub mod blobs;
+pub mod export;
 pub mod catalog;
 pub mod freshness;
 pub mod health;

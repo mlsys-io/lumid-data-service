@@ -26,7 +26,7 @@ use crate::write::engine;
 /// Validate + normalise a SQL identifier (schema/table/column) to
 /// `^[a-z_][a-z0-9_]{0,62}$`. Lifted from `ingest/proposals.rs::norm_ident` so
 /// the DDL builder can live here unchanged.
-fn norm_ident(s: &str) -> Option<String> {
+pub(crate) fn norm_ident(s: &str) -> Option<String> {
     let l = s.trim().to_lowercase();
     let ok = !l.is_empty()
         && l.len() <= 63

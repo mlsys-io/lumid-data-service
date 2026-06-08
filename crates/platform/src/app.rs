@@ -71,6 +71,9 @@ pub fn build_router(
         .route("/ingress/proposals/:id/reject", post(handlers::ingest::builder_reject_proposal))
         .route("/admin/ingress/proposals/:id/approve", post(handlers::ingest::approve_proposal))
         .route("/admin/ingress/proposals/:id/reject", post(handlers::ingest::reject_proposal))
+        // Export: paginated NDJSON dump of any table, backend-agnostic.
+        // Used for single-port cross-instance migration (see handlers/export.rs).
+        .route("/admin/export/:schema/:table", get(handlers::export::get_export))
         // Ingress admin (super_admin / local key) — port of injection/routes/ingest_admin.py.
         .route("/admin/ingress/acl", post(handlers::ingest::grant_acl).delete(handlers::ingest::revoke_acl))
         .route("/admin/ingress/refresh-schemas", post(handlers::ingest::refresh_schemas))
