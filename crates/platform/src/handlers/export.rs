@@ -33,6 +33,7 @@ use crate::backend::BoundQuery;
 use crate::error::ApiError;
 use crate::read::bind::BindValue;
 use crate::state::AppState;
+use crate::sync::push::strip_server_side_cols;
 
 use super::ingest::require_admin;
 
@@ -85,7 +86,8 @@ pub async fn get_export(
 
     let mut body: Vec<u8> = Vec::with_capacity(rows.len() * 128);
     for row in &rows {
-        serde_json::to_writer(&mut body, &Value::Object(row.clone()))
+        let clean = strip_server_side_cols(&Value::Object(row.clone()));
+        serde_json::to_writer(&mut body, &clean)
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("{e}")))?;
         body.push(b'\n');
     }
