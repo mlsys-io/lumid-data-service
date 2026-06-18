@@ -41,6 +41,7 @@ pub const USER_SCHEMAS: &[&str] = &[
     "prediction_markets",
     "raw",
     "provenance",
+    "obs",
 ];
 
 /// Always-blocked Postgres system schema prefixes/names. These are never
