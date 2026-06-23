@@ -8,7 +8,7 @@ license.workspace = true
 
 [dependencies]
 axum = { version = "0.7", features = ["macros", "ws", "multipart"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 serde = { version = "1", features = ["derive"] }
@@ -46,3 +46,4 @@ tokio-util = { version = "0.7", features = ["io"] }
 rustls = { version = "0.23", features = ["ring"] }
 toml = "0.8"
 humantime = "2"
+http-body = "1"

@@ -217,11 +217,18 @@ pub async fn gate(
     }
     // Fire-and-forget usage recording (per-request global + per-sub counters).
     if let Some(c) = st.redis.clone() {
+        // Prefer Content-Length header; fall back to body size hint (covers
+        // in-memory JSON responses that Axum doesn't set C-L on). Streaming
+        // responses (SSE, WS) return None from size_hint → 0.
         let bytes = resp
             .headers()
             .get(axum::http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<i64>().ok())
+            .or_else(|| {
+                use http_body::Body as _;
+                resp.body().size_hint().exact().map(|n| n as i64)
+            })
             .unwrap_or(0);
         tokio::spawn(crate::handlers::usage::record(c, sub, method, tmpl, resp.status().as_u16(), bytes));
     }

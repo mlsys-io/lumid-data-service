@@ -185,6 +185,12 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
+    // Streaming LLM client: connect timeout only. No total timeout — reasoning
+    // models can legitimately take several minutes before the first token.
+    let http_stream = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     let blob_store = build_blob_store(&settings);
 
@@ -256,7 +262,7 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     ));
 
     let state = state::AppState {
-        pool, settings, lumid, local_keys, rate, redis, redis_client, hub, http, read_cache, blob_store, backends,
+        pool, settings, lumid, local_keys, rate, redis, redis_client, hub, http, http_stream, read_cache, blob_store, backends,
         feed_liveness, card_store,
     };
 

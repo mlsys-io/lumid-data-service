@@ -25,8 +25,11 @@ pub struct AppState {
     pub hub: Option<std::sync::Arc<crate::realtime::hub::Hub>>,
     /// Multi-tier response cache backing the config-driven read layer.
     pub read_cache: std::sync::Arc<crate::read::cache::CacheManager>,
-    /// Shared HTTP client for the LLM reverse proxy (and any outbound calls).
+    /// Shared HTTP client for short non-streaming outbound calls (120 s total timeout).
     pub http: reqwest::Client,
+    /// Long-lived HTTP client for SSE/streaming LLM responses. Connect timeout
+    /// only — no total timeout, so multi-minute reasoning streams aren't cut off.
+    pub http_stream: reqwest::Client,
     /// Pluggable blob object-store backend (local filesystem by default, or
     /// S3/MinIO when `LUMID_BLOB_BACKEND=s3`). Built once at boot.
     pub blob_store: Arc<dyn object_store::ObjectStore>,

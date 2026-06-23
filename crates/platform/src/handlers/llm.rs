@@ -26,10 +26,19 @@ use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use bytes::Bytes;
+use futures_util::StreamExt;
 use serde_json::{json, Value};
+use tokio::time::{interval, Duration, MissedTickBehavior};
 
 use crate::error::ApiError;
 use crate::state::AppState;
+
+/// SSE comment injected every 15 s while the upstream is silent (queue wait or
+/// long reasoning phase). Keeps client-side idle timeouts from firing before the
+/// model produces its first content token.
+const KEEPALIVE_FRAME: &[u8] = b": keep-alive\n\n";
+const KEEPALIVE_INTERVAL_S: u64 = 15;
 
 /// The model named in a (post-default) request body, if non-empty.
 fn model_of(body: &Value) -> Option<String> {
@@ -145,10 +154,14 @@ async fn proxy_json(
 }
 
 /// Streaming proxy. Upstream is expected to return SSE (`text/event-stream`) or
-/// chunked JSONLs; bytes pass through unchanged with no buffering.
+/// chunked JSONLs. Uses `http_stream` (connect timeout only — no total timeout)
+/// so multi-minute reasoning generations aren't cut off at 120 s.
+///
+/// Injects SSE comment keep-alive frames every `KEEPALIVE_INTERVAL_S` seconds of
+/// upstream silence (queue wait before first token, or long thinking phase).
 async fn proxy_stream(st: &AppState, base: &str, path: &str, body: Value) -> Response {
     let url = format!("{base}{path}");
-    let mut req = st.http.post(&url).json(&body);
+    let mut req = st.http_stream.post(&url).json(&body);
     if !st.settings.llm_api_key.is_empty() {
         req = req.header("Authorization", format!("Bearer {}", st.settings.llm_api_key));
     }
@@ -174,9 +187,37 @@ async fn proxy_stream(st: &AppState, base: &str, path: &str, body: Value) -> Res
         );
         return sse_response(Body::from(frame));
     }
-    // Stream raw upstream bytes through unchanged.
-    let stream = resp.bytes_stream();
-    sse_response(Body::from_stream(stream))
+
+    // Spawn a task that pipes upstream bytes to a channel, injecting SSE
+    // keep-alive comments during any silent gaps >= KEEPALIVE_INTERVAL_S.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    tokio::spawn(async move {
+        let mut ka = interval(Duration::from_secs(KEEPALIVE_INTERVAL_S));
+        ka.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        ka.tick().await; // discard the first immediate tick
+        let mut upstream = Box::pin(resp.bytes_stream());
+        loop {
+            tokio::select! {
+                biased;
+                chunk = upstream.next() => {
+                    match chunk {
+                        Some(Ok(b)) => { if tx.send(b).is_err() { break; } }
+                        // On upstream error or end, close the channel (drops tx).
+                        _ => break,
+                    }
+                }
+                _ = ka.tick() => {
+                    if tx.send(Bytes::from_static(KEEPALIVE_FRAME)).is_err() { break; }
+                }
+            }
+        }
+    });
+
+    // Convert the mpsc receiver to a Stream for axum Body.
+    let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|b| (Ok::<Bytes, std::convert::Infallible>(b), rx))
+    });
+    sse_response(Body::from_stream(body_stream))
 }
 
 fn sse_response(body: Body) -> Response {
