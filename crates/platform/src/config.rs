@@ -31,6 +31,13 @@ pub struct Settings {
     pub db_user: String,
     pub db_password: String,
     pub db_name: String,
+    /// Single-tenant pin: when non-empty, every pooled connection starts with
+    /// `app.tenant_id` set to this value (via the libpq `options` param), so the
+    /// DB role can be a plain NOSUPERUSER/NOBYPASSRLS login and RLS still scopes
+    /// it to exactly this tenant. Empty (default) = today's behavior (no GUC set;
+    /// the connecting role must itself be BYPASSRLS/superuser to cross RLS, e.g.
+    /// the multi-tenant cloud instance that sets `app.tenant_id` per request).
+    pub db_tenant_id: String,
     pub pool_max: usize,
     pub statement_timeout_ms: u32,
     pub ohlc_row_cap: i64,
@@ -173,6 +180,7 @@ impl Settings {
             db_user: env_str("DB_USER", "postgres"),
             db_password: env_str("DB_PASSWORD", ""),
             db_name: env_str("DB_NAME", "postgres"),
+            db_tenant_id: env_str("DB_TENANT_ID", ""),
             pool_max: env_u32("POOL_MAX", 20) as usize,
             statement_timeout_ms: env_u32("STATEMENT_TIMEOUT_MS", 30000),
             ohlc_row_cap: env_u32("OHLC_ROW_CAP", 200_000) as i64,
