@@ -57,6 +57,10 @@ pub struct Settings {
     // Rate limit, "<n>/<unit>" e.g. "600/minute".
     pub rate_limit_anon: String,
     pub rate_limit_authed: String,
+    /// Max simultaneous in-flight requests per API key. 0 = unlimited.
+    pub max_concurrency_per_key: u32,
+    /// Max simultaneous in-flight requests per client IP. 0 = unlimited.
+    pub max_concurrency_per_ip: u32,
 
     // Redis (read-only: quote-snapshot last-tick). Empty disables.
     pub redis_url: String,
@@ -108,11 +112,17 @@ pub struct Settings {
     // model injected when a request omits one (→ primary).
     pub llm_backend_url: String,
     pub llm_default_model: String,
-    /// Additional model→backend routes for the multi-backend `/v1/*` proxy, as
-    /// `(model, base_url)` pairs from `LUMID_LLM_BACKENDS` (`model=url;model=url`).
-    /// A request whose `model` matches one of these is proxied to that backend;
-    /// everything else goes to the primary. `/v1/models` aggregates all backends.
-    pub llm_backends: Vec<(String, String)>,
+    /// Additional model→backend routes for the multi-backend `/v1/*` proxy.
+    /// Format: `model=url;model=url` (one backend) or `model=url1,url2;…` (round-robin).
+    /// A request whose `model` matches one of these is proxied to a backend chosen
+    /// round-robin across the URL list; everything else goes to the primary.
+    /// `/v1/models` aggregates all backends.
+    pub llm_backends: Vec<(String, Vec<String>)>,
+    /// Catch-all backend URL for any explicitly-specified model that isn't the
+    /// primary and isn't in `llm_backends`. When set (e.g. `https://openrouter.ai/api`),
+    /// unknown model IDs are forwarded there rather than rejected or sent to local.
+    /// Empty (default) = fall through to primary.
+    pub llm_openrouter_url: String,
     /// Optional bearer for upstream LLM calls made by the agent loop. When
     /// non-empty, the platform injects `Authorization: Bearer <key>` on the
     /// requests it originates from the agent loop. The `/v1/*` proxy does NOT
@@ -193,6 +203,8 @@ impl Settings {
             api_keys_raw: env_str("API_KEYS", ""),
             rate_limit_anon: env_str("RATE_LIMIT_ANON", "60/minute"),
             rate_limit_authed: env_str("RATE_LIMIT_AUTHED", "600/minute"),
+            max_concurrency_per_key: env_u32("MAX_CONCURRENCY_PER_KEY", 0),
+            max_concurrency_per_ip: env_u32("MAX_CONCURRENCY_PER_IP", 0),
             redis_url: env_str("REDIS_URL", ""),
             quotes_max_symbols: env_u32("RT_SSE_REQUEST_SYMS", 100) as usize,
             blob_root: env_str("BLOB_ROOT", "/app/blobs"),
@@ -230,9 +242,19 @@ impl Settings {
             llm_backends: env_str("LLM_BACKENDS", "")
                 .split(';')
                 .filter_map(|e| e.trim().split_once('='))
-                .map(|(m, u)| (m.trim().to_string(), u.trim().trim_end_matches('/').to_string()))
-                .filter(|(m, u)| !m.is_empty() && !u.is_empty())
+                .map(|(m, urls_str)| {
+                    let urls: Vec<String> = urls_str
+                        .split(',')
+                        .map(|u| u.trim().trim_end_matches('/').to_string())
+                        .filter(|u| !u.is_empty())
+                        .collect();
+                    (m.trim().to_string(), urls)
+                })
+                .filter(|(m, urls)| !m.is_empty() && !urls.is_empty())
                 .collect(),
+            llm_openrouter_url: env_str("LLM_OPENROUTER_URL", "")
+                .trim_end_matches('/')
+                .to_string(),
             llm_api_key: env_str("LLM_API_KEY", ""),
             user_schemas: env_str("USER_SCHEMAS", "")
                 .split(',')

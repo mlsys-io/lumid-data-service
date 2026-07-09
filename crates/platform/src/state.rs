@@ -17,6 +17,7 @@ pub struct AppState {
     pub lumid: Arc<LumidClient>,
     pub local_keys: Arc<HashMap<String, String>>,
     pub rate: Arc<RateLimiter>,
+    pub concurrency: Option<Arc<crate::auth::ratelimit::ConcurrencyLimiter>>,
     /// Read-only Redis (quote-snapshot last-tick). None when unconfigured.
     pub redis: Option<redis::aio::MultiplexedConnection>,
     /// Redis client handle for opening pub/sub connections (realtime streams).
@@ -25,11 +26,13 @@ pub struct AppState {
     pub hub: Option<std::sync::Arc<crate::realtime::hub::Hub>>,
     /// Multi-tier response cache backing the config-driven read layer.
     pub read_cache: std::sync::Arc<crate::read::cache::CacheManager>,
-    /// Shared HTTP client for short non-streaming outbound calls (120 s total timeout).
+    /// Shared HTTP client for non-streaming outbound calls (300 s total timeout).
     pub http: reqwest::Client,
     /// Long-lived HTTP client for SSE/streaming LLM responses. Connect timeout
     /// only — no total timeout, so multi-minute reasoning streams aren't cut off.
     pub http_stream: reqwest::Client,
+    /// Health-aware, least-loaded LLM backend pool with circuit breaker.
+    pub llm_pool: Arc<crate::llm_pool::BackendPool>,
     /// Pluggable blob object-store backend (local filesystem by default, or
     /// S3/MinIO when `LUMID_BLOB_BACKEND=s3`). Built once at boot.
     pub blob_store: Arc<dyn object_store::ObjectStore>,

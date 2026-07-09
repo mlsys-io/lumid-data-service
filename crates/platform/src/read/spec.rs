@@ -118,6 +118,13 @@ pub struct EndpointSpec {
     /// duplicates, and `FINAL` is expensive.
     #[serde(default)]
     pub ch_final: bool,
+    /// Optional per-spec query timeout in milliseconds. When set, the backend
+    /// `query_rows` call is wrapped in `tokio::time::timeout`; on expiry the
+    /// spec returns an empty result (200 []) rather than propagating as 500.
+    /// Intended for full-text search specs over compressed hypertables where
+    /// zero-match queries scan all chunks and can take minutes.
+    #[serde(default)]
+    pub query_timeout_ms: Option<u64>,
     /// Parsed backend-neutral query IR (`T-READ-IR-001`). Populated at spec-load
     /// when `sql` fits the bounded read-only SELECT grammar; `None` ⇒ the spec
     /// fell back to the raw-SQL Postgres path (the un-parseable construct was
