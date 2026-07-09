@@ -1,6 +1,11 @@
 # T-READ-IR-001 — backend-neutral query IR for the read layer
 
-**Area:** READ-IR · **Size:** L · **Status:** proposed
+> **Status update (2026-07):** landed. `QueryIr`/`Predicate`/`Expr`, the SELECT
+> parser with raw-SQL fallback, and both `PostgresDialect` + `ClickHouseDialect`
+> lowerers now live in `crates/platform/src/read/{ir,parse,dialect}.rs`. The
+> checklist below is the original spec, kept as a historical record.
+
+**Area:** READ-IR · **Size:** L · **Status:** implemented (was: proposed)
 **Design:** `docs/decisions/read-query-ir.md`
 **Builds on:** PR #9 (`BindValue` ABI + CH placeholder translation)
 

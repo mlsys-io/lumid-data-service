@@ -280,9 +280,29 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         settings.retrieval_sample_rows,
     ));
 
+    // Federation (F1 mesh core): peer registry + forwarder. Reuses the shared
+    // `http` client. Empty peer set / no `*_federate` ⇒ pure local (no-op).
+    let federation = Arc::new(crate::federation::Federation::new(
+        &settings.peers,
+        http.clone(),
+        settings.instance_id.clone(),
+        settings.app_id.clone(),
+    ));
+    if federation.has_peers() {
+        tracing::info!(
+            "federation: instance={} app={} peers={} read_federate={:?} llm_federate={:?}",
+            settings.instance_id,
+            settings.app_id,
+            settings.peers.len(),
+            settings.read_federate,
+            settings.llm_federate,
+        );
+    }
+
     let state = state::AppState {
         pool, settings, lumid, local_keys, rate, concurrency, redis, redis_client, hub, http,
         http_stream, llm_pool, read_cache, blob_store, backends, feed_liveness, card_store,
+        federation,
     };
 
     // Auto-MCP: one tool per declarative read endpoint, merged into ext routes.

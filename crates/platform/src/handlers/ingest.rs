@@ -48,7 +48,12 @@ async fn gate_target(
     let backend = st.backends.get(schema, table).await?;
     let exists = backend.table_meta(schema, table).await?.is_some();
     if exists {
-        acl::check_can_write(&st.pool, &identity.role, schema, table).await?;
+        // A narrow capability scope (e.g. lqt:universe:refresh → mailbox.lqt_inbox)
+        // authorizes this ONE table without a coarse role grant that would open
+        // it to every PAT of that role. Fall through to the role ACL otherwise.
+        if !acl::scope_grants_write(&identity.scopes, schema, table) {
+            acl::check_can_write(&st.pool, &identity.role, schema, table).await?;
+        }
     } else if !acl::can_propose(&st.pool, &identity.role).await? {
         return Err(ApiError::Forbidden(format!(
             "role {:?} has no ingress allowlist entries; cannot write or propose new tables.",

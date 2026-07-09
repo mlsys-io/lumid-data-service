@@ -19,11 +19,14 @@ myapp/
 
 ## 1. Get an app image
 
-**Config-only app** (declarative reads, no custom Rust — the common case): build the
-generic platform binary once and tag it `lumid-app:latest`:
+**Config-only app** (declarative reads, no custom Rust — the common case): build a
+thin generic platform binary once and tag it `lumid-app:latest`. This repo ships
+only the platform library crate (`crates/platform`, crate `lumid-platform`), so
+the config-only binary is a ~6-line `main` you provide in your own app crate (see
+`../../DEVELOPING.md`); build it and package it:
 
 ```bash
-# from the platform repo root (crates/mint-app-bin is the config-only binary)
+# from your app crate that depends on lumid-platform via a path dep
 docker run --rm -v "$PWD":/build -e CARGO_HOME=/build/.cargo-home \
   -w /build rust:1-bookworm cargo build --release --bin mint-app
 # package the binary into a slim image

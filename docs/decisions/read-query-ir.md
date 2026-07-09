@@ -1,6 +1,11 @@
 # Read-layer query IR — compile specs to a backend-neutral IR, lower to PG / CH
 
-**Status:** proposed (design)
+> **Status update (2026-07):** accepted + implemented. The IR, SELECT parser
+> (with raw-SQL fallback), and `PostgresDialect`/`ClickHouseDialect` lowerers
+> described below now exist in `crates/platform/src/read/{ir,parse,dialect}.rs`.
+> This document is retained as the design record.
+
+**Status:** implemented (was: proposed — design)
 **Author:** Yao Lu
 **Builds on:** PR #9 (backend-neutral `BindValue` ABI + CH read placeholder translation)
 **Related:** LQT `docs/decisions/governed-policy-substrate.md` (the platform-wide "DSL+compile" consolidation; this is its **layer β** consumer)

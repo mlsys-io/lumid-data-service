@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{RawPathParams, RawQuery, State};
+use axum::extract::{Extension, OriginalUri, RawPathParams, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -17,8 +17,10 @@ use serde_json::{Map, Value};
 use super::bind;
 use super::cache::{CacheKey, CachedBody};
 use super::spec::{EndpointSpec, Shape};
+use crate::auth::Identity;
 use crate::db::lineage::strip_lineage_rows;
 use crate::error::{ApiError, ApiResult};
+use crate::federation::OriginIdentity;
 use crate::state::AppState;
 
 /// Build a router mounting every spec as a GET route (reads are GET-only).
@@ -28,22 +30,32 @@ pub fn build_router(specs: &[Arc<EndpointSpec>]) -> Router<AppState> {
         let spec = spec.clone();
         let id: Arc<str> = Arc::from(spec.id.as_str());
         let path = spec.path.clone();
-        let handler = move |raw_path: RawPathParams, raw_q: RawQuery, headers: HeaderMap, st: State<AppState>| {
+        let handler = move |raw_path: RawPathParams,
+                            raw_q: RawQuery,
+                            orig: OriginalUri,
+                            ident: Option<Extension<Identity>>,
+                            headers: HeaderMap,
+                            st: State<AppState>| {
             let spec = spec.clone();
             let id = id.clone();
-            async move { run_spec(&st.0, &spec, id, raw_path, raw_q, &headers).await }
+            async move {
+                run_spec(&st.0, &spec, id, raw_path, raw_q, orig, ident, &headers).await
+            }
         };
         r = r.route(&path, get(handler));
     }
     r
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_spec(
     st: &AppState,
     spec: &EndpointSpec,
     id: Arc<str>,
     raw_path: RawPathParams,
     raw_q: RawQuery,
+    orig: OriginalUri,
+    ident: Option<Extension<Identity>>,
     headers: &HeaderMap,
 ) -> Response {
     // Path + query maps.
@@ -61,25 +73,87 @@ async fn run_spec(
     let id_kv = id_echo(&path);
     let ttl = spec.ttl_duration();
 
-    // Produce (or fetch cached) the serialized body.
+    // Federation default-route (F1): when `read_federate` names a configured
+    // peer, declarative reads this instance doesn't own are forwarded to that
+    // peer. MVP rule — shadow mode: every declarative read is treated as
+    // federated (the shadow has no local warehouse). The forward is wrapped
+    // INSIDE the read-cache below (keyed spec-id+params), so a warm entry serves
+    // locally with no peer round-trip. When `read_federate` is unset, this is
+    // `None` and reads run locally exactly as before.
+    let fed_peer = st
+        .settings
+        .read_federate
+        .as_deref()
+        .and_then(|pid| st.federation.peer(pid));
+    let origin = ident
+        .map(|Extension(i)| OriginIdentity { sub: i.sub, role: i.role })
+        .unwrap_or_default();
+
+    // Produce (or fetch cached) the serialized body. The compute closure either
+    // runs the local query (`produce`) or forwards to the peer — both return the
+    // serialized JSON bytes, so the cache layer is identical for both paths.
+    let raw_q_str = raw_q.0.clone();
+    let compute = || async {
+        match fed_peer {
+            Some(peer) => {
+                produce_federated(st, peer, orig.0.path(), raw_q_str.as_deref(), &origin).await
+            }
+            None => produce(st, spec, &bound, id_kv.clone()).await,
+        }
+    };
+
     let body: ApiResult<Arc<CachedBody>> = if spec.cache {
         let gen = st.read_cache.generation(&id);
         let key = CacheKey::new(id, gen, bound.canon.clone());
-        st.read_cache
-            .get_or_compute(key, ttl, true, || async {
-                produce(st, spec, &bound, id_kv.clone()).await
-            })
-            .await
+        st.read_cache.get_or_compute(key, ttl, true, compute).await
     } else {
-        produce(st, spec, &bound, id_kv.clone())
-            .await
-            .map(|bytes| CachedBody::new(bytes, ttl))
+        compute().await.map(|bytes| CachedBody::new(bytes, ttl))
     };
 
     match body {
         Ok(cb) => respond(&cb, spec, headers),
         Err(e) => e.into_response(),
     }
+}
+
+/// Forward a declarative read to a federation `peer`'s identical endpoint and
+/// return the peer's JSON body bytes (to be cached + relayed by the caller).
+///
+/// Only a 2xx JSON response is cached; any other status maps to an `ApiError`
+/// (NOT cached — errors must not be memoized) that surfaces the peer's status
+/// class to the client. This is the compute half of the cache-wrapped forward:
+/// the surrounding `get_or_compute` means a warm spec-id+params entry never
+/// reaches here (no peer round-trip on a cache hit).
+async fn produce_federated(
+    st: &AppState,
+    peer: &crate::config::Peer,
+    path: &str,
+    query: Option<&str>,
+    origin: &OriginIdentity,
+) -> ApiResult<Vec<u8>> {
+    // Reads are GET-only; no request body.
+    let resp = st
+        .federation
+        .forward(peer, reqwest::Method::GET, path, query, Vec::new(), origin)
+        .await;
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("federation body read: {e}")))?;
+    if status.is_success() {
+        return Ok(bytes.to_vec());
+    }
+    // Map the peer's error class to ours (message from the peer body when JSON).
+    let detail = serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|v| v.get("detail").and_then(|d| d.as_str()).map(str::to_string))
+        .unwrap_or_else(|| format!("federation peer returned {}", status.as_u16()));
+    Err(match status {
+        StatusCode::NOT_FOUND => ApiError::NotFound(detail),
+        StatusCode::BAD_REQUEST => ApiError::BadRequest(detail),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ApiError::Forbidden(detail),
+        _ => ApiError::Unavailable(detail),
+    })
 }
 
 /// Execute the query and serialize the shaped JSON body.
