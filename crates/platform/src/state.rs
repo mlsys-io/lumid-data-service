@@ -42,4 +42,8 @@ pub struct AppState {
     pub feed_liveness: Arc<dyn crate::realtime::FeedLiveness>,
     /// In-process TTL cache for schema cards (built by the retrieval pipeline).
     pub card_store: Arc<CardStore>,
+    /// Federation client (F1 mesh core): peer registry + forwarder for reads /
+    /// LLM calls this instance doesn't serve locally. Empty peer set ⇒ pure
+    /// local (no forwarding). Cheap to clone.
+    pub federation: Arc<crate::federation::Federation>,
 }

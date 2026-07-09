@@ -14,6 +14,7 @@ pub mod boot;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod federation;
 pub mod handlers;
 pub mod ingest;
 pub mod llm;

@@ -22,7 +22,7 @@
 //! backends leave the key unset and the header is not injected.
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -31,7 +31,10 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::time::{interval, Duration, MissedTickBehavior};
 
+use crate::auth::Identity;
+use crate::config::Peer;
 use crate::error::ApiError;
+use crate::federation::{OriginIdentity, HDR_APP, HDR_ORIGIN_ROLE, HDR_ORIGIN_SUB};
 use crate::state::AppState;
 
 /// SSE comment injected every 15 s while the upstream is silent (queue wait or
@@ -49,13 +52,45 @@ fn model_of(body: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Resolve the upstream base URL for a request's `model`. A model listed in
-/// `llm_backends` routes to that backend; anything else (incl. no model) routes
-/// to the primary `llm_backend_url`. 503 when nothing is configured.
-fn backend_for_model(st: &AppState, model: Option<&str>) -> Result<String, ApiError> {
+/// The resolved upstream for a `/v1/*` request: a base URL plus, when the
+/// request is federated (`LUMID_LLM_FEDERATE`), the peer whose bearer + origin
+/// headers authenticate the hop. `peer: None` ⇒ a local LLM backend (unchanged
+/// behavior: `llm_api_key` is injected if set).
+struct LlmTarget {
+    base: String,
+    peer: Option<Peer>,
+}
+
+/// Resolve the upstream for a request's `model`.
+///
+/// Federation default-route (F1): when `LUMID_LLM_FEDERATE` names a configured
+/// peer, ALL `/v1/*` traffic targets that peer's base URL (the peer serves LLM
+/// from ITS `llm_backends`), authenticated with the peer bearer. When unset,
+/// behavior is unchanged: a model listed in `llm_backends` routes to that
+/// backend; anything else (incl. no model) routes to the primary
+/// `llm_backend_url`; 503 when nothing is configured.
+fn resolve_llm_target(st: &AppState, model: Option<&str>) -> Result<LlmTarget, ApiError> {
+    if let Some(pid) = st.settings.llm_federate.as_deref() {
+        match st.federation.peer(pid) {
+            Some(peer) => {
+                return Ok(LlmTarget {
+                    base: peer.base_url.trim_end_matches('/').to_string(),
+                    peer: Some(peer.clone()),
+                });
+            }
+            None => {
+                return Err(ApiError::Unavailable(format!(
+                    "LUMID_LLM_FEDERATE={pid} names no configured peer (check LUMID_PEERS)"
+                )));
+            }
+        }
+    }
     if let Some(m) = model {
         if let Some((_, url)) = st.settings.llm_backends.iter().find(|(bm, _)| bm == m) {
-            return Ok(url.trim_end_matches('/').to_string());
+            return Ok(LlmTarget {
+                base: url.trim_end_matches('/').to_string(),
+                peer: None,
+            });
         }
     }
     let primary = st.settings.llm_backend_url.trim_end_matches('/');
@@ -64,7 +99,38 @@ fn backend_for_model(st: &AppState, model: Option<&str>) -> Result<String, ApiEr
             "LLM backend not configured (LUMID_LLM_BACKEND_URL is empty)".into(),
         ));
     }
-    Ok(primary.to_string())
+    Ok(LlmTarget { base: primary.to_string(), peer: None })
+}
+
+/// Apply outbound auth to a `/v1/*` upstream request: the peer bearer + origin
+/// headers when federating, else the local `llm_api_key` (if set). Keeps the two
+/// auth modes in one place so every proxy helper stays consistent.
+fn apply_upstream_auth(
+    mut req: reqwest::RequestBuilder,
+    st: &AppState,
+    peer: Option<&Peer>,
+    origin: &OriginIdentity,
+) -> reqwest::RequestBuilder {
+    match peer {
+        Some(p) => {
+            if !p.token.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", p.token));
+            }
+            req = req
+                .header(HDR_ORIGIN_SUB, origin.sub.clone())
+                .header(HDR_ORIGIN_ROLE, origin.role.clone())
+                .header(HDR_APP, st.settings.app_id.clone());
+        }
+        None => {
+            if !st.settings.llm_api_key.is_empty() {
+                req = req.header(
+                    "Authorization",
+                    format!("Bearer {}", st.settings.llm_api_key),
+                );
+            }
+        }
+    }
+    req
 }
 
 /// Inject the server-configured default `model` when the caller omits it (or
@@ -93,21 +159,22 @@ fn apply_default_model(st: &AppState, mut body: Value) -> Value {
 
 /// One-shot proxy for non-streaming endpoints. Faithfully relays upstream
 /// status + JSON body (or wraps a non-JSON body).
+#[allow(clippy::too_many_arguments)]
 async fn proxy_json(
     st: &AppState,
     base: &str,
     method: reqwest::Method,
     path: &str,
     body: Option<Value>,
+    peer: Option<&Peer>,
+    origin: &OriginIdentity,
 ) -> Response {
     let url = format!("{base}{path}");
     let mut req = st.http.request(method.clone(), &url);
     if let Some(b) = body {
         req = req.json(&b);
     }
-    if !st.settings.llm_api_key.is_empty() {
-        req = req.header("Authorization", format!("Bearer {}", st.settings.llm_api_key));
-    }
+    req = apply_upstream_auth(req, st, peer, origin);
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
@@ -159,12 +226,17 @@ async fn proxy_json(
 ///
 /// Injects SSE comment keep-alive frames every `KEEPALIVE_INTERVAL_S` seconds of
 /// upstream silence (queue wait before first token, or long thinking phase).
-async fn proxy_stream(st: &AppState, base: &str, path: &str, body: Value) -> Response {
+async fn proxy_stream(
+    st: &AppState,
+    base: &str,
+    path: &str,
+    body: Value,
+    peer: Option<&Peer>,
+    origin: &OriginIdentity,
+) -> Response {
     let url = format!("{base}{path}");
     let mut req = st.http_stream.post(&url).json(&body);
-    if !st.settings.llm_api_key.is_empty() {
-        req = req.header("Authorization", format!("Bearer {}", st.settings.llm_api_key));
-    }
+    req = apply_upstream_auth(req, st, peer, origin);
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
@@ -242,12 +314,42 @@ fn require_object(body: Value) -> Result<Value, ApiError> {
     }
 }
 
+/// The caller's origin identity for a forwarded (federated) `/v1/*` request,
+/// from the gated `Identity` in request extensions. Default (empty) when absent
+/// — the peer authenticates on the peer bearer regardless; the origin headers
+/// are attribution/separation groundwork (F3).
+fn origin_of(ident: Option<Extension<Identity>>) -> OriginIdentity {
+    ident
+        .map(|Extension(i)| OriginIdentity { sub: i.sub, role: i.role })
+        .unwrap_or_default()
+}
+
 // ----------------------------------------------------------------- OpenAI
 
 /// GET /v1/models — aggregate the `data` list across every configured backend
 /// (primary + `llm_backends`), deduped by model id. Best-effort: a backend that
 /// errors is skipped. 503 only when nothing is configured.
-pub async fn list_models(State(st): State<AppState>) -> Response {
+pub async fn list_models(
+    ident: Option<Extension<Identity>>,
+    State(st): State<AppState>,
+) -> Response {
+    // Federation default-route: forward `/v1/models` to the peer verbatim.
+    if st.settings.llm_federate.is_some() {
+        let target = match resolve_llm_target(&st, None) {
+            Ok(t) => t,
+            Err(e) => return e.into_response(),
+        };
+        return proxy_json(
+            &st,
+            &target.base,
+            reqwest::Method::GET,
+            "/v1/models",
+            None,
+            target.peer.as_ref(),
+            &origin_of(ident),
+        )
+        .await;
+    }
     // Distinct backend base URLs, primary first.
     let mut bases: Vec<String> = Vec::new();
     let primary = st.settings.llm_backend_url.trim_end_matches('/').to_string();
@@ -268,7 +370,16 @@ pub async fn list_models(State(st): State<AppState>) -> Response {
     }
     // Single backend → relay verbatim (preserves the upstream's exact shape).
     if bases.len() == 1 {
-        return proxy_json(&st, &bases[0], reqwest::Method::GET, "/v1/models", None).await;
+        return proxy_json(
+            &st,
+            &bases[0],
+            reqwest::Method::GET,
+            "/v1/models",
+            None,
+            None,
+            &OriginIdentity::default(),
+        )
+        .await;
     }
     let mut data: Vec<Value> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -297,85 +408,108 @@ pub async fn list_models(State(st): State<AppState>) -> Response {
 }
 
 /// POST /v1/chat/completions
-pub async fn chat_completions(State(st): State<AppState>, body: Json<Value>) -> Response {
+pub async fn chat_completions(
+    ident: Option<Extension<Identity>>,
+    State(st): State<AppState>,
+    body: Json<Value>,
+) -> Response {
     let body = match require_object(body.0) {
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
     let body = apply_default_model(&st, body);
-    let base = match backend_for_model(&st, model_of(&body).as_deref()) {
-        Ok(b) => b,
+    let target = match resolve_llm_target(&st, model_of(&body).as_deref()) {
+        Ok(t) => t,
         Err(e) => return e.into_response(),
     };
+    let origin = origin_of(ident);
     if wants_stream(&body) {
-        proxy_stream(&st, &base, "/v1/chat/completions", body).await
+        proxy_stream(&st, &target.base, "/v1/chat/completions", body, target.peer.as_ref(), &origin).await
     } else {
-        proxy_json(&st, &base, reqwest::Method::POST, "/v1/chat/completions", Some(body)).await
+        proxy_json(&st, &target.base, reqwest::Method::POST, "/v1/chat/completions", Some(body), target.peer.as_ref(), &origin).await
     }
 }
 
 /// POST /v1/completions
-pub async fn completions(State(st): State<AppState>, body: Json<Value>) -> Response {
+pub async fn completions(
+    ident: Option<Extension<Identity>>,
+    State(st): State<AppState>,
+    body: Json<Value>,
+) -> Response {
     let body = match require_object(body.0) {
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
     let body = apply_default_model(&st, body);
-    let base = match backend_for_model(&st, model_of(&body).as_deref()) {
-        Ok(b) => b,
+    let target = match resolve_llm_target(&st, model_of(&body).as_deref()) {
+        Ok(t) => t,
         Err(e) => return e.into_response(),
     };
+    let origin = origin_of(ident);
     if wants_stream(&body) {
-        proxy_stream(&st, &base, "/v1/completions", body).await
+        proxy_stream(&st, &target.base, "/v1/completions", body, target.peer.as_ref(), &origin).await
     } else {
-        proxy_json(&st, &base, reqwest::Method::POST, "/v1/completions", Some(body)).await
+        proxy_json(&st, &target.base, reqwest::Method::POST, "/v1/completions", Some(body), target.peer.as_ref(), &origin).await
     }
 }
 
 /// POST /v1/embeddings (non-streaming)
-pub async fn embeddings(State(st): State<AppState>, body: Json<Value>) -> Response {
+pub async fn embeddings(
+    ident: Option<Extension<Identity>>,
+    State(st): State<AppState>,
+    body: Json<Value>,
+) -> Response {
     let body = match require_object(body.0) {
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
     let body = apply_default_model(&st, body);
-    let base = match backend_for_model(&st, model_of(&body).as_deref()) {
-        Ok(b) => b,
+    let target = match resolve_llm_target(&st, model_of(&body).as_deref()) {
+        Ok(t) => t,
         Err(e) => return e.into_response(),
     };
-    proxy_json(&st, &base, reqwest::Method::POST, "/v1/embeddings", Some(body)).await
+    proxy_json(&st, &target.base, reqwest::Method::POST, "/v1/embeddings", Some(body), target.peer.as_ref(), &origin_of(ident)).await
 }
 
 // -------------------------------------------------------------- Anthropic
 
 /// POST /v1/messages
-pub async fn messages(State(st): State<AppState>, body: Json<Value>) -> Response {
+pub async fn messages(
+    ident: Option<Extension<Identity>>,
+    State(st): State<AppState>,
+    body: Json<Value>,
+) -> Response {
     let body = match require_object(body.0) {
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
     let body = apply_default_model(&st, body);
-    let base = match backend_for_model(&st, model_of(&body).as_deref()) {
-        Ok(b) => b,
+    let target = match resolve_llm_target(&st, model_of(&body).as_deref()) {
+        Ok(t) => t,
         Err(e) => return e.into_response(),
     };
+    let origin = origin_of(ident);
     if wants_stream(&body) {
-        proxy_stream(&st, &base, "/v1/messages", body).await
+        proxy_stream(&st, &target.base, "/v1/messages", body, target.peer.as_ref(), &origin).await
     } else {
-        proxy_json(&st, &base, reqwest::Method::POST, "/v1/messages", Some(body)).await
+        proxy_json(&st, &target.base, reqwest::Method::POST, "/v1/messages", Some(body), target.peer.as_ref(), &origin).await
     }
 }
 
 /// POST /v1/messages/count_tokens (non-streaming)
-pub async fn count_tokens(State(st): State<AppState>, body: Json<Value>) -> Response {
+pub async fn count_tokens(
+    ident: Option<Extension<Identity>>,
+    State(st): State<AppState>,
+    body: Json<Value>,
+) -> Response {
     let body = match require_object(body.0) {
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
     let body = apply_default_model(&st, body);
-    let base = match backend_for_model(&st, model_of(&body).as_deref()) {
-        Ok(b) => b,
+    let target = match resolve_llm_target(&st, model_of(&body).as_deref()) {
+        Ok(t) => t,
         Err(e) => return e.into_response(),
     };
-    proxy_json(&st, &base, reqwest::Method::POST, "/v1/messages/count_tokens", Some(body)).await
+    proxy_json(&st, &target.base, reqwest::Method::POST, "/v1/messages/count_tokens", Some(body), target.peer.as_ref(), &origin_of(ident)).await
 }

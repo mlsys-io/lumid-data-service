@@ -331,9 +331,13 @@ fn system_schemas_rejected_by_is_user_schema() {
         "_timescaledb_internal",
         "public",
     ];
+    // System schemas are rejected regardless of the effective allowlist (the
+    // `!is_system_schema` guard short-circuits), so an empty effective list is
+    // sufficient to exercise the rejection.
+    let effective: Vec<String> = Vec::new();
     for s in bad_schemas {
         assert!(
-            !is_user_schema(s),
+            !is_user_schema(s, &effective),
             "schema '{s}' must NOT pass the user-schema check"
         );
     }

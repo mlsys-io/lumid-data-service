@@ -24,6 +24,50 @@ fn env_u64(name: &str, default: u64) -> u64 {
     env_var(name).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+/// A federation peer: another lumid-data instance this one can forward
+/// reads / LLM calls to. Part of the F1 mesh core (see the "federated multi-app
+/// mesh" design). `token` is the bearer the peer accepts on its own gated
+/// routes — a local key on the peer labelled e.g. `peer:<id>` / `sync:<id>`,
+/// reusing the existing local-key auth path (no new scheme).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Peer {
+    /// Short peer id (the key in `LUMID_PEERS`), e.g. `primary`.
+    pub id: String,
+    /// Base URL of the peer's HTTP surface, no trailing slash (e.g.
+    /// `http://findata-primary:8088`). The forwarder appends the identical path.
+    pub base_url: String,
+    /// Bearer token presented to the peer as `Authorization: Bearer <token>`.
+    /// Sourced from `LUMID_PEER_<ID>_TOKEN` (uppercased id). May be empty when
+    /// the peer needs no auth (dev / anonymous local key set).
+    pub token: String,
+}
+
+/// Parse `LUMID_PEERS=id=base_url;id=base_url` into a peer registry, reading each
+/// peer's bearer from `LUMID_PEER_<ID>_TOKEN` (id uppercased, non-alnum → `_`).
+/// Malformed / empty entries are skipped. The `read_env` closure indirection
+/// lets tests inject a fake env without touching the process environment.
+fn parse_peers(raw: &str, read_env: &dyn Fn(&str) -> Option<String>) -> Vec<Peer> {
+    raw.split(';')
+        .filter_map(|e| e.trim().split_once('='))
+        .filter_map(|(id, url)| {
+            let id = id.trim();
+            let url = url.trim().trim_end_matches('/');
+            if id.is_empty() || url.is_empty() {
+                return None;
+            }
+            let token_var = format!(
+                "PEER_{}_TOKEN",
+                id.to_uppercase()
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect::<String>()
+            );
+            let token = read_env(&token_var).unwrap_or_default();
+            Some(Peer { id: id.to_string(), base_url: url.to_string(), token })
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub db_host: String,
@@ -163,6 +207,29 @@ pub struct Settings {
     pub sync_max_attempts: u32,
     /// Base backoff (ms) for push retries; doubles per attempt. Default 500.
     pub sync_backoff_ms: u64,
+
+    // ── Federation / mesh core (F1) ──────────────────────────────────────────
+    // The peer-forward plane. When no peers + no `*_federate` are set, behavior
+    // is IDENTICAL to a pure-local instance (every knob defaults to off).
+    /// This instance's id in the mesh (`LUMID_INSTANCE_ID`). Default `"local"`.
+    /// Stamped on forwarded requests (loop guard groundwork for F3) and useful
+    /// for logs. F2/F3 tag peers `parent|child|peer` off this identity.
+    pub instance_id: String,
+    /// The app/tenant this instance serves (`LUMID_APP_ID`, default `"findata"`).
+    /// Stamped as `X-Lumid-App` on forwarded requests so a downstream peer can
+    /// later enforce per-app separation (F3). MVP: header contract only, no RBAC.
+    pub app_id: String,
+    /// Federation peers, from `LUMID_PEERS=id=base_url;…` + `LUMID_PEER_<ID>_TOKEN`.
+    /// Empty ⇒ no forwarding is possible (pure local).
+    pub peers: Vec<Peer>,
+    /// Shadow default-route for reads: the peer id (must be in `peers`) that
+    /// declarative reads this instance doesn't own are forwarded to. `None`
+    /// (unset) ⇒ all reads served locally (unchanged). `LUMID_READ_FEDERATE`.
+    pub read_federate: Option<String>,
+    /// LLM default-route: the peer id the `/v1/*` proxy targets instead of the
+    /// local `llm_backends`. `None` ⇒ local LLM backends (unchanged).
+    /// `LUMID_LLM_FEDERATE`.
+    pub llm_federate: Option<String>,
 }
 
 impl Settings {
@@ -256,6 +323,77 @@ impl Settings {
             sync_batch_rows: env_u64("SYNC_BATCH_ROWS", 1000),
             sync_max_attempts: env_u32("SYNC_MAX_ATTEMPTS", 5),
             sync_backoff_ms: env_u64("SYNC_BACKOFF_MS", 500),
+            instance_id: env_str("INSTANCE_ID", "local"),
+            app_id: env_str("APP_ID", "findata"),
+            peers: parse_peers(&env_str("PEERS", ""), &|name| env_var(name)),
+            read_federate: env_var("READ_FEDERATE")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            llm_federate: env_var("LLM_FEDERATE")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_peers_basic() {
+        let env = |name: &str| match name {
+            "PEER_PRIMARY_TOKEN" => Some("tok-primary".to_string()),
+            "PEER_HUB_TOKEN" => Some("tok-hub".to_string()),
+            _ => None,
+        };
+        let peers = parse_peers(
+            "primary=http://findata-primary:8088;hub=https://hub.example/",
+            &env,
+        );
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].id, "primary");
+        // Trailing slash stripped.
+        assert_eq!(peers[0].base_url, "http://findata-primary:8088");
+        assert_eq!(peers[0].token, "tok-primary");
+        assert_eq!(peers[1].id, "hub");
+        assert_eq!(peers[1].base_url, "https://hub.example");
+        assert_eq!(peers[1].token, "tok-hub");
+    }
+
+    #[test]
+    fn parse_peers_missing_token_is_empty_not_dropped() {
+        let peers = parse_peers("primary=http://p:8088", &|_| None);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].token, "");
+    }
+
+    #[test]
+    fn parse_peers_non_alnum_id_uppercased_for_token_var() {
+        // id `us-east` → token var PEER_US_EAST_TOKEN.
+        let env = |name: &str| {
+            if name == "PEER_US_EAST_TOKEN" {
+                Some("t".to_string())
+            } else {
+                None
+            }
+        };
+        let peers = parse_peers("us-east=http://p:8088", &env);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].id, "us-east");
+        assert_eq!(peers[0].token, "t");
+    }
+
+    #[test]
+    fn parse_peers_skips_malformed_and_empty() {
+        let peers = parse_peers("  ;=http://x;id=;good=http://g:1;garbage", &|_| None);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].id, "good");
+        assert_eq!(peers[0].base_url, "http://g:1");
+    }
+
+    #[test]
+    fn parse_peers_empty_input() {
+        assert!(parse_peers("", &|_| None).is_empty());
     }
 }
