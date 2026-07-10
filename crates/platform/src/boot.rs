@@ -142,6 +142,14 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         &settings.rate_limit_anon,
         &settings.rate_limit_authed,
     ));
+    let concurrency = if settings.max_concurrency_per_key > 0 || settings.max_concurrency_per_ip > 0 {
+        let pk = settings.max_concurrency_per_key.max(1);
+        let pi = settings.max_concurrency_per_ip.max(1);
+        tracing::info!("concurrency limits: {pk}/key  {pi}/ip");
+        Some(Arc::new(auth::ratelimit::ConcurrencyLimiter::new(pk, pi)))
+    } else {
+        None
+    };
     tracing::info!(
         "auth: {} local key(s), lumid {}",
         local_keys.len(),
@@ -182,7 +190,7 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     };
 
     let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(300))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     // Streaming LLM client: connect timeout only. No total timeout — reasoning
@@ -191,6 +199,17 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
+
+    // LLM backend pool — health-aware, least-loaded, with circuit breaker.
+    let llm_pool = {
+        let pool = Arc::new(crate::llm_pool::BackendPool::from_settings(&settings));
+        pool.clone().start_health_prober(http.clone());
+        tracing::info!(
+            "llm pool: {} unique backend(s)",
+            pool.all.len()
+        );
+        pool
+    };
 
     let blob_store = build_blob_store(&settings);
 
@@ -280,9 +299,24 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         );
     }
 
+    // Shadow catch-all forward cache — only consulted when `read_federate` is set
+    // (shadow mode). Built unconditionally (cheap); the middleware short-circuits
+    // to a passthrough when not shadowing.
+    let shadow_cache = crate::federation::ShadowCache::new(
+        std::time::Duration::from_secs(settings.shadow_cache_ttl_s.max(1)),
+    );
+    if settings.read_federate.is_some() {
+        tracing::info!(
+            "shadow catch-all forward active (read_federate={:?}, cache_ttl={}s)",
+            settings.read_federate,
+            settings.shadow_cache_ttl_s,
+        );
+    }
+
     let state = state::AppState {
-        pool, settings, lumid, local_keys, rate, redis, redis_client, hub, http, http_stream, read_cache, blob_store, backends,
-        feed_liveness, card_store, federation,
+        pool, settings, lumid, local_keys, rate, concurrency, redis, redis_client, hub, http,
+        http_stream, llm_pool, read_cache, blob_store, backends, feed_liveness, card_store,
+        federation, shadow_cache,
     };
 
     // Auto-MCP: one tool per declarative read endpoint, merged into ext routes.

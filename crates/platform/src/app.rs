@@ -125,6 +125,13 @@ pub fn build_router(
         )
         .merge(read_router)
         .merge(ext_router)
+        // Shadow catch-all forward: in shadow mode (`read_federate` set) it
+        // forwards every non-allowlisted GET/HEAD to the peer + caches, short-
+        // circuiting the local handler. Layered INSIDE the gate (added before it,
+        // so it runs AFTER gate) so the `Identity` extension is available for the
+        // `X-Lumid-Origin-*` attribution headers. Pure passthrough when not
+        // shadowing — non-shadow instances are byte-identical to today.
+        .layer(from_fn_with_state(state.clone(), crate::federation::shadow_forward))
         .layer(from_fn_with_state(state.clone(), crate::auth::gate));
 
     public

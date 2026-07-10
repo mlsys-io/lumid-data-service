@@ -18,6 +18,7 @@ pub mod federation;
 pub mod handlers;
 pub mod ingest;
 pub mod llm;
+pub mod llm_pool;
 pub mod mcp;
 pub mod openapi;
 pub mod parsers;
