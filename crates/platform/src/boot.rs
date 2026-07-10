@@ -299,10 +299,24 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         );
     }
 
+    // Shadow catch-all forward cache — only consulted when `read_federate` is set
+    // (shadow mode). Built unconditionally (cheap); the middleware short-circuits
+    // to a passthrough when not shadowing.
+    let shadow_cache = crate::federation::ShadowCache::new(
+        std::time::Duration::from_secs(settings.shadow_cache_ttl_s.max(1)),
+    );
+    if settings.read_federate.is_some() {
+        tracing::info!(
+            "shadow catch-all forward active (read_federate={:?}, cache_ttl={}s)",
+            settings.read_federate,
+            settings.shadow_cache_ttl_s,
+        );
+    }
+
     let state = state::AppState {
         pool, settings, lumid, local_keys, rate, concurrency, redis, redis_client, hub, http,
         http_stream, llm_pool, read_cache, blob_store, backends, feed_liveness, card_store,
-        federation,
+        federation, shadow_cache,
     };
 
     // Auto-MCP: one tool per declarative read endpoint, merged into ext routes.

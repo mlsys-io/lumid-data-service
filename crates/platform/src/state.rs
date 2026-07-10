@@ -49,4 +49,8 @@ pub struct AppState {
     /// LLM calls this instance doesn't serve locally. Empty peer set ⇒ pure
     /// local (no forwarding). Cheap to clone.
     pub federation: Arc<crate::federation::Federation>,
+    /// Shadow catch-all forward cache: memoizes peer responses for the
+    /// `federation::shadow_forward` middleware. Only consulted in shadow mode
+    /// (`read_federate` set); a no-op otherwise. Cheap to clone (moka is Arc-y).
+    pub shadow_cache: Arc<crate::federation::ShadowCache>,
 }

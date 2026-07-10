@@ -240,6 +240,10 @@ pub struct Settings {
     /// local `llm_backends`. `None` ⇒ local LLM backends (unchanged).
     /// `LUMID_LLM_FEDERATE`.
     pub llm_federate: Option<String>,
+    /// TTL (seconds) for the shadow catch-all forward cache — the moka cache
+    /// backing `federation::shadow_forward`. Only consulted in shadow mode
+    /// (`read_federate` set). `LUMID_SHADOW_CACHE_TTL_S`, default 30.
+    pub shadow_cache_ttl_s: u64,
 }
 
 impl Settings {
@@ -354,6 +358,7 @@ impl Settings {
             llm_federate: env_var("LLM_FEDERATE")
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
+            shadow_cache_ttl_s: env_u64("SHADOW_CACHE_TTL_S", 30),
         }
     }
 }
