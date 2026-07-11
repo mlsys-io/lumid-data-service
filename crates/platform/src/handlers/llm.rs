@@ -646,7 +646,23 @@ pub async fn list_models(
             for m in arr {
                 let id = m.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
                 if seen.insert(id) {
-                    data.push(m.clone());
+                    let mut m = m.clone();
+                    // Normalize across serving stacks: vLLM advertises
+                    // `max_model_len`; llama.cpp reports the per-slot window
+                    // as `meta.n_ctx` instead. Surface the same field for
+                    // both so catalog consumers get one shape.
+                    if m.get("max_model_len").is_none() {
+                        if let Some(n_ctx) = m
+                            .get("meta")
+                            .and_then(|meta| meta.get("n_ctx"))
+                            .and_then(|n| n.as_i64())
+                        {
+                            if let Some(obj) = m.as_object_mut() {
+                                obj.insert("max_model_len".into(), json!(n_ctx));
+                            }
+                        }
+                    }
+                    data.push(m);
                 }
             }
         }
