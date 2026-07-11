@@ -651,7 +651,9 @@ pub async fn list_models(
                     // `max_model_len`; llama.cpp reports the per-slot window
                     // as `meta.n_ctx` instead. Surface the same field for
                     // both so catalog consumers get one shape.
-                    if m.get("max_model_len").is_none() {
+                    // llama.cpp emits the key as an explicit JSON null — treat
+                    // null the same as absent.
+                    if m.get("max_model_len").map_or(true, |v| v.is_null()) {
                         if let Some(n_ctx) = m
                             .get("meta")
                             .and_then(|meta| meta.get("n_ctx"))
