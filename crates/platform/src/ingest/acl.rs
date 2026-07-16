@@ -118,6 +118,18 @@ pub fn scope_grants_write(scopes: &[String], schema: &str, table: &str) -> bool 
         // this scope → mailbox.lqt_inbox ONLY. The mailbox-consumer re-checks the
         // scope (lqt-auth `universe.refresh` topic grant) as the real authority.
         ("lqt:universe:refresh", "mailbox", "lqt_inbox"),
+        // LQT off-box signal producers: a strategy/trading-scoped PAT publishes a
+        // `signal.publish` message (external signal batch → lqt.signals) into the
+        // mailbox inbox via the generic /ingest path — the topic-controlled
+        // alternative to /xpio/strategies (which hardcodes `strategy.deploy`).
+        // These are the SAME scopes lqt-auth's `signal.publish` topic grant
+        // accepts, and both can ALREADY write the inbox via /xpio/strategies — so
+        // this is endpoint parity, not new privilege. Table-level here; the
+        // mailbox-consumer's per-topic `TOPIC_AUTHZ` (payload.auth.pat) stays the
+        // real per-message authority. Least-privilege: these reach
+        // mailbox.lqt_inbox ONLY.
+        ("lqt:strategy", "mailbox", "lqt_inbox"),
+        ("lqt:trading", "mailbox", "lqt_inbox"),
     ];
     for (cap, sch, tbl) in CAP_GRANTS {
         if *sch == schema && *tbl == table && scopes.iter().any(|s| s == cap) {
@@ -161,5 +173,18 @@ mod tests {
         assert!(!scope_grants_write(&scopes(&["lumid:read"]), "mailbox", "lqt_inbox"));
         assert!(!scope_grants_write(&scopes(&["lqt:universe"]), "mailbox", "lqt_inbox"));
         assert!(!scope_grants_write(&scopes(&["*"]), "mailbox", "lqt_inbox"));
+    }
+
+    #[test]
+    fn signal_publish_scopes_grant_only_mailbox_inbox() {
+        for cap in ["lqt:strategy", "lqt:trading"] {
+            let s = scopes(&[cap]);
+            // Blessed for the inbox (the signal.publish ingest transport)…
+            assert!(scope_grants_write(&s, "mailbox", "lqt_inbox"), "{cap} → inbox");
+            // …and NOTHING else (least privilege).
+            assert!(!scope_grants_write(&s, "mailbox", "lqt_outbox"));
+            assert!(!scope_grants_write(&s, "obs", "runtime_cycles"));
+            assert!(!scope_grants_write(&s, "core", "tenant_strategies"));
+        }
     }
 }
