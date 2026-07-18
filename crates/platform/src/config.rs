@@ -198,6 +198,19 @@ pub struct Settings {
     /// role's grants match it. Empty (default) = no `SET ROLE` (current behavior).
     pub retrieval_db_role: String,
 
+    /// Postgres role a declarative read is de-escalated / re-scoped to (via
+    /// `SET LOCAL ROLE` inside a `READ ONLY` transaction) when the endpoint is
+    /// flagged `admin_cross_tenant = true` AND the introspected caller role is
+    /// `admin`/`super_admin`/`local` (LumidOS admin oversight — Phase D4). The
+    /// deployment points this at a NOSUPERUSER role whose RLS visibility spans
+    /// tenants (e.g. one NOT pinned to a single `app.tenant_id`, or that a
+    /// dedicated cross-tenant RLS policy blesses) — so an admin sees every
+    /// tenant's rows for VIEW only, WITHOUT a `bypassrls` grant on the hot DB and
+    /// without any field-box fan-out. Empty (default) ⇒ the feature is disabled:
+    /// admin callers fall through to the normal self-scoped read path, so behavior
+    /// is byte-identical to today. `LUMID_ADMIN_READ_ROLE`.
+    pub admin_read_role: String,
+
     // Data-push / sync plane (generic). `enable_sync` (ServeParts) mounts the
     // inbox + admin routes; these knobs drive the optional push helper and the
     // inbox peer gate. Empty `sync_target_url` ⇒ the push helper is a no-op.
@@ -338,6 +351,7 @@ impl Settings {
             retrieval_prefix: env_str("RETRIEVAL_PREFIX", "retrievals"),
             retrieval_sample_rows: env_u32("RETRIEVAL_SAMPLE_ROWS", 5) as usize,
             retrieval_db_role: env_str("RETRIEVAL_DB_ROLE", ""),
+            admin_read_role: env_str("ADMIN_READ_ROLE", ""),
             sync_target_url: env_str("SYNC_TARGET_URL", "").trim_end_matches('/').to_string(),
             sync_target_token: env_str("SYNC_TARGET_TOKEN", ""),
             sync_peer_id: env_str("SYNC_PEER_ID", ""),

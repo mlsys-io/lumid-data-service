@@ -73,6 +73,18 @@ async fn run_spec(
     let id_kv = id_echo(&path);
     let ttl = spec.ttl_duration();
 
+    // Admin cross-tenant oversight (Phase D4). The elevation decision is made
+    // here from the trusted `Identity` extension — never from a client-supplied
+    // field. A `user` (or an anonymous/absent identity) never elevates, so the
+    // non-admin path is byte-identical to today (same query, same self-scoped RLS
+    // binding). See `admin_read_elevation` for the exact gate.
+    let caller_role = ident.as_ref().map(|Extension(i)| i.role.as_str()).unwrap_or("");
+    // The role actually handed to the query path: the configured cross-tenant
+    // role when elevating, else empty (⇒ normal self-scoped `query_rows`).
+    let effective_read_role =
+        admin_read_elevation(spec, &st.settings.admin_read_role, caller_role).unwrap_or_default();
+    let elevate = !effective_read_role.is_empty();
+
     // Federation default-route (F1): when `read_federate` names a configured
     // peer, declarative reads this instance doesn't own are forwarded to that
     // peer. MVP rule — shadow mode: every declarative read is treated as
@@ -93,18 +105,27 @@ async fn run_spec(
     // runs the local query (`produce`) or forwards to the peer — both return the
     // serialized JSON bytes, so the cache layer is identical for both paths.
     let raw_q_str = raw_q.0.clone();
+    let read_role = effective_read_role.clone();
     let compute = || async {
         match fed_peer {
             Some(peer) => {
                 produce_federated(st, peer, orig.0.path(), raw_q_str.as_deref(), &origin).await
             }
-            None => produce(st, spec, &bound, id_kv.clone()).await,
+            None => produce(st, spec, &bound, id_kv.clone(), &read_role).await,
         }
     };
 
     let body: ApiResult<Arc<CachedBody>> = if spec.cache {
         let gen = st.read_cache.generation(&id);
-        let key = CacheKey::new(id, gen, bound.canon.clone());
+        // Fold the elevation into the cache key so an admin's cross-tenant result
+        // is NEVER served to a self-scoped (non-admin) caller and vice-versa —
+        // the two share a spec id + params but must not share a cached body.
+        let canon = if elevate {
+            format!("{}\u{1}admin_read={}", bound.canon, effective_read_role)
+        } else {
+            bound.canon.clone()
+        };
+        let key = CacheKey::new(id, gen, canon);
         st.read_cache.get_or_compute(key, ttl, true, compute).await
     } else {
         compute().await.map(|bytes| CachedBody::new(bytes, ttl))
@@ -167,6 +188,7 @@ async fn produce(
     spec: &EndpointSpec,
     bound: &bind::Bound,
     id_kv: Option<(String, String)>,
+    read_role: &str,
 ) -> ApiResult<Vec<u8>> {
     use crate::backend::BackendKind;
     use crate::read::dialect::{ClickHouseDialect, Dialect};
@@ -190,24 +212,27 @@ async fn produce(
                     order_key_cols: ir.order_by.iter().map(|o| o.expr.clone()).collect(),
                 };
                 let lowered = dialect.lower(&bound.substituted, &bound.value_map, spec.ir.as_ref())?;
+                // `read_role` re-scopes the read for admin cross-tenant oversight;
+                // empty ⇒ the normal self-scoped path. The ClickHouse backend's
+                // default impl ignores the role, so this is byte-identical for CH.
                 backend
-                    .query_rows(&crate::backend::BoundQuery {
+                    .query_rows_as_role(&crate::backend::BoundQuery {
                         sql: &lowered.sql,
                         params: Vec::new(),
                         binds: &lowered.values,
                         pre_lowered: true,
-                    })
+                    }, read_role)
                     .await
             }
             _ => {
                 // Postgres (or CH-without-IR fallback): hand over the PG-shaped SQL.
                 backend
-                    .query_rows(&crate::backend::BoundQuery {
+                    .query_rows_as_role(&crate::backend::BoundQuery {
                         sql: &bound.sql,
                         params: bound.refs(),
                         binds: &bound.values,
                         pre_lowered: false,
-                    })
+                    }, read_role)
                     .await
             }
         }
@@ -244,6 +269,27 @@ fn id_echo(path: &HashMap<String, String>) -> Option<(String, String)> {
     None
 }
 
+/// Decide the effective DB read-role for admin cross-tenant oversight (Phase D4).
+///
+/// Returns `Some(role)` — the configured cross-tenant `admin_read_role` — ONLY
+/// when all three hold: (1) the endpoint opts in (`spec.admin_cross_tenant`),
+/// (2) a non-empty `admin_read_role` is configured, and (3) the SERVER-introspected
+/// `caller_role` is `admin`/`super_admin`/`local`. Otherwise `None` ⇒ the caller
+/// runs the normal self-scoped read (byte-identical to today). `caller_role` must
+/// come from the trusted `Identity`, never a client-supplied field — so a `user`
+/// (or anonymous, empty role) can never cross tenants and no leak is possible.
+fn admin_read_elevation(spec: &EndpointSpec, admin_read_role: &str, caller_role: &str) -> Option<String> {
+    let role = admin_read_role.trim();
+    if spec.admin_cross_tenant
+        && !role.is_empty()
+        && matches!(caller_role, "admin" | "super_admin" | "local")
+    {
+        Some(role.to_string())
+    } else {
+        None
+    }
+}
+
 /// The `(schema, table)` a read endpoint resolves its backend on — the first
 /// declared source table (`schema.table`). Endpoints with no declared table (or
 /// a bare name) default to the empty pair, which resolves to Postgres.
@@ -269,7 +315,9 @@ pub async fn execute_to_value(
 ) -> ApiResult<Value> {
     let bound = bind::resolve(spec, &path, &query)?;
     let id_kv = id_echo(&path);
-    let bytes = produce(st, spec, &bound, id_kv).await?;
+    // MCP tool path: no HTTP identity here, so never elevate — empty role runs
+    // the normal self-scoped read (byte-identical to before Phase D4).
+    let bytes = produce(st, spec, &bound, id_kv, "").await?;
     serde_json::from_slice(&bytes).map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))
 }
 
@@ -366,4 +414,87 @@ fn pct_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod admin_cross_tenant_tests {
+    use super::*;
+    use crate::read::spec;
+
+    fn spec_with(admin_cross_tenant: bool) -> EndpointSpec {
+        // Build via the real TOML loader so the spec is shaped exactly as at
+        // runtime (defaults applied, IR compiled). `admin_cross_tenant` is the
+        // only knob these tests vary.
+        let toml = format!(
+            r#"
+[[read.endpoint]]
+id = "runtime.cycles"
+path = "/runtime/cycles/:box"
+ttl = "30s"
+sql = "SELECT box, ts FROM obs.runtime_cycles WHERE box = :box ORDER BY ts DESC LIMIT :limit"
+tables = ["obs.runtime_cycles"]
+admin_cross_tenant = {admin_cross_tenant}
+  [[read.endpoint.param]]
+  name = "box"
+  kind = "path"
+  type = "key"
+  [[read.endpoint.param]]
+  name = "limit"
+  kind = "query"
+  type = "int"
+  default = 100
+"#
+        );
+        spec::parse(&toml).expect("parse spec").pop().expect("one spec")
+    }
+
+    // A flagged endpoint elevates ONLY for admin roles, and ONLY when a role is
+    // configured. This is the cross-tenant unlock — admins see all tenants.
+    #[test]
+    fn admin_roles_elevate_when_flagged_and_configured() {
+        let sp = spec_with(true);
+        for role in ["admin", "super_admin", "local"] {
+            assert_eq!(
+                admin_read_elevation(&sp, "lqt_admin_read", role),
+                Some("lqt_admin_read".to_string()),
+                "role {role} must elevate on a flagged endpoint"
+            );
+        }
+    }
+
+    // A `user` (or anonymous/unknown role) must NEVER elevate — this is the
+    // no-leak invariant. A cross-tenant read for a non-admin MUST fail to elevate,
+    // so the caller stays on the self-scoped RLS path (byte-equivalent to today).
+    #[test]
+    fn non_admin_roles_never_elevate() {
+        let sp = spec_with(true);
+        for role in ["user", "", "reader", "trader", "USER", "Admin", "superadmin"] {
+            assert_eq!(
+                admin_read_elevation(&sp, "lqt_admin_read", role),
+                None,
+                "role {role:?} must NOT elevate (no cross-tenant leak)"
+            );
+        }
+    }
+
+    // Feature disabled (empty `admin_read_role`) ⇒ even an admin stays self-scoped
+    // — the deployment hasn't opted in, so behavior is byte-identical to today.
+    #[test]
+    fn unconfigured_role_disables_elevation_for_everyone() {
+        let sp = spec_with(true);
+        for role in ["admin", "super_admin", "local", "user"] {
+            assert_eq!(admin_read_elevation(&sp, "", role), None);
+            assert_eq!(admin_read_elevation(&sp, "   ", role), None, "whitespace-only role is empty");
+        }
+    }
+
+    // An endpoint that did NOT opt in is never elevated, regardless of caller role
+    // — most endpoints stay strictly self-scoped even for admins.
+    #[test]
+    fn unflagged_endpoint_never_elevates() {
+        let sp = spec_with(false);
+        for role in ["admin", "super_admin", "local", "user"] {
+            assert_eq!(admin_read_elevation(&sp, "lqt_admin_read", role), None);
+        }
+    }
 }

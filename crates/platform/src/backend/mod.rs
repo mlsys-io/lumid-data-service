@@ -125,4 +125,47 @@ pub trait Backend: Send + Sync {
     /// Execute a bound read query and return the row objects (lineage/shape are
     /// applied by the caller).
     async fn query_rows(&self, q: &BoundQuery<'_>) -> ApiResult<Vec<Map<String, Value>>>;
+
+    /// Execute a bound read query with the session role de-escalated / re-scoped
+    /// to `role` for THIS query only (Phase D4 admin cross-tenant oversight). The
+    /// Postgres backend runs it inside a `READ ONLY` transaction with
+    /// `SET LOCAL ROLE <role>` (reverts at txn end, no pool leakage) so an admin
+    /// caller reads under a cross-tenant-visible role WITHOUT a `bypassrls` grant.
+    ///
+    /// Default impl ignores `role` and delegates to [`query_rows`] — backends that
+    /// don't model Postgres RLS roles (e.g. ClickHouse) just run the query
+    /// normally. Callers must only reach this path after a server-side admin-role
+    /// check (see `read/exec.rs`), so the default fallthrough never widens access.
+    async fn query_rows_as_role(&self, q: &BoundQuery<'_>, _role: &str) -> ApiResult<Vec<Map<String, Value>>> {
+        self.query_rows(q).await
+    }
+}
+
+/// Validate + double-quote a Postgres role identifier for a `SET LOCAL ROLE`.
+/// Rejects nothing but escapes embedded quotes so a hostile `LUMID_ADMIN_READ_ROLE`
+/// can't break out of the quoted identifier — defence in depth (the value is
+/// operator-configured, not user input, but the role name reaches a `batch_execute`).
+/// Mirrors the `quote_pg_ident` guard used by the retrieval replayer.
+pub(crate) fn quote_role_ident(ident: &str) -> String {
+    let escaped = ident.replace('"', "\"\"");
+    format!("\"{escaped}\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quote_role_ident;
+
+    #[test]
+    fn plain_role_is_double_quoted() {
+        assert_eq!(quote_role_ident("lqt_admin_read"), "\"lqt_admin_read\"");
+    }
+
+    #[test]
+    fn embedded_quotes_are_escaped_no_breakout() {
+        // A hostile role name can't terminate the quoted identifier and inject SQL.
+        assert_eq!(
+            quote_role_ident("a\"; DROP ROLE x; --"),
+            "\"a\"\"; DROP ROLE x; --\""
+        );
+    }
 }
