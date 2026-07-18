@@ -199,4 +199,35 @@ impl Backend for PostgresBackend {
         let rows = client.query(q.sql, &q.params).await?;
         Ok(rows_to_objects(&rows))
     }
+
+    async fn query_rows_as_role(&self, q: &BoundQuery<'_>, role: &str) -> ApiResult<Vec<Map<String, Value>>> {
+        // Empty role ⇒ no elevation configured; run the normal (self-scoped) path.
+        // This keeps the feature strictly opt-in and the default byte-identical.
+        if role.trim().is_empty() {
+            return self.query_rows(q).await;
+        }
+        // Run the read inside an explicit READ ONLY transaction with the session
+        // role re-scoped to `role` for this query only (Phase D4). Ordering:
+        // `SET TRANSACTION READ ONLY` first (blocks any mutation even via a
+        // writable CTE), then `SET LOCAL ROLE` (reverts at txn end — no pool
+        // leakage). The connecting pool role must be a member of `role`. This is
+        // how an admin caller reads across tenants WITHOUT a `bypassrls` grant:
+        // the deployment points `role` at a cross-tenant-visible RLS role.
+        let mut client = self.pool.get().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("begin admin-read txn: {e}")))?;
+        let setup = format!(
+            "SET TRANSACTION READ ONLY; SET LOCAL ROLE {}",
+            super::quote_role_ident(role.trim())
+        );
+        tx.batch_execute(&setup)
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("configure admin-read txn: {e}")))?;
+        let rows = tx.query(q.sql, &q.params).await?;
+        // READ ONLY txn — drop (implicit rollback) is fine, nothing to commit.
+        drop(tx);
+        Ok(rows_to_objects(&rows))
+    }
 }

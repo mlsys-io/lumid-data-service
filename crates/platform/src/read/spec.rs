@@ -125,6 +125,17 @@ pub struct EndpointSpec {
     /// zero-match queries scan all chunks and can take minutes.
     #[serde(default)]
     pub query_timeout_ms: Option<u64>,
+    /// Admin cross-tenant oversight (Phase D4). When `true`, an introspected
+    /// `admin`/`super_admin`/`local` caller reads this endpoint under the
+    /// configured `admin_read_role` (a `SET LOCAL ROLE` in a `READ ONLY` txn),
+    /// transcending per-tenant RLS for VIEW only — so oversight endpoints
+    /// (a user's strategies, `obs.runtime_cycles`, `audit.event_chain`) return
+    /// all tenants' rows for an admin. NON-admin callers are UNAFFECTED (they run
+    /// the normal self-scoped path — byte-identical to today), and elevation is
+    /// gated ONLY on the server-introspected role, never a client-supplied field.
+    /// No-op unless `LUMID_ADMIN_READ_ROLE` is also set. Default false.
+    #[serde(default)]
+    pub admin_cross_tenant: bool,
     /// Parsed backend-neutral query IR (`T-READ-IR-001`). Populated at spec-load
     /// when `sql` fits the bounded read-only SELECT grammar; `None` ⇒ the spec
     /// fell back to the raw-SQL Postgres path (the un-parseable construct was
