@@ -342,7 +342,7 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     }
 
     let read_router = read::exec::build_router(&specs);
-    let openapi_router = crate::openapi::build_router(&specs, &parts.openapi_paths);
+    let openapi_router = crate::openapi::build_router(&specs, &parts.openapi_paths, parts.enable_llm);
     let router = app::build_router(
         state,
         read_router,

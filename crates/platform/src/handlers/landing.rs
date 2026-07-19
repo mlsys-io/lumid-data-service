@@ -19,16 +19,38 @@ pub fn default_routes() -> Router<AppState> {
 }
 
 /// `GET /` — generic platform landing. Public.
-pub async fn landing() -> Html<&'static str> {
-    Html(GENERIC_LANDING_HTML)
+///
+/// Branding is per-deployment via env (all `LUMID_`-prefixed): a deployment that
+/// serves inference sets `SERVICE_NAME`/`SERVICE_HEADING`/`SERVICE_TAGLINE` to
+/// present as e.g. "Lumid LLM"; the findata deployment (env unset) renders the
+/// original data-platform copy byte-for-byte.
+pub async fn landing() -> Html<String> {
+    let name = crate::config::env_var("SERVICE_NAME")
+        .unwrap_or_else(|| "lumid-data-service".to_string());
+    let heading = crate::config::env_var("SERVICE_HEADING")
+        .unwrap_or_else(|| "A portable data service.".to_string());
+    let tagline =
+        crate::config::env_var("SERVICE_TAGLINE").unwrap_or_else(|| DEFAULT_TAGLINE.to_string());
+    Html(
+        GENERIC_LANDING_HTML
+            .replace("__SVC_NAME__", &name)
+            .replace("__SVC_HEADING__", &heading)
+            .replace("__SVC_TAGLINE__", &tagline),
+    )
 }
+
+/// Default hero tagline (the original data-platform copy) used when
+/// `LUMID_SERVICE_TAGLINE` is unset.
+const DEFAULT_TAGLINE: &str = "Config-driven REST reads, a schema-introspecting <em>ingest</em> \
+    plane, a Redis pub/sub <em>realtime</em> hub, catalog + lineage, auth, and an auto-generated \
+    <em>MCP</em> surface — in one binary. The dataset on top is defined by configuration, not code.";
 
 const GENERIC_LANDING_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>lumid-data-service</title>
+  <title>__SVC_NAME__</title>
   <meta name="description" content="A portable read / write / realtime data service — config-driven REST reads, a schema-introspecting ingest plane, a Redis pub/sub realtime hub, catalog + lineage, auth, and MCP.">
   <meta name="theme-color" content="#0f766e">
   <style>
@@ -69,13 +91,8 @@ const GENERIC_LANDING_HTML: &str = r##"<!DOCTYPE html>
 <body>
 <div class="wrap">
   <header class="hero">
-    <h1>A portable data service.</h1>
-    <p class="tag">
-      Config-driven REST reads, a schema-introspecting <em>ingest</em> plane, a
-      Redis pub/sub <em>realtime</em> hub, catalog + lineage, auth, and an
-      auto-generated <em>MCP</em> surface — in one binary. The dataset on top is
-      defined by configuration, not code.
-    </p>
+    <h1>__SVC_HEADING__</h1>
+    <p class="tag">__SVC_TAGLINE__</p>
   </header>
 
   <section>
@@ -107,7 +124,7 @@ const GENERIC_LANDING_HTML: &str = r##"<!DOCTYPE html>
 curl -H "Authorization: Bearer &lt;token&gt;" https://&lt;host&gt;/catalog/schemas</pre>
   </section>
 
-  <footer>lumid-data-service · the portable data platform</footer>
+  <footer>__SVC_NAME__</footer>
 </div>
 </body>
 </html>"##;
