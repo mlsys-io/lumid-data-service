@@ -63,7 +63,36 @@ async fn run_spec(
     for (k, v) in &raw_path {
         path.insert(k.to_string(), v.to_string());
     }
-    let query = parse_query(raw_q.0.as_deref());
+    let mut query = parse_query(raw_q.0.as_deref());
+
+    // The trusted, server-authenticated caller sub + role (from the `Identity`
+    // extension the gate inserted — never a client-supplied field).
+    let caller_sub = ident.as_ref().map(|Extension(i)| i.sub.clone()).unwrap_or_default();
+    let caller_role = ident.as_ref().map(|Extension(i)| i.role.as_str()).unwrap_or("");
+
+    // Admin cross-tenant oversight (Phase D4). The elevation decision is made
+    // here from the trusted `Identity` extension — never from a client-supplied
+    // field. A `user` (or an anonymous/absent identity) never elevates, so the
+    // non-admin path is byte-identical to today (same query, same self-scoped RLS
+    // binding). See `admin_read_elevation` for the exact gate.
+    //
+    // The role actually handed to the query path: the configured cross-tenant
+    // role when elevating, else empty (⇒ normal self-scoped `query_rows`).
+    let effective_read_role =
+        admin_read_elevation(spec, &st.settings.admin_read_role, caller_role).unwrap_or_default();
+    let elevate = !effective_read_role.is_empty();
+
+    // Self-tenant injection (Phase 0c). When the endpoint is `self_tenant` AND we
+    // are NOT elevating an admin cross-tenant read, OVERRIDE the tenant bind with
+    // the server-authenticated caller sub — dropping any value the caller tried
+    // to pass in the path or query for that bind. This is the security core: the
+    // tenant is server-derived and cannot be forged. An admin oversight read
+    // (`elevate`) intentionally skips this so the admin sees all tenants. The
+    // GUC-pinned query dispatch (`self_tenant_active`) happens in `produce`.
+    let self_tenant_active = spec.self_tenant && !elevate;
+    if self_tenant_active {
+        inject_self_tenant(spec, &caller_sub, &mut path, &mut query);
+    }
 
     let bound = match bind::resolve(spec, &path, &query) {
         Ok(b) => b,
@@ -72,18 +101,6 @@ async fn run_spec(
 
     let id_kv = id_echo(&path);
     let ttl = spec.ttl_duration();
-
-    // Admin cross-tenant oversight (Phase D4). The elevation decision is made
-    // here from the trusted `Identity` extension — never from a client-supplied
-    // field. A `user` (or an anonymous/absent identity) never elevates, so the
-    // non-admin path is byte-identical to today (same query, same self-scoped RLS
-    // binding). See `admin_read_elevation` for the exact gate.
-    let caller_role = ident.as_ref().map(|Extension(i)| i.role.as_str()).unwrap_or("");
-    // The role actually handed to the query path: the configured cross-tenant
-    // role when elevating, else empty (⇒ normal self-scoped `query_rows`).
-    let effective_read_role =
-        admin_read_elevation(spec, &st.settings.admin_read_role, caller_role).unwrap_or_default();
-    let elevate = !effective_read_role.is_empty();
 
     // Federation default-route (F1): when `read_federate` names a configured
     // peer, declarative reads this instance doesn't own are forwarded to that
@@ -106,12 +123,15 @@ async fn run_spec(
     // serialized JSON bytes, so the cache layer is identical for both paths.
     let raw_q_str = raw_q.0.clone();
     let read_role = effective_read_role.clone();
+    // The sub handed to the query path in self-tenant mode (pins the RLS GUC and
+    // drives the `query_rows_as_tenant` dispatch); empty otherwise.
+    let self_tenant_sub = if self_tenant_active { caller_sub.clone() } else { String::new() };
     let compute = || async {
         match fed_peer {
             Some(peer) => {
                 produce_federated(st, peer, orig.0.path(), raw_q_str.as_deref(), &origin).await
             }
-            None => produce(st, spec, &bound, id_kv.clone(), &read_role).await,
+            None => produce(st, spec, &bound, id_kv.clone(), &read_role, &self_tenant_sub).await,
         }
     };
 
@@ -120,8 +140,13 @@ async fn run_spec(
         // Fold the elevation into the cache key so an admin's cross-tenant result
         // is NEVER served to a self-scoped (non-admin) caller and vice-versa —
         // the two share a spec id + params but must not share a cached body.
+        // Self-tenant reads fold the injected sub in for the same reason (one
+        // user's rows must never be served to another) — the sub is already in
+        // `bound.canon` as the `:tenant` bind, but we make the isolation explicit.
         let canon = if elevate {
             format!("{}\u{1}admin_read={}", bound.canon, effective_read_role)
+        } else if self_tenant_active {
+            format!("{}\u{1}self_tenant={}", bound.canon, caller_sub)
         } else {
             bound.canon.clone()
         };
@@ -189,6 +214,7 @@ async fn produce(
     bound: &bind::Bound,
     id_kv: Option<(String, String)>,
     read_role: &str,
+    self_tenant_sub: &str,
 ) -> ApiResult<Vec<u8>> {
     use crate::backend::BackendKind;
     use crate::read::dialect::{ClickHouseDialect, Dialect};
@@ -226,14 +252,22 @@ async fn produce(
             }
             _ => {
                 // Postgres (or CH-without-IR fallback): hand over the PG-shaped SQL.
-                backend
-                    .query_rows_as_role(&crate::backend::BoundQuery {
-                        sql: &bound.sql,
-                        params: bound.refs(),
-                        binds: &bound.values,
-                        pre_lowered: false,
-                    }, read_role)
-                    .await
+                let bq = crate::backend::BoundQuery {
+                    sql: &bound.sql,
+                    params: bound.refs(),
+                    binds: &bound.values,
+                    pre_lowered: false,
+                };
+                // Self-tenant mode (Phase 0c) pins the RLS GUC to the caller sub
+                // for this query only. It is mutually exclusive with admin
+                // elevation (the handler only sets one): `self_tenant_sub` is
+                // non-empty ONLY when NOT elevating, so this branch never both
+                // sets the GUC and re-scopes the role.
+                if !self_tenant_sub.is_empty() {
+                    backend.query_rows_as_tenant(&bq, self_tenant_sub).await
+                } else {
+                    backend.query_rows_as_role(&bq, read_role).await
+                }
             }
         }
     };
@@ -290,6 +324,33 @@ fn admin_read_elevation(spec: &EndpointSpec, admin_read_role: &str, caller_role:
     }
 }
 
+/// Overwrite the self-tenant bind in the request maps with the server-derived
+/// `sub`, stripping any caller-supplied copy from both maps (Phase 0c). The sub
+/// is placed into whichever map (`path`/`query`) the param is declared in so
+/// `bind::resolve` picks it up; it is removed from the *other* map so a caller
+/// cannot smuggle a value in via the wrong location. Callers invoke this ONLY
+/// when self-tenant mode is active and NOT elevating — so the resulting bind is
+/// always the trusted `Identity.sub`, never a client-supplied field.
+fn inject_self_tenant(
+    spec: &EndpointSpec,
+    sub: &str,
+    path: &mut HashMap<String, String>,
+    query: &mut HashMap<String, String>,
+) {
+    let bind = spec.self_tenant_bind();
+    match spec.param(bind).map(|p| p.kind) {
+        Some(super::spec::Kind::Path) => {
+            path.insert(bind.to_string(), sub.to_string());
+            query.remove(bind);
+        }
+        _ => {
+            // Query param (or unspecified — the lint guarantees the param exists).
+            query.insert(bind.to_string(), sub.to_string());
+            path.remove(bind);
+        }
+    }
+}
+
 /// The `(schema, table)` a read endpoint resolves its backend on — the first
 /// declared source table (`schema.table`). Endpoints with no declared table (or
 /// a bare name) default to the empty pair, which resolves to Postgres.
@@ -315,9 +376,10 @@ pub async fn execute_to_value(
 ) -> ApiResult<Value> {
     let bound = bind::resolve(spec, &path, &query)?;
     let id_kv = id_echo(&path);
-    // MCP tool path: no HTTP identity here, so never elevate — empty role runs
-    // the normal self-scoped read (byte-identical to before Phase D4).
-    let bytes = produce(st, spec, &bound, id_kv, "").await?;
+    // MCP tool path: no HTTP identity here, so never elevate and never self-tenant
+    // inject — empty role + empty sub run the normal self-scoped read
+    // (byte-identical to before Phase D4 / Phase 0c).
+    let bytes = produce(st, spec, &bound, id_kv, "", "").await?;
     serde_json::from_slice(&bytes).map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))
 }
 
@@ -496,5 +558,180 @@ admin_cross_tenant = {admin_cross_tenant}
         for role in ["admin", "super_admin", "local", "user"] {
             assert_eq!(admin_read_elevation(&sp, "lqt_admin_read", role), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod self_tenant_tests {
+    use super::*;
+    use crate::read::spec;
+    use std::collections::HashMap;
+
+    // Build a self-tenant inspect spec via the real TOML loader (defaults +
+    // IR + lints applied), matching the lqt.toml `/lqt/inspect/cycles/:strategy`
+    // shape: a query `:tenant` bind carries the injected sub. `admin_cross_tenant`
+    // varies so the precedence tests can flip it.
+    fn inspect_spec(admin_cross_tenant: bool) -> EndpointSpec {
+        let toml = format!(
+            r#"
+[[read.endpoint]]
+id = "lqt.inspect.cycles"
+path = "/lqt/inspect/cycles/:strategy"
+ttl = "10s"
+self_tenant = true
+admin_cross_tenant = {admin_cross_tenant}
+sql = "SELECT ts FROM obs.runtime_cycles WHERE tenant_id = :tenant::uuid AND strategy_id = :strategy ORDER BY ts DESC LIMIT :limit"
+tables = ["obs.runtime_cycles"]
+  [[read.endpoint.param]]
+  name = "strategy"
+  kind = "path"
+  type = "str"
+  [[read.endpoint.param]]
+  name = "tenant"
+  kind = "query"
+  type = "str"
+  [[read.endpoint.param]]
+  name = "limit"
+  kind = "query"
+  type = "int"
+  default = 100
+"#
+        );
+        spec::parse(&toml).expect("parse self-tenant spec").pop().expect("one spec")
+    }
+
+    fn maps() -> (HashMap<String, String>, HashMap<String, String>) {
+        (HashMap::new(), HashMap::new())
+    }
+
+    // A caller-supplied `tenant` query value is IGNORED and OVERRIDDEN by the
+    // server-derived sub. This is the security core: the tenant is never trusted
+    // from the request.
+    #[test]
+    fn caller_supplied_tenant_is_overridden_by_sub() {
+        let sp = inspect_spec(false);
+        let (mut path, mut query) = maps();
+        // Attacker tries to read tenant "victim" via the query param.
+        query.insert("tenant".into(), "victim-tenant-uuid".into());
+        query.insert("limit".into(), "50".into());
+        path.insert("strategy".into(), "momo".into());
+
+        inject_self_tenant(&sp, "caller-sub-uuid", &mut path, &mut query);
+
+        // The injected sub wins — the attacker's value is gone.
+        assert_eq!(query.get("tenant").map(String::as_str), Some("caller-sub-uuid"));
+        // Non-tenant params are untouched.
+        assert_eq!(query.get("limit").map(String::as_str), Some("50"));
+        assert_eq!(path.get("strategy").map(String::as_str), Some("momo"));
+
+        // The resolved bind carries the sub, not the attacker's value.
+        let bound = bind::resolve(&sp, &path, &query).expect("resolve");
+        match bound.value_map.get("tenant") {
+            Some(bind::BindValue::Text(t)) => assert_eq!(t, "caller-sub-uuid"),
+            Some(_) => panic!("tenant bind should be Text(sub)"),
+            None => panic!("tenant bind missing after injection"),
+        }
+    }
+
+    // A caller who smuggles `tenant` in the WRONG location (path, when the param
+    // is a query param) still can't leak it — the injector strips the stray copy
+    // from the other map so only the query slot (the declared one) survives.
+    #[test]
+    fn caller_supplied_tenant_in_wrong_map_is_stripped() {
+        let sp = inspect_spec(false);
+        let (mut path, mut query) = maps();
+        path.insert("strategy".into(), "momo".into());
+        path.insert("tenant".into(), "smuggled".into()); // wrong map
+
+        inject_self_tenant(&sp, "caller-sub", &mut path, &mut query);
+
+        assert_eq!(query.get("tenant").map(String::as_str), Some("caller-sub"));
+        assert!(path.get("tenant").is_none(), "stray path copy must be stripped");
+    }
+
+    // Precedence: when the endpoint is BOTH self_tenant and admin_cross_tenant,
+    // an admin caller elevates (sees all tenants) and self-tenant injection is
+    // SKIPPED; a non-admin caller does NOT elevate and injection applies. This
+    // mirrors the `self_tenant_active = spec.self_tenant && !elevate` gate in
+    // `run_spec`, so we assert the elevation decision that drives it.
+    #[test]
+    fn admin_elevation_wins_over_self_tenant() {
+        let sp = inspect_spec(true);
+        // Non-admin: never elevates ⇒ self-tenant injection is active.
+        for role in ["user", "", "reader"] {
+            let elevate = admin_read_elevation(&sp, "lqt_admin_read", role).is_some();
+            assert!(!elevate, "role {role:?} must NOT elevate");
+            let self_tenant_active = sp.self_tenant && !elevate;
+            assert!(self_tenant_active, "non-admin self_tenant read must inject the sub");
+        }
+        // Admin: elevates ⇒ self-tenant injection is skipped (cross-tenant view).
+        for role in ["admin", "super_admin", "local"] {
+            let elevate = admin_read_elevation(&sp, "lqt_admin_read", role).is_some();
+            assert!(elevate, "role {role:?} must elevate");
+            let self_tenant_active = sp.self_tenant && !elevate;
+            assert!(!self_tenant_active, "admin cross-tenant read must NOT self-tenant-scope");
+        }
+    }
+
+    // With admin oversight UNCONFIGURED (empty admin_read_role), even an admin
+    // stays self-scoped on a self_tenant endpoint — injection applies to everyone.
+    #[test]
+    fn self_tenant_applies_to_admin_when_elevation_unconfigured() {
+        let sp = inspect_spec(true);
+        for role in ["admin", "super_admin", "user"] {
+            let elevate = admin_read_elevation(&sp, "", role).is_some();
+            assert!(!elevate);
+            assert!(sp.self_tenant && !elevate, "no configured role ⇒ self-tenant scopes everyone");
+        }
+    }
+
+    // The self-tenant bind name defaults to "tenant" and is honoured by the lint
+    // (the spec parsed cleanly above proves the lint passed for the declared param).
+    #[test]
+    fn self_tenant_bind_defaults_to_tenant() {
+        let sp = inspect_spec(false);
+        assert_eq!(sp.self_tenant_bind(), "tenant");
+    }
+
+    // A self_tenant endpoint that references the bind but does NOT declare a
+    // matching param is rejected at load (fail-loud — a silent no-filter would
+    // leak cross-tenant).
+    #[test]
+    fn self_tenant_without_declared_param_fails_to_load() {
+        let toml = r#"
+[[read.endpoint]]
+id = "bad.inspect"
+path = "/bad"
+ttl = "10s"
+self_tenant = true
+sql = "SELECT ts FROM obs.runtime_cycles WHERE tenant_id = :tenant::uuid"
+tables = ["obs.runtime_cycles"]
+"#;
+        let err = spec::parse(toml).expect_err("must reject: no :tenant param declared");
+        let msg = format!("{err}");
+        assert!(msg.contains("self_tenant"), "error should name the self_tenant contract: {msg}");
+    }
+
+    // A self_tenant endpoint whose SQL never references the injected bind is
+    // rejected — otherwise the injection would be a no-op and the read would
+    // return every tenant's rows.
+    #[test]
+    fn self_tenant_without_sql_reference_fails_to_load() {
+        let toml = r#"
+[[read.endpoint]]
+id = "bad.inspect2"
+path = "/bad2"
+ttl = "10s"
+self_tenant = true
+sql = "SELECT ts FROM obs.runtime_cycles ORDER BY ts DESC LIMIT 10"
+tables = ["obs.runtime_cycles"]
+  [[read.endpoint.param]]
+  name = "tenant"
+  kind = "query"
+  type = "str"
+"#;
+        let err = spec::parse(toml).expect_err("must reject: SQL never references :tenant");
+        let msg = format!("{err}");
+        assert!(msg.contains("self_tenant"), "error should name the self_tenant contract: {msg}");
     }
 }

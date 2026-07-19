@@ -230,4 +230,35 @@ impl Backend for PostgresBackend {
         drop(tx);
         Ok(rows_to_objects(&rows))
     }
+
+    async fn query_rows_as_tenant(&self, q: &BoundQuery<'_>, sub: &str) -> ApiResult<Vec<Map<String, Value>>> {
+        // Empty sub ⇒ nothing to pin; run the normal path (defensive — the read
+        // handler never reaches here without an authenticated sub).
+        if sub.trim().is_empty() {
+            return self.query_rows(q).await;
+        }
+        // Run the read inside an explicit READ ONLY transaction with the RLS
+        // tenant GUC pinned to the caller's sub for this query only (Phase 0c).
+        // `SET TRANSACTION READ ONLY` first (blocks any mutation even via a
+        // writable CTE), then `set_config('app.tenant_id', $1, true)` — the
+        // `true` scopes it to the txn so it reverts on commit/rollback (no pool
+        // leakage). The sub is bound as a parameter (never string-interpolated),
+        // so a hostile-shaped value cannot escape into SQL. RLS-scoped tables
+        // then filter on `current_setting('app.tenant_id')::uuid`.
+        let mut client = self.pool.get().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("begin self-tenant read txn: {e}")))?;
+        tx.batch_execute("SET TRANSACTION READ ONLY")
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("configure self-tenant read txn: {e}")))?;
+        tx.execute("SELECT set_config('app.tenant_id', $1, true)", &[&sub])
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("pin app.tenant_id GUC: {e}")))?;
+        let rows = tx.query(q.sql, &q.params).await?;
+        // READ ONLY txn — drop (implicit rollback) is fine, nothing to commit.
+        drop(tx);
+        Ok(rows_to_objects(&rows))
+    }
 }

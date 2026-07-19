@@ -136,6 +136,31 @@ pub struct EndpointSpec {
     /// No-op unless `LUMID_ADMIN_READ_ROLE` is also set. Default false.
     #[serde(default)]
     pub admin_cross_tenant: bool,
+    /// Self-tenant read mode (Phase 0c user-inspection). When `true`, the handler
+    /// injects the SERVER-authenticated caller's `Identity.sub` as the tenant
+    /// filter binding (the `:name` given by [`self_tenant_param`], default
+    /// `"tenant"`), OVERRIDING any caller-supplied path/query value — so a user
+    /// can only ever read their OWN rows. It ALSO sets the RLS GUC
+    /// `set_config('app.tenant_id', sub, true)` inside the read txn so
+    /// RLS-scoped tables (e.g. `core.tenant_strategies`) filter to the caller.
+    /// The tenant is server-derived, never trusted from the request — this is the
+    /// security core of the user-inspect surface (`obs.runtime_cycles` carries
+    /// cross-tenant rows and is NOT itself RLS-protected, so the server-injected
+    /// `WHERE tenant_id = :tenant` filter is load-bearing).
+    ///
+    /// Admin cross-tenant oversight still wins: when the endpoint ALSO sets
+    /// `admin_cross_tenant` and the introspected caller is admin/super_admin/local
+    /// with a configured `admin_read_role`, the read elevates instead (the
+    /// self-tenant injection is skipped so an admin sees all tenants). Default
+    /// false ⇒ byte-identical to today.
+    #[serde(default)]
+    pub self_tenant: bool,
+    /// The `:name` bind that receives the injected `Identity.sub` when
+    /// [`self_tenant`] is set. Default `"tenant"`. The endpoint's SQL must
+    /// reference this bind (e.g. `WHERE tenant_id = :tenant::uuid`) and declare a
+    /// matching `str` param; the handler overrides its value with the caller sub.
+    #[serde(default)]
+    pub self_tenant_param: Option<String>,
     /// Parsed backend-neutral query IR (`T-READ-IR-001`). Populated at spec-load
     /// when `sql` fits the bounded read-only SELECT grammar; `None` ⇒ the spec
     /// fell back to the raw-SQL Postgres path (the un-parseable construct was
@@ -150,6 +175,11 @@ impl EndpointSpec {
     }
     pub fn param(&self, name: &str) -> Option<&ParamSpec> {
         self.params.iter().find(|p| p.name == name)
+    }
+    /// The `:name` bind that receives the injected caller `sub` in self-tenant
+    /// mode. Defaults to `"tenant"` when unset.
+    pub fn self_tenant_bind(&self) -> &str {
+        self.self_tenant_param.as_deref().unwrap_or("tenant")
     }
 }
 
@@ -250,6 +280,24 @@ fn lint(ep: &EndpointSpec) -> Result<(), ApiError> {
     for frag in fragment_names(&ep.sql) {
         if !produced.contains(frag.as_str()) {
             return Err(bail(format!("{{{{{frag}}}}}}}}} has no param producing it")));
+        }
+    }
+    // Self-tenant mode must declare the bind it injects into (so the SQL's
+    // `:tenant` lowers to a `$N` and the resolver has a slot to override). A
+    // typo'd `self_tenant_param` would otherwise silently NOT filter by tenant.
+    if ep.self_tenant {
+        let bind = ep.self_tenant_bind();
+        if !ep.params.iter().any(|p| p.name == bind) {
+            return Err(bail(format!(
+                "self_tenant endpoint must declare a param named '{bind}' \
+                 (the injected caller-sub bind)"
+            )));
+        }
+        if !ep.sql.contains(&format!(":{bind}")) {
+            return Err(bail(format!(
+                "self_tenant endpoint SQL must reference the injected bind ':{bind}' \
+                 (e.g. WHERE tenant_id = :{bind}::uuid)"
+            )));
         }
     }
     Ok(())
