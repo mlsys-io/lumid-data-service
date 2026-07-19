@@ -15,7 +15,12 @@ use crate::error::ApiResult;
 use crate::state::AppState;
 
 pub async fn health() -> Json<Value> {
-    Json(json!({"status": "ok", "service": "lumid-data-service"}))
+    // Branding is per-deployment: LUMID_SERVICE_NAME lets the LLM LB report
+    // "Lumid LLM" while the findata deployment (same binary, env unset) stays
+    // "lumid-data-service".
+    let service = crate::config::env_var("SERVICE_NAME")
+        .unwrap_or_else(|| "lumid-data-service".to_string());
+    Json(json!({"status": "ok", "service": service}))
 }
 
 pub async fn health_db(State(st): State<AppState>) -> ApiResult<Json<Value>> {
