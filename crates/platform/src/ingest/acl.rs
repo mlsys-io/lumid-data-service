@@ -97,10 +97,94 @@ pub async fn check_can_write(
     )))
 }
 
+/// Narrow, scope-based capability grants — orthogonal to the coarse role ACL.
+///
+/// Some callers hold an opaque LQT-style *capability* scope on their PAT (e.g.
+/// `lqt:universe:refresh`) rather than a platform role/level. Such a scope
+/// authorizes writing to ONE specific (schema, table) and nothing else — this
+/// is strictly narrower than an `ingress_acl` role grant (which would open a
+/// whole schema/table to EVERY PAT of that role). The mapping is a hard-coded
+/// allowlist here (not DB-driven) precisely so it stays least-privilege and
+/// can't be widened by an accidental `*` ACL row.
+///
+/// Returns true iff any of the caller's `scopes` grants write to (schema,
+/// table). Keep each entry a single concrete (scope, schema, table) triple.
+pub fn scope_grants_write(scopes: &[String], schema: &str, table: &str) -> bool {
+    // (capability scope, target schema, target table) — one row per capability.
+    const CAP_GRANTS: &[(&str, &str, &str)] = &[
+        // LQT monitored-universe refresh: the scoped scheduler cred publishes a
+        // `universe.refresh` config message into the mailbox inbox. Blessed as a
+        // grantable capability by lumid-identity (canGrant allowlist). Narrow:
+        // this scope → mailbox.lqt_inbox ONLY. The mailbox-consumer re-checks the
+        // scope (lqt-auth `universe.refresh` topic grant) as the real authority.
+        ("lqt:universe:refresh", "mailbox", "lqt_inbox"),
+        // LQT off-box signal producers: a strategy/trading-scoped PAT publishes a
+        // `signal.publish` message (external signal batch → lqt.signals) into the
+        // mailbox inbox via the generic /ingest path — the topic-controlled
+        // alternative to /xpio/strategies (which hardcodes `strategy.deploy`).
+        // These are the SAME scopes lqt-auth's `signal.publish` topic grant
+        // accepts, and both can ALREADY write the inbox via /xpio/strategies — so
+        // this is endpoint parity, not new privilege. Table-level here; the
+        // mailbox-consumer's per-topic `TOPIC_AUTHZ` (payload.auth.pat) stays the
+        // real per-message authority. Least-privilege: these reach
+        // mailbox.lqt_inbox ONLY.
+        ("lqt:strategy", "mailbox", "lqt_inbox"),
+        ("lqt:trading", "mailbox", "lqt_inbox"),
+    ];
+    for (cap, sch, tbl) in CAP_GRANTS {
+        if *sch == schema && *tbl == table && scopes.iter().any(|s| s == cap) {
+            return true;
+        }
+    }
+    false
+}
+
 /// A role can propose a net-new shape if it has ANY can_write=true row.
 pub async fn can_propose(pool: &Pool, role: &str) -> Result<bool, ApiError> {
     let cache = cache_snapshot(pool).await?;
     Ok(cache
         .iter()
         .any(|((r, _, _), allow)| r == role && *allow))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scope_grants_write;
+
+    fn scopes(ss: &[&str]) -> Vec<String> {
+        ss.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn universe_refresh_scope_grants_only_mailbox_inbox() {
+        let s = scopes(&["lqt:universe:refresh"]);
+        // The one blessed (scope, schema, table) triple.
+        assert!(scope_grants_write(&s, "mailbox", "lqt_inbox"));
+        // Same scope must NOT reach any other table/schema (least privilege).
+        assert!(!scope_grants_write(&s, "mailbox", "lqt_outbox"));
+        assert!(!scope_grants_write(&s, "mailbox", "processed"));
+        assert!(!scope_grants_write(&s, "obs", "runtime_cycles"));
+        assert!(!scope_grants_write(&s, "core", "tenant_strategies"));
+    }
+
+    #[test]
+    fn unrelated_or_empty_scopes_grant_nothing() {
+        assert!(!scope_grants_write(&scopes(&[]), "mailbox", "lqt_inbox"));
+        assert!(!scope_grants_write(&scopes(&["lumid:read"]), "mailbox", "lqt_inbox"));
+        assert!(!scope_grants_write(&scopes(&["lqt:universe"]), "mailbox", "lqt_inbox"));
+        assert!(!scope_grants_write(&scopes(&["*"]), "mailbox", "lqt_inbox"));
+    }
+
+    #[test]
+    fn signal_publish_scopes_grant_only_mailbox_inbox() {
+        for cap in ["lqt:strategy", "lqt:trading"] {
+            let s = scopes(&[cap]);
+            // Blessed for the inbox (the signal.publish ingest transport)…
+            assert!(scope_grants_write(&s, "mailbox", "lqt_inbox"), "{cap} → inbox");
+            // …and NOTHING else (least privilege).
+            assert!(!scope_grants_write(&s, "mailbox", "lqt_outbox"));
+            assert!(!scope_grants_write(&s, "obs", "runtime_cycles"));
+            assert!(!scope_grants_write(&s, "core", "tenant_strategies"));
+        }
+    }
 }

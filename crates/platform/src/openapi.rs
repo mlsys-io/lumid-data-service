@@ -29,7 +29,7 @@ fn oapi_path(path: &str) -> String {
         .join("/")
 }
 
-fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
+fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value, enable_llm: bool) -> Value {
     let mut paths = Map::new();
     for s in specs {
         let params: Vec<Value> = s
@@ -122,6 +122,25 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
     add("/mcp", "post", "MCP JSON-RPC", vec![], "Model Context Protocol (JSON-RPC 2.0, Streamable-HTTP). One tool per read endpoint; tools/list + tools/call.");
     add("/usage/me", "get", "Your usage", vec![], "Calling identity's totals: total_calls, bytes_out, calls_last_24h, hourly_last_24h.");
 
+    // --- LLM reverse-proxy (/v1/*) — only when this deployment mounts the LLM
+    // plugin (ServeParts.enable_llm). OpenAI- + Anthropic-compatible, model-routed
+    // across the backend pool. Enumerated here so the spec matches the mounted
+    // surface (previously omitted — the "/v1/* are compiled, not declarative" gap). ---
+    if enable_llm {
+        add("/v1/models", "get", "List models",
+            vec![], "OpenAI-compatible. Model ids available across the routed backend pool.");
+        add("/v1/chat/completions", "post", "Chat completions",
+            vec![], "OpenAI-compatible chat completions (streaming + non-streaming). Model-routed; `model` selects the backend.");
+        add("/v1/completions", "post", "Text completions",
+            vec![], "OpenAI-compatible legacy text completions. Model-routed.");
+        add("/v1/embeddings", "post", "Embeddings",
+            vec![], "OpenAI-compatible embeddings. Model-routed.");
+        add("/v1/messages", "post", "Messages (Anthropic)",
+            vec![], "Anthropic-compatible Messages API (streaming + non-streaming). Model-routed.");
+        add("/v1/messages/count_tokens", "post", "Count tokens (Anthropic)",
+            vec![], "Anthropic-compatible token counting for a Messages request.");
+    }
+
     // --- Platform public surfaces (no auth) ---
     add("/health", "get", "Liveness", vec![], "Liveness probe.");
     add("/status", "get", "Status board", vec![], "HTML health board: DB/Redis/pool + realtime feed health + endpoint-freshness SLA.");
@@ -144,8 +163,8 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
             "title": crate::config::env_var("SERVICE_NAME").unwrap_or_else(|| "lumid".into()),
             "version": env!("CARGO_PKG_VERSION"),
             "description": "Read + discovery + realtime + MCP surface. Declarative read \
-                endpoints, catalog/lineage, SSE/WebSocket streams, and POST /mcp. \
-                App-compiled reads and the optional /v1 LLM proxy are at /reference. \
+                endpoints, catalog/lineage, SSE/WebSocket streams, POST /mcp, and — when this \
+                deployment serves inference — the OpenAI/Anthropic-compatible /v1/* LLM proxy. \
                 Write/ingest/admin routes are operator-only and intentionally not listed here.",
         },
         "servers": [{"url": "/"}],
@@ -158,8 +177,8 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
 /// A router with `GET /openapi.json` (public — merge outside the gate).
 /// `extra_paths` is an app-contributed OpenAPI paths object merged into the doc
 /// (so apps can document routes the platform doesn't name, e.g. realtime SSE/WS).
-pub fn build_router(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Router<AppState> {
-    let doc = Arc::new(generate(specs, extra_paths));
+pub fn build_router(specs: &[Arc<EndpointSpec>], extra_paths: &Value, enable_llm: bool) -> Router<AppState> {
+    let doc = Arc::new(generate(specs, extra_paths, enable_llm));
     Router::new().route(
         "/openapi.json",
         get(move || {

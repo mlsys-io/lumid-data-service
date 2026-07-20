@@ -34,10 +34,13 @@ anyhow = "1"
 ```rust
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Every ServeParts field has a default; set only what you add.
     lumid_platform::serve(lumid_platform::ServeParts {
         ext_routes: axum::Router::new(),  // or your_ext::routes()
         workers:    vec![],               // or your_ext::workers()
         enable_llm: false,                // true → mount the /v1/* LLM proxy
+        // enable_agent / enable_sync, public_routes, landing, openapi_paths — see README
+        ..Default::default()
     })
     .await
 }
@@ -135,8 +138,10 @@ realtime hub, and auto-MCP (one tool per read endpoint) for free.
 4. Iterate: rebuild binary → rebuild tiny image → `docker rm -f myapp && docker run …`.
 
 ## Worked example
-The **mint** app (`crates/mint-app-bin/` + `mint.toml`) is a complete
-platform-only app — copy it.
+This repo currently ships only the platform library crate (`crates/platform`,
+crate `lumid-platform`); the `mint` reference-app binary lives outside the repo
+(build your own thin `main` per the skeleton above). The README's `mint`
+`main.rs` snippets show the complete config-only shape.
 
 ## Enabling the LLM proxy
 Set `enable_llm: true` in `ServeParts` and `LUMID_LLM_BACKEND_URL` in the env → the

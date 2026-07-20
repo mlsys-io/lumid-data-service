@@ -195,6 +195,23 @@ pub async fn gate(
         });
     }
 
+    // Concurrency guard: slot is held for the full response body lifetime
+    // (guards live inside CountedBody, released when the body is consumed).
+    let concurrency_guards = if let Some(cl) = &st.concurrency {
+        let ip = client_ip(&headers);
+        match cl.acquire(&key, &ip) {
+            Some(guards) => Some(guards),
+            None => {
+                return Err(ApiError::RateLimited {
+                    retry_after_s: 1,
+                    limit: format!("concurrency limit exceeded for {key}"),
+                });
+            }
+        }
+    } else {
+        None
+    };
+
     // require_identity: anonymous is rejected on data routes.
     let ident = ident.ok_or_else(|| {
         ApiError::Unauthorized(
@@ -232,5 +249,12 @@ pub async fn gate(
             .unwrap_or(0);
         tokio::spawn(crate::handlers::usage::record(c, sub, method, tmpl, resp.status().as_u16(), bytes));
     }
+    // Wrap the body with the concurrency guards so the in-flight slot is held
+    // for the full response lifetime (including SSE streams).
+    let resp = if let Some(guards) = concurrency_guards {
+        ratelimit::CountedBody::wrap(resp, guards)
+    } else {
+        resp
+    };
     Ok(resp)
 }

@@ -1,0 +1,21 @@
+# lqt-data / lumid-platform runtime image (ad-hoc build for the signal.publish
+# ingest-scope bless — mirrors the off-box CI image: rust release build of the
+# `lumid-platform` bin + a debian-slim runtime carrying ca-certs (the platform
+# makes outbound HTTPS to lum.id for PAT introspection + connects to Postgres).
+# Build context = repo root.
+FROM rust:1.86-slim AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . /src
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=lds-cargo-registry \
+    --mount=type=cache,target=/src/target,id=lds-cargo-target \
+    cargo build --release -p lumid-platform --bin lqt-ingest-server \
+ && mkdir -p /out && cp /src/target/release/lqt-ingest-server /out/lqt-ingest-server
+
+FROM debian:12-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /out/lqt-ingest-server /usr/local/bin/lqt-ingest-server
+ENTRYPOINT ["/usr/local/bin/lqt-ingest-server"]

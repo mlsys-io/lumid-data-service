@@ -199,4 +199,66 @@ impl Backend for PostgresBackend {
         let rows = client.query(q.sql, &q.params).await?;
         Ok(rows_to_objects(&rows))
     }
+
+    async fn query_rows_as_role(&self, q: &BoundQuery<'_>, role: &str) -> ApiResult<Vec<Map<String, Value>>> {
+        // Empty role ⇒ no elevation configured; run the normal (self-scoped) path.
+        // This keeps the feature strictly opt-in and the default byte-identical.
+        if role.trim().is_empty() {
+            return self.query_rows(q).await;
+        }
+        // Run the read inside an explicit READ ONLY transaction with the session
+        // role re-scoped to `role` for this query only (Phase D4). Ordering:
+        // `SET TRANSACTION READ ONLY` first (blocks any mutation even via a
+        // writable CTE), then `SET LOCAL ROLE` (reverts at txn end — no pool
+        // leakage). The connecting pool role must be a member of `role`. This is
+        // how an admin caller reads across tenants WITHOUT a `bypassrls` grant:
+        // the deployment points `role` at a cross-tenant-visible RLS role.
+        let mut client = self.pool.get().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("begin admin-read txn: {e}")))?;
+        let setup = format!(
+            "SET TRANSACTION READ ONLY; SET LOCAL ROLE {}",
+            super::quote_role_ident(role.trim())
+        );
+        tx.batch_execute(&setup)
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("configure admin-read txn: {e}")))?;
+        let rows = tx.query(q.sql, &q.params).await?;
+        // READ ONLY txn — drop (implicit rollback) is fine, nothing to commit.
+        drop(tx);
+        Ok(rows_to_objects(&rows))
+    }
+
+    async fn query_rows_as_tenant(&self, q: &BoundQuery<'_>, sub: &str) -> ApiResult<Vec<Map<String, Value>>> {
+        // Empty sub ⇒ nothing to pin; run the normal path (defensive — the read
+        // handler never reaches here without an authenticated sub).
+        if sub.trim().is_empty() {
+            return self.query_rows(q).await;
+        }
+        // Run the read inside an explicit READ ONLY transaction with the RLS
+        // tenant GUC pinned to the caller's sub for this query only (Phase 0c).
+        // `SET TRANSACTION READ ONLY` first (blocks any mutation even via a
+        // writable CTE), then `set_config('app.tenant_id', $1, true)` — the
+        // `true` scopes it to the txn so it reverts on commit/rollback (no pool
+        // leakage). The sub is bound as a parameter (never string-interpolated),
+        // so a hostile-shaped value cannot escape into SQL. RLS-scoped tables
+        // then filter on `current_setting('app.tenant_id')::uuid`.
+        let mut client = self.pool.get().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("begin self-tenant read txn: {e}")))?;
+        tx.batch_execute("SET TRANSACTION READ ONLY")
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("configure self-tenant read txn: {e}")))?;
+        tx.execute("SELECT set_config('app.tenant_id', $1, true)", &[&sub])
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("pin app.tenant_id GUC: {e}")))?;
+        let rows = tx.query(q.sql, &q.params).await?;
+        // READ ONLY txn — drop (implicit rollback) is fine, nothing to commit.
+        drop(tx);
+        Ok(rows_to_objects(&rows))
+    }
 }

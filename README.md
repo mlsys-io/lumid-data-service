@@ -6,7 +6,9 @@ crate (`lumid-platform`, in `crates/platform`). Applications embed it and add on
 domain: declarative read endpoints (config), any bespoke routes, and any realtime workers.
 
 It is a **library, not a separate service**: an app statically links it into one binary/process.
-(`mint` is a minimal reference app; a fuller app adds bespoke routes + realtime workers.)
+(`mint` is a minimal reference app — a config-only `main` shown below; note this repo currently
+ships only the `lumid-platform` library crate in `crates/platform`, so the `mint`/app binary
+lives in a separate app crate. A fuller app adds bespoke routes + realtime workers.)
 
 ## Build an app on it
 The whole of `mint`'s `main.rs` (a config-only app — no domain Rust at all):
@@ -51,7 +53,7 @@ A new app therefore = **a config file + a thin `main` + a DB schema**:
    `ext_routes`, un-gated via `public_routes`), a realtime `UpstreamWorker` (via `workers`), a
    custom landing (`landing`), and OpenAPI entries for any of it (`openapi_paths`).
 
-See the `mint` reference app for a complete platform-only example.
+See `DEVELOPING.md` for a complete platform-only (config-only) app walkthrough.
 
 ## What the platform provides (no app code)
 - **Auth gate** — Lumid PAT + local-key bypass, tiered rate limit (emits
