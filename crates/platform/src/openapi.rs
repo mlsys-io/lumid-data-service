@@ -128,9 +128,14 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value, enable_llm: bool) 
     // surface (previously omitted — the "/v1/* are compiled, not declarative" gap). ---
     if enable_llm {
         add("/v1/models", "get", "List models",
-            vec![], "OpenAI-compatible. Model ids available across the routed backend pool.");
+            vec![], "OpenAI-compatible. Model ids available across the routed backend pool: chat + \
+             vision (text models accept image content), embeddings, image generation, text-to-speech, \
+             and the `qwen-omni` agent (chat that can draw + speak in one call).");
         add("/v1/chat/completions", "post", "Chat completions",
-            vec![], "OpenAI-compatible chat completions (streaming + non-streaming). Model-routed; `model` selects the backend.");
+            vec![], "OpenAI-compatible chat completions (streaming + non-streaming). Model-routed; \
+             `model` selects the backend. Vision-capable models accept image content parts. The \
+             `qwen-omni` model runs tools server-side (image generation / speech) and embeds the \
+             generated media in the reply as data-URIs.");
         add("/v1/completions", "post", "Text completions",
             vec![], "OpenAI-compatible legacy text completions. Model-routed.");
         add("/v1/embeddings", "post", "Embeddings",

@@ -29,13 +29,19 @@ pub async fn landing() -> Html<String> {
         .unwrap_or_else(|| "lumid-data-service".to_string());
     let heading = crate::config::env_var("SERVICE_HEADING")
         .unwrap_or_else(|| "A portable data service.".to_string());
+    // An LLM deployment sets SERVICE_TAGLINE (+ enable_llm); render the inference
+    // "Discover" surface (models + multimodal examples). Unset → the data-service
+    // page, byte-for-byte as before.
+    let is_llm = crate::config::env_var("SERVICE_TAGLINE").is_some();
     let tagline =
         crate::config::env_var("SERVICE_TAGLINE").unwrap_or_else(|| DEFAULT_TAGLINE.to_string());
+    let discover = if is_llm { LLM_DISCOVER } else { DATA_DISCOVER };
     Html(
         GENERIC_LANDING_HTML
             .replace("__SVC_NAME__", &name)
             .replace("__SVC_HEADING__", &heading)
-            .replace("__SVC_TAGLINE__", &tagline),
+            .replace("__SVC_TAGLINE__", &tagline)
+            .replace("__DISCOVER__", discover),
     )
 }
 
@@ -97,7 +103,16 @@ const GENERIC_LANDING_HTML: &str = r##"<!DOCTYPE html>
 
   <section>
     <h2>Discover</h2>
-    <div class="tiles">
+__DISCOVER__
+  </section>
+
+  <footer>__SVC_NAME__</footer>
+</div>
+</body>
+</html>"##;
+
+/// Data-service "Discover" section (findata deployment — unchanged copy).
+const DATA_DISCOVER: &str = r##"    <div class="tiles">
       <a class="tile" href="/openapi.json">
         <div class="t">OpenAPI</div>
         <div class="d">The full machine-readable spec for every read route.</div>
@@ -121,10 +136,44 @@ const GENERIC_LANDING_HTML: &str = r##"<!DOCTYPE html>
     </div>
 
 <pre class="code"># Every data route needs a bearer token; discovery is public.
-curl -H "Authorization: Bearer &lt;token&gt;" https://&lt;host&gt;/catalog/schemas</pre>
-  </section>
+curl -H "Authorization: Bearer &lt;token&gt;" https://&lt;host&gt;/catalog/schemas</pre>"##;
 
-  <footer>__SVC_NAME__</footer>
-</div>
-</body>
-</html>"##;
+/// LLM-gateway "Discover" section — models + multimodal usage.
+const LLM_DISCOVER: &str = r##"    <div class="tiles">
+      <a class="tile" href="/v1/models">
+        <div class="t">Models</div>
+        <div class="d">Chat + vision, embeddings, image generation, text-to-speech, and the omni agent — one OpenAI/Anthropic-compatible API.</div>
+        <div class="e">GET /v1/models</div>
+      </a>
+      <a class="tile" href="/openapi.json">
+        <div class="t">OpenAPI</div>
+        <div class="d">The full machine-readable spec for every /v1 route.</div>
+        <div class="e">GET /openapi.json</div>
+      </a>
+      <a class="tile" href="/status">
+        <div class="t">Status</div>
+        <div class="d">Live health board — backend pool + per-endpoint freshness.</div>
+        <div class="e">GET /status</div>
+      </a>
+      <a class="tile" href="/usage">
+        <div class="t">Usage</div>
+        <div class="d">Your request dashboard.</div>
+        <div class="e">GET /usage • /usage/me</div>
+      </a>
+    </div>
+
+<pre class="code"># Chat — text + vision (OpenAI- or Anthropic-compatible). All calls need a bearer token.
+curl https://&lt;host&gt;/v1/chat/completions -H "Authorization: Bearer &lt;token&gt;" \
+  -d '{"model":"qwen3.6-35b-a3b","messages":[{"role":"user","content":"Hello"}]}'
+
+# Image generation → {data:[{b64_json}]}
+curl https://&lt;host&gt;/v1/images/generations -H "Authorization: Bearer &lt;token&gt;" \
+  -d '{"model":"qwen-image","prompt":"a red panda astronaut","size":"1024x1024"}'
+
+# Text to speech → binary audio
+curl https://&lt;host&gt;/v1/audio/speech -H "Authorization: Bearer &lt;token&gt;" \
+  -d '{"model":"qwen-tts","input":"Hello from Lumid"}' --output speech.mp3
+
+# qwen-omni — one agentic chat call that can draw and speak (media embedded in the reply)
+curl https://&lt;host&gt;/v1/chat/completions -H "Authorization: Bearer &lt;token&gt;" \
+  -d '{"model":"qwen-omni","messages":[{"role":"user","content":"Draw a sunset and say goodnight"}]}'</pre>"##;
