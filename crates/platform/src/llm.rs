@@ -22,4 +22,9 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/embeddings", post(handlers::llm::embeddings))
         .route("/v1/messages", post(handlers::llm::messages))
         .route("/v1/messages/count_tokens", post(handlers::llm::count_tokens))
+        // OpenAI images (JSON `{data:[{b64_json}]}`) + audio/speech (binary,
+        // relayed verbatim). Model-routed across the same pool (e.g. a
+        // `qwen-image` / `qwen-tts` entry in LUMID_LLM_BACKENDS).
+        .route("/v1/images/generations", post(handlers::llm::images))
+        .route("/v1/audio/speech", post(handlers::llm::speech))
 }

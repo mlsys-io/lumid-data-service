@@ -750,3 +750,201 @@ pub async fn count_tokens(
     };
     dispatch_json(&st, ident, reqwest::Method::POST, "/v1/messages/count_tokens", &body).await
 }
+
+// ───────────────────────────── binary passthrough (audio) + images
+
+/// Relay a raw upstream body with its status + `Content-Type`. Used for
+/// endpoints whose upstream returns non-JSON bytes (TTS audio) — `proxy_json`
+/// would force-parse the body and corrupt it.
+fn binary_response(
+    status: StatusCode,
+    content_type: Option<axum::http::HeaderValue>,
+    bytes: Bytes,
+) -> Response {
+    let mut resp = (status, bytes).into_response();
+    if let Some(ct) = content_type {
+        resp.headers_mut().insert(header::CONTENT_TYPE, ct);
+    }
+    resp
+}
+
+/// Non-streaming binary forward across the local pool (retry on connect / 503,
+/// mirroring `proxy_json` but relaying raw bytes + `Content-Type`).
+async fn proxy_binary(
+    st: &AppState,
+    backends: &[std::sync::Arc<crate::llm_pool::BackendHandle>],
+    method: reqwest::Method,
+    path: &str,
+    body: Option<&Value>,
+) -> Response {
+    let mut last_err: Option<Response> = None;
+    for handle in backends {
+        let _guard = handle.acquire();
+        let url = format!("{}{path}", handle.url);
+        let mut req = st.http.request(method.clone(), &url);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        req = add_auth(st, req);
+        let upstream = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                handle.on_connect_err();
+                tracing::warn!("llm {method} {path} → {} connect failed: {e}", handle.url);
+                last_err = Some(
+                    (StatusCode::BAD_GATEWAY, Json(json!({ "detail": "upstream LLM unreachable" })))
+                        .into_response(),
+                );
+                continue;
+            }
+        };
+        let status = upstream.status();
+        if status.as_u16() == 503 {
+            handle.on_connect_err();
+            tracing::warn!("llm {method} {path} → {} 503, retrying", handle.url);
+            last_err = Some(
+                (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "detail": "upstream LLM overloaded" })))
+                    .into_response(),
+            );
+            continue;
+        }
+        handle.on_connect_ok();
+        let ax_status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let ct = upstream.headers().get(header::CONTENT_TYPE).cloned();
+        let bytes = match upstream.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("llm reading body from {}: {e}", handle.url);
+                return (StatusCode::BAD_GATEWAY, Json(json!({ "detail": "upstream LLM body truncated" })))
+                    .into_response();
+            }
+        };
+        return binary_response(ax_status, ct, bytes);
+    }
+    last_err.unwrap_or_else(|| {
+        (StatusCode::BAD_GATEWAY, Json(json!({ "detail": "all LLM backends unavailable" })))
+            .into_response()
+    })
+}
+
+/// One-shot binary proxy to a federation peer (mirrors `proxy_json_peer`).
+async fn proxy_binary_peer(
+    st: &AppState,
+    peer: &Peer,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<&Value>,
+    origin: &OriginIdentity,
+) -> Response {
+    let base = peer.base_url.trim_end_matches('/');
+    let url = format!("{base}{path}");
+    let mut req = st.http.request(method.clone(), &url);
+    if let Some(b) = body {
+        req = req.json(b);
+    }
+    req = apply_peer_auth(req, st, peer, origin);
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let (status, detail) = if e.is_timeout() {
+                (StatusCode::GATEWAY_TIMEOUT, "upstream LLM timed out")
+            } else {
+                tracing::warn!("peer {method} {path} → {} failed: {e}", peer.id);
+                (StatusCode::BAD_GATEWAY, "upstream LLM unreachable")
+            };
+            return (status, Json(json!({ "detail": detail }))).into_response();
+        }
+    };
+    let ax_status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let ct = resp.headers().get(header::CONTENT_TYPE).cloned();
+    match resp.bytes().await {
+        Ok(bytes) => binary_response(ax_status, ct, bytes),
+        Err(e) => {
+            tracing::warn!("reading peer {path} body failed: {e}");
+            (StatusCode::BAD_GATEWAY, Json(json!({ "detail": "upstream LLM unreachable" }))).into_response()
+        }
+    }
+}
+
+/// Binary forward to the OpenRouter catch-all (mirrors `proxy_json_openrouter`).
+async fn proxy_binary_openrouter(
+    st: &AppState,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<&Value>,
+) -> Response {
+    let base = &st.llm_pool.openrouter_url;
+    let url = format!("{base}{path}");
+    let mut req = st.http.request(method.clone(), &url);
+    if let Some(b) = body {
+        req = req.json(b);
+    }
+    req = add_auth(st, req);
+    match req.send().await {
+        Ok(r) => {
+            let ax_status = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let ct = r.headers().get(header::CONTENT_TYPE).cloned();
+            match r.bytes().await {
+                Ok(bytes) => binary_response(ax_status, ct, bytes),
+                Err(_) => (StatusCode::BAD_GATEWAY, Json(json!({ "detail": "openrouter body error" }))).into_response(),
+            }
+        }
+        Err(e) => {
+            tracing::warn!("openrouter {method} {path} failed: {e}");
+            (StatusCode::BAD_GATEWAY, Json(json!({ "detail": "openrouter unreachable" }))).into_response()
+        }
+    }
+}
+
+/// Dispatch a non-streaming binary request. Same outer federation switch as
+/// `dispatch_json`, but relays the raw body (audio) instead of parsing JSON.
+async fn dispatch_binary(
+    st: &AppState,
+    ident: Option<Extension<Identity>>,
+    method: reqwest::Method,
+    path: &str,
+    body: &Value,
+) -> Response {
+    match federation_peer(st) {
+        Err(e) => e.into_response(),
+        Ok(Some(peer)) => proxy_binary_peer(st, &peer, method, path, Some(body), &origin_of(ident)).await,
+        Ok(None) => match resolve(st, model_of(body).as_deref()) {
+            Err(e) => e.into_response(),
+            Ok(None) => proxy_binary_openrouter(st, method, path, Some(body)).await,
+            Ok(Some(backends)) => proxy_binary(st, &backends, method, path, Some(body)).await,
+        },
+    }
+}
+
+// ───────────────────────────── OpenAI images + audio route handlers
+
+/// POST /v1/images/generations — OpenAI image generation. Non-streaming JSON
+/// (`{data:[{b64_json|url}]}`). Routes by the request `model` (e.g. `qwen-image`)
+/// across the backend pool exactly like chat/embeddings. No text-model default
+/// is applied — the caller must name an image model.
+pub async fn images(
+    ident: Option<Extension<Identity>>,
+    State(st): State<AppState>,
+    body: Json<Value>,
+) -> Response {
+    let body = match require_object(body.0) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    dispatch_json(&st, ident, reqwest::Method::POST, "/v1/images/generations", &body).await
+}
+
+/// POST /v1/audio/speech — OpenAI text-to-speech. The upstream returns binary
+/// audio (`audio/mpeg` / `audio/wav`), relayed verbatim. Routes by the request
+/// `model` (e.g. `qwen-tts`). No text-model default is applied.
+pub async fn speech(
+    ident: Option<Extension<Identity>>,
+    State(st): State<AppState>,
+    body: Json<Value>,
+) -> Response {
+    let body = match require_object(body.0) {
+        Ok(b) => b,
+        Err(e) => return e.into_response(),
+    };
+    dispatch_binary(&st, ident, reqwest::Method::POST, "/v1/audio/speech", &body).await
+}
