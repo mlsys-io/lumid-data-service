@@ -139,6 +139,10 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value, enable_llm: bool) 
             vec![], "Anthropic-compatible Messages API (streaming + non-streaming). Model-routed.");
         add("/v1/messages/count_tokens", "post", "Count tokens (Anthropic)",
             vec![], "Anthropic-compatible token counting for a Messages request.");
+        add("/v1/images/generations", "post", "Image generation",
+            vec![], "OpenAI-compatible image generation. Model-routed (e.g. `qwen-image`); returns `{data:[{b64_json}]}`.");
+        add("/v1/audio/speech", "post", "Text to speech",
+            vec![], "OpenAI-compatible text-to-speech. Model-routed (e.g. `qwen-tts`); returns binary audio (mp3/wav).");
     }
 
     // --- Platform public surfaces (no auth) ---
