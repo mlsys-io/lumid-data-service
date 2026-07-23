@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use object_store::path::Path as ObjPath;
-use object_store::ObjectStore;
+use object_store::{Attribute, Attributes, ObjectStore, PutOptions};
 
 use crate::error::{ApiError, ApiResult};
 
@@ -145,16 +145,26 @@ fn csv_escape(v: &serde_json::Value) -> String {
 /// `materialized_uri` is the app-relative fetch path `/blobs/<key>` that
 /// consumers pass to `GET {base_url}{materialized_uri}`.  The storage backend
 /// (scheme, bucket) is never exposed.
+///
+/// `content_type` (e.g. `OutputFormat::content_type()`) is attached as
+/// object-store metadata so `GET /blobs/<key>` can read it straight off the
+/// object. These keys (`retrievals/<run_id>/result.<ext>`) carry no
+/// `sha256=` segment and are never routed through `raw.blobs`, so — unlike
+/// ingested CAS blobs — object-store metadata is their ONLY source of truth;
+/// without it `GET` falls through to an extension guess, which doesn't know
+/// `.jsonl`/`.ndjson` and would serve `application/octet-stream`.
 pub async fn write_to_store(
     store: &Arc<dyn ObjectStore>,
     key: &str,
     bytes: Vec<u8>,
+    content_type: &str,
 ) -> ApiResult<(String, usize)> {
     let path = ObjPath::from(key);
     let size = bytes.len();
     let payload = object_store::PutPayload::from(bytes::Bytes::from(bytes));
+    let attrs = Attributes::from_iter([(Attribute::ContentType, content_type.to_string())]);
     store
-        .put(&path, payload)
+        .put_opts(&path, payload, PutOptions::from(attrs))
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("object store write failed: {e}")))?;
     let uri = format!("/blobs/{key}");
@@ -240,7 +250,7 @@ mod tests {
 
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let key = "retrievals/abc123/result.jsonl";
-        let (uri, size) = write_to_store(&store, key, b"hello\n".to_vec())
+        let (uri, size) = write_to_store(&store, key, b"hello\n".to_vec(), OutputFormat::Jsonl.content_type())
             .await
             .expect("write_to_store must succeed");
 
@@ -258,5 +268,63 @@ mod tests {
             "URI must not contain bucket name; got: {uri}"
         );
         assert_eq!(size, 6, "size must match byte count");
+    }
+
+    /// End-to-end: a materialized `result.jsonl` (the shape `replayer.rs`
+    /// produces) must resolve to `application/x-ndjson` on read-back through
+    /// the same `GetResult.attributes` path `GET /blobs/{key}` uses — not
+    /// `application/octet-stream`. This key has no `sha256=` segment (so
+    /// `raw.blobs` can never match it) and `.jsonl` isn't extension-guessable,
+    /// so object-store metadata is the only thing that can make this work.
+    #[tokio::test]
+    async fn materialized_result_jsonl_resolves_to_x_ndjson_on_readback() {
+        use object_store::memory::InMemory;
+        use std::sync::Arc;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let key = "retrievals/run-42/result.jsonl";
+        write_to_store(
+            &store,
+            key,
+            b"{\"a\":1}\n".to_vec(),
+            OutputFormat::Jsonl.content_type(),
+        )
+        .await
+        .expect("write_to_store must succeed");
+
+        let got = store
+            .get(&ObjPath::from(key))
+            .await
+            .expect("readback must succeed");
+        let stored_ct = got
+            .attributes
+            .get(&Attribute::ContentType)
+            .map(|v| v.to_string());
+        assert_eq!(stored_ct.as_deref(), Some("application/x-ndjson"));
+
+        // Feed it through the exact same resolver `serve_blob` uses: no DB
+        // row (this key has no sha256= segment), no usable extension guess.
+        let resolved = crate::handlers::blobs::resolve_content_type(
+            stored_ct.as_deref(),
+            None,
+            key,
+        );
+        assert_eq!(resolved, "application/x-ndjson");
+    }
+
+    #[tokio::test]
+    async fn materialized_result_csv_resolves_to_text_csv_on_readback() {
+        use object_store::memory::InMemory;
+        use std::sync::Arc;
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let key = "retrievals/run-43/result.csv";
+        write_to_store(&store, key, b"a,b\n1,2\n".to_vec(), OutputFormat::Csv.content_type())
+            .await
+            .expect("write_to_store must succeed");
+
+        let got = store.get(&ObjPath::from(key)).await.expect("readback must succeed");
+        let stored_ct = got.attributes.get(&Attribute::ContentType).map(|v| v.to_string());
+        assert_eq!(stored_ct.as_deref(), Some("text/csv"));
     }
 }

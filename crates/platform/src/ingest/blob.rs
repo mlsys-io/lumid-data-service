@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use deadpool_postgres::Pool;
-use object_store::{path::Path as ObjPath, ObjectStore, PutPayload};
+use object_store::{path::Path as ObjPath, Attribute, Attributes, ObjectStore, PutOptions, PutPayload};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -178,8 +178,17 @@ pub async fn ingest_blob(
 
     // 2) Write to the object store (localfs default → identical on-disk layout
     //    at `<blob_root>/<prefix>/sha256=<hex>`; or S3/MinIO when configured).
+    //    Attach the resolved content-type as object-store metadata so
+    //    `GET /blobs/{key}` can read the real type straight off the object —
+    //    these CAS keys are extension-free, so `raw.blobs` is otherwise the
+    //    only place it survives.
+    let attrs = Attributes::from_iter([(Attribute::ContentType, ct.clone())]);
     blob_store
-        .put(&ObjPath::from(key.as_str()), PutPayload::from(body.to_vec()))
+        .put_opts(
+            &ObjPath::from(key.as_str()),
+            PutPayload::from(body.to_vec()),
+            PutOptions::from(attrs),
+        )
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("blob put: {e}")))?;
 

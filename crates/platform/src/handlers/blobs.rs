@@ -1,10 +1,15 @@
 //! Blob serving (read side) — port of `api/routes/blobs.py`.
 //!
 //! GET /blobs/{key:path}
-//!   Serve the bytes at `<settings.blob_root>/{key}`. Content-Type is read from
-//!   `raw.blobs.content_type` (DB-truth, not file-extension guessing), falling
-//!   back to `application/octet-stream`. 404 if the file is missing; 400 on any
-//!   path-traversal attempt that escapes blob_root; 503 if blob_root unset.
+//!   Serve the bytes at `<settings.blob_root>/{key}`. Content-Type is the
+//!   object's own object-store metadata (the real MinIO/S3 Content-Type) when
+//!   present, else `raw.blobs.content_type`, else an extension guess, else
+//!   `application/octet-stream` — see `resolve_content_type`. Always sets
+//!   `X-Content-Type-Options: nosniff`, and forces
+//!   `Content-Disposition: attachment` for active-content types (HTML/SVG)
+//!   since this route is public and unauthenticated. 404 if the file is
+//!   missing; 400 on any path-traversal attempt that escapes blob_root; 503
+//!   if blob_root unset.
 //!
 //! GET /blobs?prefix=…
 //!   List objects by prefix (flat or delimiter-bounded). See `list_blobs`.
@@ -18,11 +23,13 @@ use std::path::{Component, Path as FsPath};
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use futures_util::TryStreamExt;
-use object_store::{path::Path as ObjPath, Error as ObjError, PutPayload};
+use object_store::{
+    path::Path as ObjPath, Attribute, Attributes, Error as ObjError, PutOptions, PutPayload,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::Identity;
@@ -145,6 +152,50 @@ pub fn is_hidden_prefix(common_prefix: &str, retrieval_prefix: &str) -> bool {
     norm == retrieval_prefix || norm.starts_with(&format!("{retrieval_prefix}/"))
 }
 
+// ── content-type resolution ──────────────────────────────────────────────────
+
+/// Trim and validate a candidate Content-Type string before it's allowed
+/// anywhere near a response header. `HeaderValue::from_str` is the actual
+/// security boundary: it rejects control characters (CR/LF, NUL, ...), so
+/// object-store metadata or DB rows that were tampered with to smuggle extra
+/// headers (response splitting) get rejected here rather than propagated.
+pub fn valid_content_type(raw: &str) -> Option<String> {
+    let ct = raw.trim();
+    if ct.is_empty() || !ct.contains('/') {
+        return None;
+    }
+    HeaderValue::from_str(ct).ok()?;
+    Some(ct.to_string())
+}
+
+/// Pure fallback chain used by `serve_blob`, split out so the ordering and
+/// validation are unit-testable without a live Postgres pool or object store.
+/// `stored` is the (already stringified) object-store metadata Content-Type;
+/// `db` is `raw.blobs.content_type`; `key` feeds the last-resort extension
+/// guess. Each tier is independently validated, so a malformed value at a
+/// higher tier falls through instead of aborting the whole lookup.
+pub fn resolve_content_type(stored: Option<&str>, db: Option<&str>, key: &str) -> String {
+    stored
+        .and_then(valid_content_type)
+        .or_else(|| db.and_then(valid_content_type))
+        .or_else(|| q::guess_from_extension(key))
+        .unwrap_or_else(|| "application/octet-stream".to_string())
+}
+
+/// Content-types a browser would execute as active content if served inline.
+/// `GET /blobs/{key}` is an unauthenticated, publicly-fetchable route, so
+/// serving these with their real type is a stored-XSS vector — mitigated in
+/// `serve_blob` by forcing `Content-Disposition: attachment` instead of
+/// suppressing the real Content-Type (consumers that check the header, like
+/// FlowMesh's connector, still see the accurate value).
+pub fn is_active_content_type(ct: &str) -> bool {
+    let base = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "text/html" | "application/xhtml+xml" | "image/svg+xml"
+    )
+}
+
 // ── handler ──────────────────────────────────────────────────────────────────
 
 pub async fn list_blobs(
@@ -249,16 +300,43 @@ pub async fn serve_blob(
         Err(e) => return Err(ApiError::Internal(anyhow::anyhow!("blob get: {e}"))),
     };
 
-    let ct = q::content_type_for_key(&st.pool, &key)
-        .await?
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+    // Content-type resolution, most authoritative source first:
+    //  1) the object's own stored metadata (the real MinIO/S3 Content-Type —
+    //     what an operator, or another tool, set directly on the object);
+    //  2) `raw.blobs.content_type` — the only surviving source for blobs
+    //     ingested before object-store metadata was written, since their
+    //     extensionless `sha256=...` keys can never be extension-guessed;
+    //  3) an extension guess;
+    //  4) `application/octet-stream`.
+    let stored_raw = got.attributes.get(&Attribute::ContentType).map(|v| v.to_string());
+
+    // Skip the DB round-trip entirely when the object's own metadata already
+    // gives a valid type.
+    let ct = if let Some(ct) = stored_raw.as_deref().and_then(valid_content_type) {
+        ct
+    } else {
+        let db_raw = q::content_type_for_key(&st.pool, &key).await?;
+        resolve_content_type(None, db_raw.as_deref(), &key)
+    };
+
+    let ct_header = HeaderValue::from_str(&ct)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, ct_header)
+        .header(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+
+    if is_active_content_type(&ct) {
+        builder = builder.header(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
+    }
 
     // Stream rather than buffering (blobs can be up to 100 MB).
-    let resp = (
-        [(header::CONTENT_TYPE, ct)],
-        Body::from_stream(got.into_stream()),
-    )
-        .into_response();
+    let resp = builder
+        .body(Body::from_stream(got.into_stream()))
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("build blob response: {e}")))?;
     Ok(resp)
 }
 
@@ -290,6 +368,7 @@ pub async fn put_blob(
     State(st): State<AppState>,
     Extension(identity): Extension<Identity>,
     Path(key): Path<String>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> ApiResult<Json<PutBlobResponse>> {
     require_blob_write(&identity)?;
@@ -306,10 +385,26 @@ pub async fn put_blob(
         )));
     }
 
-    st.blob_store
-        .put(&ObjPath::from(key.as_str()), PutPayload::from(body))
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("blob put: {e}")))?;
+    // Preserve the caller-declared Content-Type as object-store metadata so
+    // `GET /blobs/{key}` can serve the real type back later instead of
+    // falling through to an extension guess (this key has no DB row at all).
+    let declared_ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(valid_content_type);
+
+    let obj_path = ObjPath::from(key.as_str());
+    let payload = PutPayload::from(body);
+    let put_res = match declared_ct {
+        Some(ct) => {
+            let attrs = Attributes::from_iter([(Attribute::ContentType, ct)]);
+            st.blob_store
+                .put_opts(&obj_path, payload, PutOptions::from(attrs))
+                .await
+        }
+        None => st.blob_store.put(&obj_path, payload).await,
+    };
+    put_res.map_err(|e| ApiError::Internal(anyhow::anyhow!("blob put: {e}")))?;
     Ok(Json(PutBlobResponse { key, size }))
 }
 
