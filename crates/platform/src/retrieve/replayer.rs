@@ -149,7 +149,7 @@ pub async fn replay(
     let output_bytes = materializer.into_bytes();
     let size_bytes = output_bytes.len() as i64;
     let (materialized_uri, _) =
-        write_to_store(&st.blob_store, &key, output_bytes).await?;
+        write_to_store(&st.blob_store, &key, output_bytes, output_format.content_type()).await?;
 
     let signed_url = super::materialize::try_presign_url(&st.blob_store, &key);
     let replay_latency_ms = started.elapsed().as_millis() as i64;
