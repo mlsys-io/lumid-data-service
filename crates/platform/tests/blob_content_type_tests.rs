@@ -129,11 +129,16 @@ fn resolve_content_type_never_panics_on_malformed_stored_and_db_values() {
 // ── active-content mitigation (stored XSS via public GET) ───────────────────
 
 #[test]
-fn html_and_svg_are_flagged_as_active_content() {
+fn html_svg_and_js_are_flagged_as_active_content() {
     assert!(is_active_content_type("text/html"));
     assert!(is_active_content_type("text/html; charset=utf-8"));
     assert!(is_active_content_type("image/svg+xml"));
     assert!(is_active_content_type("application/xhtml+xml"));
+    // JS can be executed via <script src="…"> even without MIME sniffing when
+    // the server declares the correct type — must force attachment.
+    assert!(is_active_content_type("text/javascript"));
+    assert!(is_active_content_type("application/javascript"));
+    assert!(is_active_content_type("text/javascript; charset=utf-8"));
 }
 
 #[test]
@@ -142,6 +147,24 @@ fn images_and_text_plain_are_not_active_content() {
     assert!(!is_active_content_type("text/plain"));
     assert!(!is_active_content_type("application/x-ndjson"));
     assert!(!is_active_content_type("application/octet-stream"));
+}
+
+#[test]
+fn svg_extension_guess_is_flagged_as_active_content() {
+    // Exercises the full cascade: .svg → extension guess → image/svg+xml →
+    // is_active_content_type → Content-Disposition: attachment.
+    // This path is reachable on GET /blobs/{key} for any blob with a .svg key
+    // and no stored metadata or DB row.
+    let ct = resolve_content_type(None, None, "assets/icon.svg");
+    assert_eq!(ct, "image/svg+xml");
+    assert!(is_active_content_type(&ct));
+}
+
+#[test]
+fn js_extension_guess_is_flagged_as_active_content() {
+    let ct = resolve_content_type(None, None, "scripts/bundle.js");
+    assert_eq!(ct, "text/javascript");
+    assert!(is_active_content_type(&ct));
 }
 
 // ── guess_from_extension: the reproduction case from the bug report ────────

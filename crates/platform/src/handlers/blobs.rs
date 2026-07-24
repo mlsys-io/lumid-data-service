@@ -188,11 +188,20 @@ pub fn resolve_content_type(stored: Option<&str>, db: Option<&str>, key: &str) -
 /// `serve_blob` by forcing `Content-Disposition: attachment` instead of
 /// suppressing the real Content-Type (consumers that check the header, like
 /// FlowMesh's connector, still see the accurate value).
+///
+/// JS is included because a `<script src="…">` that fetches from this route
+/// would execute if the response carries `text/javascript`; `X-Content-Type-
+/// Options: nosniff` prevents MIME-sniffing but does not suppress a server
+/// that correctly declares its own JS content-type.
 pub fn is_active_content_type(ct: &str) -> bool {
     let base = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
     matches!(
         base.as_str(),
-        "text/html" | "application/xhtml+xml" | "image/svg+xml"
+        "text/html"
+            | "application/xhtml+xml"
+            | "image/svg+xml"
+            | "text/javascript"
+            | "application/javascript"
     )
 }
 

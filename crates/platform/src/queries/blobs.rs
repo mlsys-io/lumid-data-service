@@ -55,6 +55,11 @@ pub fn guess_from_extension(key: &str) -> Option<String> {
         "xml" => "application/xml",
         "css" => "text/css",
         "js" | "mjs" => "text/javascript",
+        // NOTE: `.jsonl` / `.ndjson` are intentionally absent — Python's
+        // `mimetypes.guess_type` doesn't know them either. These types can
+        // only be resolved via stored object-store metadata or `raw.blobs`;
+        // adding them here would give false confidence and break the parity
+        // contract. See `blob_content_type_tests::jsonl_and_ndjson_extensions_are_not_guessable`.
         "zip" => "application/zip",
         "gz" => "application/gzip",
         "tar" => "application/x-tar",
