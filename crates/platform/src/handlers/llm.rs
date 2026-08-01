@@ -645,6 +645,16 @@ pub async fn list_models(
         if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
             for m in arr {
                 let id = m.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                // Only advertise models that are actually ROUTABLE (explicitly
+                // configured in LUMID_LLM_BACKENDS). Remote aggregator backends
+                // (Moonshot, OpenRouter) report their WHOLE catalog on /v1/models;
+                // without this filter those extra ids leak in as advertised models
+                // but fall through to the default backend when called — a silent
+                // wrong-model. Local/self-hosted backends self-report their
+                // configured alias, so they pass unchanged.
+                if !st.llm_pool.by_model.contains_key(&id) {
+                    continue;
+                }
                 if seen.insert(id) {
                     let mut m = m.clone();
                     // Normalize across serving stacks: vLLM advertises
