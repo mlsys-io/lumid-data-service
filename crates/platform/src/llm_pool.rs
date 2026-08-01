@@ -142,10 +142,14 @@ impl BackendPool {
     /// Backends to try for `model`, sorted: healthy-least-loaded first, then
     /// unhealthy (fallback of last resort). Returns empty when nothing is configured.
     pub fn backends_for(&self, model: Option<&str>) -> Vec<Arc<BackendHandle>> {
-        let handles = model
-            .and_then(|m| self.by_model.get(m))
-            .map(|v| v.as_slice())
-            .or_else(|| self.primary.as_ref().map(std::slice::from_ref));
+        // An EXPLICIT model resolves ONLY to its configured backends — never a
+        // silent fallback to the primary/default (that fallback served qwen for
+        // any unmapped id; the caller now 404s an unmapped model instead). An
+        // OMITTED model (None) uses the primary/default backend.
+        let handles = match model {
+            Some(m) => self.by_model.get(m).map(|v| v.as_slice()),
+            None => self.primary.as_ref().map(std::slice::from_ref),
+        };
 
         let Some(handles) = handles else {
             return vec![];

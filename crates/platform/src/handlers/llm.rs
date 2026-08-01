@@ -280,9 +280,14 @@ fn resolve(
     if !backends.is_empty() {
         return Ok(Some(backends));
     }
-    // Unknown explicit model → OpenRouter catch-all.
-    if model.is_some() && !st.llm_pool.openrouter_url.is_empty() {
-        return Ok(None); // caller will proxy to openrouter_url
+    // Empty pool. An EXPLICIT model that isn't configured is REJECTED (strict
+    // allowlist) — not silently served by the primary/default, and not sent to
+    // the OpenRouter catch-all. This kills the "unmapped id → qwen" wrong-model
+    // path. To make a new model routable, add it to LUMID_LLM_BACKENDS.
+    if let Some(m) = model {
+        return Err(ApiError::NotFound(format!(
+            "model '{m}' is not available — see GET /v1/models for the configured models"
+        )));
     }
     Err(ApiError::Unavailable(
         "LLM backend not configured (LUMID_LLM_BACKEND_URL is empty)".into(),
