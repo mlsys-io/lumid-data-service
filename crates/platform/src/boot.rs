@@ -189,8 +189,14 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         _ => None,
     };
 
+    // The 300s total budget is deliberate — a single image generation can
+    // legitimately run for minutes. But without a CONNECT timeout a backend
+    // that never completes the TCP handshake inherits that whole budget, so a
+    // dead worker reads as a 5-minute hang and then a 502. Bound the handshake
+    // separately (matching http_stream) and leave the total alone.
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
+        .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     // Streaming LLM client: connect timeout only. No total timeout — reasoning

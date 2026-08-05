@@ -96,6 +96,41 @@ fn require_object(body: Value) -> Result<Value, ApiError> {
     }
 }
 
+/// Classify an outbound `send()` failure for logs.
+///
+/// `reqwest::Error`'s Display is the same "error sending request for url (…)"
+/// string whether the handshake was refused, the total budget expired, or the
+/// body died mid-stream — and the useful detail sits in the source chain, which
+/// Display hides. Logging every failure as "connect failed" made a 300s total
+/// timeout look like a connect error and sent at least one investigation down
+/// the wrong path. Name the mode, and print the cause chain.
+fn send_err_kind(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connect"
+    } else if e.is_body() {
+        "body"
+    } else if e.is_decode() {
+        "decode"
+    } else if e.is_request() {
+        "request"
+    } else {
+        "other"
+    }
+}
+
+/// Full `source:` chain of an error — the part `{e}` alone drops.
+fn err_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(c) = cur {
+        out.push_str(&format!(" ← {c}"));
+        cur = c.source();
+    }
+    out
+}
+
 /// Inject the local `llm_api_key` bearer (if set) on an outbound upstream call.
 fn add_auth(st: &AppState, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     if st.settings.llm_api_key.is_empty() {
@@ -339,7 +374,7 @@ async fn proxy_json(
             Ok(r) => r,
             Err(e) => {
                 handle.on_connect_err();
-                tracing::warn!("llm {method} {path} → {} connect failed: {e}", handle.url);
+                tracing::warn!("llm {method} {path} → {} send failed [{}]: {}", handle.url, send_err_kind(&e), err_chain(&e));
                 last_err = Some((
                     StatusCode::BAD_GATEWAY,
                     Json(json!({ "detail": "upstream LLM unreachable" })),
@@ -418,7 +453,7 @@ async fn proxy_json_openrouter(st: &AppState, method: reqwest::Method, path: &st
             }
         }
         Err(e) => {
-            tracing::warn!("openrouter {method} {path} failed: {e}");
+            tracing::warn!("openrouter {method} {path} send failed [{}]: {}", send_err_kind(&e), err_chain(&e));
             (StatusCode::BAD_GATEWAY, Json(json!({ "detail": "openrouter unreachable" }))).into_response()
         }
     }
@@ -444,7 +479,7 @@ async fn proxy_stream(
             Ok(r) => r,
             Err(e) => {
                 handle.on_connect_err();
-                tracing::warn!("llm stream POST {path} → {} connect failed: {e}", handle.url);
+                tracing::warn!("llm stream POST {path} → {} send failed [{}]: {}", handle.url, send_err_kind(&e), err_chain(&e));
                 continue;
             }
         };
@@ -834,7 +869,7 @@ async fn proxy_binary(
             Ok(r) => r,
             Err(e) => {
                 handle.on_connect_err();
-                tracing::warn!("llm {method} {path} → {} connect failed: {e}", handle.url);
+                tracing::warn!("llm {method} {path} → {} send failed [{}]: {}", handle.url, send_err_kind(&e), err_chain(&e));
                 last_err = Some(
                     (StatusCode::BAD_GATEWAY, Json(json!({ "detail": "upstream LLM unreachable" })))
                         .into_response(),
@@ -934,7 +969,7 @@ async fn proxy_binary_openrouter(
             }
         }
         Err(e) => {
-            tracing::warn!("openrouter {method} {path} failed: {e}");
+            tracing::warn!("openrouter {method} {path} send failed [{}]: {}", send_err_kind(&e), err_chain(&e));
             (StatusCode::BAD_GATEWAY, Json(json!({ "detail": "openrouter unreachable" }))).into_response()
         }
     }
