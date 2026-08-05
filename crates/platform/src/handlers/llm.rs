@@ -375,6 +375,20 @@ async fn proxy_json(
             Err(e) => {
                 handle.on_connect_err();
                 tracing::warn!("llm {method} {path} → {} send failed [{}]: {}", handle.url, send_err_kind(&e), err_chain(&e));
+                // A response timeout is NOT retryable. It means the backend
+                // ACCEPTED the request and is still working on it -- e.g. a
+                // ComfyUI image prompt already sitting in its queue. Trying
+                // the next replica enqueues a SECOND copy of the same job on
+                // an already-saturated fleet and doubles the caller's wait.
+                // A connect timeout is different: nothing was accepted, so
+                // failing over is correct. `is_connect()` separates them.
+                if e.is_timeout() && !e.is_connect() {
+                    return (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        Json(json!({ "detail": "upstream LLM timed out" })),
+                    )
+                        .into_response();
+                }
                 last_err = Some((
                     StatusCode::BAD_GATEWAY,
                     Json(json!({ "detail": "upstream LLM unreachable" })),
@@ -870,6 +884,16 @@ async fn proxy_binary(
             Err(e) => {
                 handle.on_connect_err();
                 tracing::warn!("llm {method} {path} → {} send failed [{}]: {}", handle.url, send_err_kind(&e), err_chain(&e));
+                // See proxy_json: a response timeout means the backend already
+                // took the work, so failing over duplicates the job. Only a
+                // connect-phase failure is worth another replica.
+                if e.is_timeout() && !e.is_connect() {
+                    return (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        Json(json!({ "detail": "upstream LLM timed out" })),
+                    )
+                        .into_response();
+                }
                 last_err = Some(
                     (StatusCode::BAD_GATEWAY, Json(json!({ "detail": "upstream LLM unreachable" })))
                         .into_response(),
