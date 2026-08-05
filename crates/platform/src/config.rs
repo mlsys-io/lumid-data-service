@@ -167,6 +167,11 @@ pub struct Settings {
     /// unknown model IDs are forwarded there rather than rejected or sent to local.
     /// Empty (default) = fall through to primary.
     pub llm_openrouter_url: String,
+    /// Optional bearer for the OpenRouter catch-all path (`LLM_OPENROUTER_KEY`).
+    /// When set, injected instead of `llm_api_key` on calls to `llm_openrouter_url`.
+    /// Lets kimi-k3 (direct Moonshot, `llm_api_key`) and GLM-5.2 (OpenRouter,
+    /// `llm_openrouter_key`) share the same lumid-llm instance without a key conflict.
+    pub llm_openrouter_key: String,
     /// Optional bearer for upstream LLM calls made by the agent loop. When
     /// non-empty, the platform injects `Authorization: Bearer <key>` on the
     /// requests it originates from the agent loop. The `/v1/*` proxy does NOT
@@ -339,6 +344,7 @@ impl Settings {
             llm_openrouter_url: env_str("LLM_OPENROUTER_URL", "")
                 .trim_end_matches('/')
                 .to_string(),
+            llm_openrouter_key: env_str("LLM_OPENROUTER_KEY", ""),
             llm_api_key: env_str("LLM_API_KEY", ""),
             user_schemas: env_str("USER_SCHEMAS", "")
                 .split(',')

@@ -105,6 +105,21 @@ fn add_auth(st: &AppState, req: reqwest::RequestBuilder) -> reqwest::RequestBuil
     }
 }
 
+/// Inject auth for the OpenRouter catch-all path. Uses `llm_openrouter_key` when
+/// set; falls back to `llm_api_key`. Local tailnet backends always use `add_auth`.
+fn add_openrouter_auth(st: &AppState, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let key = if !st.settings.llm_openrouter_key.is_empty() {
+        &st.settings.llm_openrouter_key
+    } else {
+        &st.settings.llm_api_key
+    };
+    if key.is_empty() {
+        req
+    } else {
+        req.header("Authorization", format!("Bearer {key}"))
+    }
+}
+
 fn sse_response(body: Body) -> Response {
     Response::builder()
         .status(StatusCode::OK)
@@ -280,10 +295,15 @@ fn resolve(
     if !backends.is_empty() {
         return Ok(Some(backends));
     }
-    // Empty pool. An EXPLICIT model that isn't configured is REJECTED (strict
-    // allowlist) — not silently served by the primary/default, and not sent to
-    // the OpenRouter catch-all. This kills the "unmapped id → qwen" wrong-model
-    // path. To make a new model routable, add it to LUMID_LLM_BACKENDS.
+    // Empty pool. An EXPLICIT model that isn't configured is never silently
+    // served by the primary/default — that was the "unmapped id → qwen"
+    // wrong-model bug. It may still be handled by the OpenRouter catch-all when
+    // one is configured; that path is explicit about which upstream answers.
+    if model.is_some() && !st.llm_pool.openrouter_url.is_empty() {
+        return Ok(None); // caller proxies to openrouter_url
+    }
+    // No catch-all configured → strict allowlist. To make a new model routable,
+    // add it to LUMID_LLM_BACKENDS (or configure LLM_OPENROUTER_URL).
     if let Some(m) = model {
         return Err(ApiError::NotFound(format!(
             "model '{m}' is not available — see GET /v1/models for the configured models"
@@ -382,7 +402,7 @@ async fn proxy_json_openrouter(st: &AppState, method: reqwest::Method, path: &st
     if let Some(b) = body {
         req = req.json(b);
     }
-    req = add_auth(st, req);
+    req = add_openrouter_auth(st, req);
     match req.send().await {
         Ok(r) => {
             let status = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -484,7 +504,7 @@ async fn proxy_stream(
 async fn proxy_stream_openrouter(st: &AppState, path: &str, body: &Value) -> Response {
     let base = &st.llm_pool.openrouter_url;
     let url = format!("{base}{path}");
-    let req = add_auth(st, st.http_stream.post(&url).json(body));
+    let req = add_openrouter_auth(st, st.http_stream.post(&url).json(body));
     match req.send().await {
         Ok(upstream) if upstream.status().as_u16() < 400 => {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
@@ -629,10 +649,19 @@ pub async fn list_models(
     let mut data: Vec<Value> = Vec::new();
     let mut seen = std::collections::HashSet::<String>::new();
     for base in &bases {
+        // The OpenRouter base gets its own bearer; pooled tailnet backends get
+        // the shared upstream key. Sending the Moonshot key to OpenRouter (or
+        // vice versa) is a key conflict, not just cosmetic.
+        let is_openrouter =
+            !st.llm_pool.openrouter_url.is_empty() && base == &st.llm_pool.openrouter_url;
         let mut req = st.http.get(format!("{base}/v1/models"));
-        if !st.settings.llm_api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", st.settings.llm_api_key));
-        }
+        req = if is_openrouter {
+            add_openrouter_auth(&st, req)
+        } else if !st.settings.llm_api_key.is_empty() {
+            req.header("Authorization", format!("Bearer {}", st.settings.llm_api_key))
+        } else {
+            req
+        };
         let r = match req.send().await {
             Ok(r) => r,
             Err(e) => {
