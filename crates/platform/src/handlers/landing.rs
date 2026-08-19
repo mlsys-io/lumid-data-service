@@ -36,13 +36,41 @@ pub async fn landing() -> Html<String> {
     let tagline =
         crate::config::env_var("SERVICE_TAGLINE").unwrap_or_else(|| DEFAULT_TAGLINE.to_string());
     let discover = if is_llm { LLM_DISCOVER } else { DATA_DISCOVER };
+    // The hero tagline carries inline <em> markup, which is invalid inside a
+    // meta content attribute — strip tags (and escape quotes) for the <meta>
+    // description so the two never drift apart the way they did when the LLM
+    // deployment kept advertising the data-service copy to crawlers.
+    let tagline_text = strip_tags(&tagline);
     Html(
         GENERIC_LANDING_HTML
             .replace("__SVC_NAME__", &name)
             .replace("__SVC_HEADING__", &heading)
+            .replace("__SVC_TAGLINE_TEXT__", &tagline_text)
             .replace("__SVC_TAGLINE__", &tagline)
             .replace("__DISCOVER__", discover),
     )
+}
+
+/// Strip inline HTML tags and escape quotes so a hero tagline can be reused as
+/// the `<meta name="description">` content. Deliberately minimal — the taglines
+/// are our own copy with `<em>` in them, not untrusted input.
+fn strip_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            '"' => {
+                if !in_tag {
+                    out.push_str("&quot;")
+                }
+            }
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Default hero tagline (the original data-platform copy) used when
@@ -57,7 +85,7 @@ const GENERIC_LANDING_HTML: &str = r##"<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>__SVC_NAME__</title>
-  <meta name="description" content="A portable read / write / realtime data service — config-driven REST reads, a schema-introspecting ingest plane, a Redis pub/sub realtime hub, catalog + lineage, auth, and MCP.">
+  <meta name="description" content="__SVC_TAGLINE_TEXT__">
   <meta name="theme-color" content="#0f766e">
   <style>
     :root { --bg:#fbfaf7; --fg:#0f172a; --fg-dim:#475569; --fg-muted:#94a3b8;
@@ -162,18 +190,20 @@ const LLM_DISCOVER: &str = r##"    <div class="tiles">
       </a>
     </div>
 
-<pre class="code"># Chat — text + vision (OpenAI- or Anthropic-compatible). All calls need a bearer token.
+<pre class="code"># Chat — OpenAI- or Anthropic-compatible. All calls need a bearer token.
+# deepseek-v4-flash is the default, served in house on our own GB10 pair.
 curl https://&lt;host&gt;/v1/chat/completions -H "Authorization: Bearer &lt;token&gt;" \
-  -d '{"model":"qwen3.6-35b-a3b","messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"Hello"}]}'
 
-# Image generation → {data:[{b64_json}]}
-curl https://&lt;host&gt;/v1/images/generations -H "Authorization: Bearer &lt;token&gt;" \
-  -d '{"model":"qwen-image","prompt":"a red panda astronaut","size":"1024x1024"}'
+# Omit "model" to get the default. Anthropic-style clients use /v1/messages.
+curl https://&lt;host&gt;/v1/messages -H "Authorization: Bearer &lt;token&gt;" \
+  -d '{"max_tokens":256,"messages":[{"role":"user","content":"Hello"}]}'
 
-# Text to speech → binary audio
-curl https://&lt;host&gt;/v1/audio/speech -H "Authorization: Bearer &lt;token&gt;" \
-  -d '{"model":"qwen-tts","input":"Hello from Lumid"}' --output speech.mp3
+# Reasoning models stream their thinking separately — give max_tokens room, or a
+# small budget is spent before any answer and content comes back empty.
 
-# qwen-omni — one agentic chat call that can draw and speak (media embedded in the reply)
-curl https://&lt;host&gt;/v1/chat/completions -H "Authorization: Bearer &lt;token&gt;" \
-  -d '{"model":"qwen-omni","messages":[{"role":"user","content":"Draw a sunset and say goodnight"}]}'</pre>"##;
+# GET /v1/models lists what is served locally. Any other id falls through to
+# OpenRouter and is BILLED per token — including a typo or a retired model id,
+# which returns 200 rather than 404. Note deepseek-v4-flash (ours, free) and
+# deepseek/deepseek-v4-flash-0731 (OpenRouter, metered) are NOT the same route.
+curl https://&lt;host&gt;/v1/models -H "Authorization: Bearer &lt;token&gt;"</pre>"##;

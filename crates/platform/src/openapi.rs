@@ -128,26 +128,33 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value, enable_llm: bool) 
     // surface (previously omitted — the "/v1/* are compiled, not declarative" gap). ---
     if enable_llm {
         add("/v1/models", "get", "List models",
-            vec![], "OpenAI-compatible. Model ids available across the routed backend pool: chat + \
-             vision (text models accept image content), embeddings, image generation, text-to-speech, \
-             and the `qwen-omni` agent (chat that can draw + speak in one call).");
+            vec![], "OpenAI-compatible. Lists only the models served by this deployment's own \
+             backend pool. An id that is NOT listed is not necessarily unavailable — it falls \
+             through to the OpenRouter catch-all and is billed per token — so absence from this \
+             list is not a 404, and a typo or a retired id will succeed rather than error.");
         add("/v1/chat/completions", "post", "Chat completions",
             vec![], "OpenAI-compatible chat completions (streaming + non-streaming). Model-routed; \
-             `model` selects the backend. Vision-capable models accept image content parts. The \
-             `qwen-omni` model runs tools server-side (image generation / speech) and embeds the \
-             generated media in the reply as data-URIs.");
+             `model` selects the backend, and omitting it uses the deployment default. Reasoning \
+             models return their chain-of-thought separately from the answer, and their thinking \
+             counts against `max_tokens` — too small a budget returns empty content with \
+             `finish_reason: \"length\"` rather than an error.");
         add("/v1/completions", "post", "Text completions",
             vec![], "OpenAI-compatible legacy text completions. Model-routed.");
         add("/v1/embeddings", "post", "Embeddings",
-            vec![], "OpenAI-compatible embeddings. Model-routed.");
+            vec![], "OpenAI-compatible embeddings. Model-routed; requires an embedding backend in \
+             the pool — check GET /v1/models first.");
         add("/v1/messages", "post", "Messages (Anthropic)",
             vec![], "Anthropic-compatible Messages API (streaming + non-streaming). Model-routed.");
         add("/v1/messages/count_tokens", "post", "Count tokens (Anthropic)",
             vec![], "Anthropic-compatible token counting for a Messages request.");
         add("/v1/images/generations", "post", "Image generation",
-            vec![], "OpenAI-compatible image generation. Model-routed (e.g. `qwen-image`); returns `{data:[{b64_json}]}`.");
+            vec![], "OpenAI-compatible image generation. Model-routed; returns `{data:[{b64_json}]}`. \
+             The route is always mounted, but it only works if this deployment's pool actually has \
+             an image backend — check GET /v1/models first.");
         add("/v1/audio/speech", "post", "Text to speech",
-            vec![], "OpenAI-compatible text-to-speech. Model-routed (e.g. `qwen-tts`); returns binary audio (mp3/wav).");
+            vec![], "OpenAI-compatible text-to-speech. Model-routed; returns binary audio (mp3/wav). \
+             The route is always mounted, but it only works if this deployment's pool actually has \
+             a speech backend — check GET /v1/models first.");
     }
 
     // --- Platform public surfaces (no auth) ---
