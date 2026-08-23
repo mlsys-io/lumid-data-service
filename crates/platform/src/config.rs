@@ -186,6 +186,20 @@ pub struct Settings {
     /// 0 disables the queue roof (in-flight roof still applies). Backends whose
     /// metrics are unreachable or unparseable are never gated by this.
     pub llm_backend_queue_roof: u32,
+
+    /// Seconds to wait for the FIRST DATA CHUNK from the local backend before
+    /// ALSO issuing the same request to OpenRouter and forwarding whichever
+    /// answers first (`LLM_HEDGE_AFTER_S`). 0 = disabled.
+    ///
+    /// This is a HEDGE, not a switch. The local request is left running, so if
+    /// OpenRouter is slow, unreachable, or misconfigured the local answer still
+    /// lands -- a slow turn can never become a failed one. That distinction is
+    /// the whole point: the previous switch-style guard fired at 45s, returned
+    /// an empty stream, and poisoned session transcripts.
+    ///
+    /// Must be well above a normal cold prefill (~75s at the ~124k mean context,
+    /// ~1.65k tok/s) so healthy turns are never hedged. Measured tail: 150-180s.
+    pub llm_hedge_after_s: u64,
     /// Catch-all backend URL for any explicitly-specified model that isn't the
     /// primary and isn't in `llm_backends`. When set (e.g. `https://openrouter.ai/api`),
     /// unknown model IDs are forwarded there rather than rejected or sent to local.
@@ -374,6 +388,7 @@ impl Settings {
                 .collect(),
             llm_backend_max_concurrency: env_u32("LLM_BACKEND_MAX_CONCURRENCY", 16),
             llm_backend_queue_roof: env_u32("LLM_BACKEND_QUEUE_ROOF", 1),
+            llm_hedge_after_s: env_u32("LLM_HEDGE_AFTER_S", 0) as u64,
             llm_openrouter_url: env_str("LLM_OPENROUTER_URL", "")
                 .trim_end_matches('/')
                 .to_string(),

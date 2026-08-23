@@ -473,12 +473,42 @@ async fn proxy_json_openrouter(st: &AppState, method: reqwest::Method, path: &st
 /// Forward a streaming request. Tries backends in order; retries on connect
 /// failure before any bytes have been sent to the client. Once streaming starts,
 /// no retry is possible.
+
+/// Which side of a hedged stream won the race to the first data frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StreamSide {
+    Local,
+    Hedge,
+}
+
+/// Whether a raw SSE chunk carries a real `data:` frame, as opposed to only
+/// keepalive comments or whitespace. This is what decides a hedge: a side that
+/// has merely opened a connection has not answered.
+fn chunk_has_data_frame(b: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(b) else {
+        // Non-UTF8 bytes are real payload, not a keepalive comment.
+        return true;
+    };
+    text.lines()
+        .any(|l| l.starts_with("data:") && !l.trim_start_matches("data:").trim().is_empty())
+}
+
+/// Whether this request's model has an OpenRouter mapping. Hedging an unmapped
+/// model would send a local-only id upstream and simply 404.
+fn model_is_mapped(st: &AppState, body: &Value) -> bool {
+    body.get("model")
+        .and_then(|m| m.as_str())
+        .map(|m| st.settings.llm_openrouter_model_map.contains_key(m))
+        .unwrap_or(false)
+}
+
 async fn proxy_stream(
     st: &AppState,
     backends: &[std::sync::Arc<crate::llm_pool::BackendHandle>],
     path: &str,
     body: &Value,
 ) -> Response {
+    let path_owned = path.to_string();
     for handle in backends {
         let guard = handle.acquire();
         let url = format!("{}{path}", handle.url);
@@ -512,23 +542,126 @@ async fn proxy_stream(
         // Connected successfully — stream. The guard is moved into the spawn
         // so inflight stays incremented until the upstream is exhausted.
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+
+        // HEDGE SETUP. A cold prefill on a large context can take minutes while
+        // the backend is perfectly healthy and nowhere near its roof, so neither
+        // the health check nor the queue roof fires. Measured: a 250k-token turn
+        // waited 180s (12 keepalives) before its first token.
+        //
+        // After `hedge_after_s` with no DATA frame, issue the SAME request to
+        // OpenRouter as well and forward whichever side produces a data frame
+        // first. Deliberately a hedge and not a switch: the local request keeps
+        // running, so if OpenRouter is unreachable or slower the local answer
+        // still lands. The previous switch-style guard abandoned the local
+        // backend, and when its fallback failed the turn came back as an empty
+        // stream that poisoned the session transcript.
+        //
+        // Only keepalive COMMENTS have reached the client at the hedge point, so
+        // adopting either side is invisible to it.
+        let hedge_after = st.settings.llm_hedge_after_s;
+        let hedge_plan = if hedge_after > 0 {
+            let rewritten = rewrite_model_for_openrouter(st, body);
+            let base = st.llm_pool.openrouter_url.clone();
+            let key = if !st.settings.llm_openrouter_key.is_empty() {
+                st.settings.llm_openrouter_key.clone()
+            } else {
+                st.settings.llm_api_key.clone()
+            };
+            // offload is only meaningful when the model is actually mapped —
+            // sending a local-only id to OpenRouter would just 404.
+            if base.is_empty() || !model_is_mapped(st, body) {
+                None
+            } else {
+                Some((format!("{base}{path}"), key, rewritten, st.http_stream.clone()))
+            }
+        } else {
+            None
+        };
+
         tokio::spawn(async move {
             let _guard = guard; // holds inflight until stream ends
             let mut ka = interval(Duration::from_secs(KEEPALIVE_INTERVAL_S));
             ka.set_missed_tick_behavior(MissedTickBehavior::Delay);
             ka.tick().await;
             let mut upstream = Box::pin(upstream.bytes_stream());
+
+            let (hx_tx, mut hx_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+            let mut hedge_started = false;
+            let mut winner: Option<StreamSide> = None;
+            let hedge_at = tokio::time::sleep(Duration::from_secs(hedge_after.max(1)));
+            tokio::pin!(hedge_at);
+
             loop {
                 tokio::select! {
                     biased;
                     chunk = upstream.next() => {
                         match chunk {
-                            Some(Ok(b)) => { if tx.send(b).is_err() { break; } }
-                            _ => break,
+                            Some(Ok(b)) => {
+                                if winner.is_none() && chunk_has_data_frame(&b) {
+                                    winner = Some(StreamSide::Local);
+                                }
+                                if winner != Some(StreamSide::Hedge) && tx.send(b).is_err() {
+                                    break;
+                                }
+                            }
+                            // Local ended. If a hedge is still in flight and has
+                            // not lost, keep the turn alive and let it answer.
+                            _ => {
+                                if winner == Some(StreamSide::Local) || !hedge_started {
+                                    break;
+                                }
+                                if hx_rx.is_closed() && hx_rx.is_empty() {
+                                    break;
+                                }
+                                // Drain the hedge to completion.
+                                while let Some(b) = hx_rx.recv().await {
+                                    if tx.send(b).is_err() {
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    Some(b) = hx_rx.recv(), if hedge_started => {
+                        if winner.is_none() && chunk_has_data_frame(&b) {
+                            winner = Some(StreamSide::Hedge);
+                            tracing::warn!(
+                                "llm stream {path_owned}: OpenRouter hedge answered first after {hedge_after}s — local prefill still running"
+                            );
+                        }
+                        if winner == Some(StreamSide::Hedge) && tx.send(b).is_err() {
+                            break;
+                        }
+                    }
+                    _ = &mut hedge_at, if !hedge_started && winner.is_none() => {
+                        hedge_started = true;
+                        if let Some((url, key, body, http)) = hedge_plan.clone() {
+                            tracing::warn!(
+                                "llm stream {path_owned}: no data from local backend in {hedge_after}s — hedging to OpenRouter"
+                            );
+                            let hx_tx = hx_tx.clone();
+                            tokio::spawn(async move {
+                                let req = http.post(&url).bearer_auth(&key).json(&body);
+                                match req.send().await {
+                                    Ok(r) if r.status().as_u16() < 400 => {
+                                        let mut s = Box::pin(r.bytes_stream());
+                                        while let Some(Ok(b)) = s.next().await {
+                                            if hx_tx.send(b).is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Ok(r) => tracing::warn!("llm hedge to OpenRouter returned HTTP {}", r.status()),
+                                    Err(e) => tracing::warn!("llm hedge to OpenRouter failed: {e}"),
+                                }
+                            });
                         }
                     }
                     _ = ka.tick() => {
-                        if tx.send(Bytes::from_static(KEEPALIVE_FRAME)).is_err() { break; }
+                        if winner.is_none() && tx.send(Bytes::from_static(KEEPALIVE_FRAME)).is_err() {
+                            break;
+                        }
                     }
                 }
             }
@@ -824,4 +957,44 @@ pub async fn count_tokens(
         Err(e) => return e.into_response(),
     };
     dispatch_json(&st, ident, reqwest::Method::POST, "/v1/messages/count_tokens", &body).await
+}
+
+#[cfg(test)]
+mod hedge_tests {
+    use super::*;
+
+    // A hedge is decided by the first side to emit a real data frame. Keepalive
+    // comments must NOT count: both sides open a connection immediately, so
+    // treating a comment as an answer would always hand the race to whichever
+    // side connected first — which is exactly the side we are trying to escape.
+    #[test]
+    fn keepalive_comments_do_not_win_the_race() {
+        assert!(!chunk_has_data_frame(b": keep-alive\n\n"));
+        assert!(!chunk_has_data_frame(b"\n\n"));
+        assert!(!chunk_has_data_frame(b""));
+        assert!(!chunk_has_data_frame(b": ping\n\n: ping\n\n"));
+    }
+
+    #[test]
+    fn real_data_frames_win_the_race() {
+        assert!(chunk_has_data_frame(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+        ));
+        assert!(chunk_has_data_frame(b"data: [DONE]\n\n"));
+        // Mixed chunk: a keepalive followed by a real frame still counts.
+        assert!(chunk_has_data_frame(b": keep-alive\n\ndata: {\"x\":1}\n\n"));
+    }
+
+    // An empty `data:` line is a framing artifact, not an answer.
+    #[test]
+    fn empty_data_line_is_not_an_answer() {
+        assert!(!chunk_has_data_frame(b"data:\n\n"));
+        assert!(!chunk_has_data_frame(b"data: \n\n"));
+    }
+
+    // Binary payload is real content, not a comment.
+    #[test]
+    fn non_utf8_counts_as_data() {
+        assert!(chunk_has_data_frame(&[0xff, 0xfe, 0x00]));
+    }
 }
