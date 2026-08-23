@@ -349,9 +349,29 @@ fn resolve(
         }
         return Ok(Some(backends));
     }
-    // Unknown explicit model → OpenRouter catch-all.
-    if model.is_some() && !st.llm_pool.openrouter_url.is_empty() {
-        return Ok(None); // caller will proxy to openrouter_url
+    // UNKNOWN MODEL IDS ARE REFUSED, NEVER FORWARDED TO OPENROUTER.
+    //
+    // There used to be a catch-all here: "unknown explicit model -> OpenRouter".
+    // It was removed in llm-0d342a8 after an e2e test caught it silently
+    // forwarding a request for a NONEXISTENT model id to real OpenRouter and
+    // being billed for it -- a typo became money, and an outage became an
+    // invisible bill instead of an obvious error.
+    //
+    // It was then reintroduced by accident in 70fc036, which stopped
+    // backends_for() falling back to the primary for a named unknown model and
+    // so made this arm reachable again. Verified at the time by watching
+    // `z-ai/glm-5.2` come back from OpenRouter (provider Baidu) -- which was a
+    // reproduction of the billing hole, not a fix.
+    //
+    // OpenRouter is reached ONLY as a bounded overflow for a KNOWN, configured
+    // model: the concurrency/queue roofs above, and the 90s hedge in
+    // proxy_stream. Both require the model to be in the roster and in
+    // LUMID_LLM_OPENROUTER_MODEL_MAP. An unrecognised id gets our own error, so
+    // a real outage 503s honestly.
+    if let Some(m) = model {
+        return Err(ApiError::Unavailable(format!(
+            "unknown model {m:?} — not in LUMID_LLM_BACKENDS (unknown ids are never forwarded to OpenRouter)"
+        )));
     }
     Err(ApiError::Unavailable(
         "LLM backend not configured (LUMID_LLM_BACKEND_URL is empty)".into(),

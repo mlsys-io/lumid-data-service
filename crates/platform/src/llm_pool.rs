@@ -217,9 +217,13 @@ impl BackendPool {
         // Measured: `z-ai/glm-5.2` and `deepseek/deepseek-v4-flash-0731` both came
         // back as vLLM `NotFoundError` 404s from the LOCAL backend instead of
         // routing to OpenRouter.
+        // Gate on having an explicit roster, NOT on OpenRouter being configured:
+        // an unknown id must resolve to no backend so resolve() can refuse it
+        // outright. A deployment with no roster at all (only LUMID_LLM_BACKEND_URL)
+        // still sends every named model to the primary, as it always did.
         let named_unknown = model.is_some()
-            && model.map_or(false, |m| !self.by_model.contains_key(m))
-            && !self.openrouter_url.is_empty();
+            && !self.by_model.is_empty()
+            && model.map_or(false, |m| !self.by_model.contains_key(m));
         let handles = model
             .and_then(|m| self.by_model.get(m))
             .map(|v| v.as_slice())
@@ -526,18 +530,32 @@ mod catchall_tests {
         }
     }
 
-    // An explicitly-named UNKNOWN model must fall through to the OpenRouter
-    // catch-all, not be swallowed by the primary backend. It WAS swallowed:
-    // `z-ai/glm-5.2` came back as a vLLM NotFoundError 404 from the LOCAL
-    // backend, because the primary fallback made resolve()'s catch-all arm
-    // unreachable whenever LUMID_LLM_BACKEND_URL was set — which is always.
+    // An explicitly-named UNKNOWN model must resolve to NO backend, so resolve()
+    // can REFUSE it. It must never reach OpenRouter: an e2e test once caught a
+    // nonexistent model id being forwarded to real OpenRouter and billed, so a
+    // typo became money (llm-0d342a8 closed that; 70fc036 reopened it by
+    // accident; this pins it shut).
     #[test]
-    fn named_unknown_model_falls_through_to_catchall() {
+    fn named_unknown_model_resolves_to_no_backend() {
         let p = pool(&["deepseek-v4-flash"], true, "https://openrouter.ai/api");
         assert!(
             p.backends_for(Some("z-ai/glm-5.2")).is_empty(),
-            "unknown model must resolve to NO local backend so resolve() reaches the catch-all"
+            "unknown model must resolve to NO local backend so resolve() refuses it"
         );
+    }
+
+    // The refusal must not depend on OpenRouter being configured -- otherwise
+    // turning the URL off silently changes an unknown id from "refused" to
+    // "served by the primary", which is how the roster stops meaning anything.
+    #[test]
+    fn named_unknown_is_refused_with_or_without_openrouter() {
+        for or in ["https://openrouter.ai/api", ""] {
+            let p = pool(&["deepseek-v4-flash"], true, or);
+            assert!(
+                p.backends_for(Some("z-ai/glm-5.2")).is_empty(),
+                "unknown model must resolve to no backend (openrouter={or:?})"
+            );
+        }
     }
 
     #[test]
