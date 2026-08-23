@@ -357,7 +357,24 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     }
 
     let read_router = read::exec::build_router(&specs);
-    let openapi_router = crate::openapi::build_router(&specs, &parts.openapi_paths);
+    // Document the /v1 surface whenever the LLM plane is on. openapi.rs builds
+    // its doc from the DECLARATIVE read specs, so a compiled route like
+    // /v1/chat/completions is invisible to it -- which is how lum.id/llm ended
+    // up serving an /openapi.json of 18 paths, none of them LLM. The app can
+    // still contribute its own paths; those WIN on a key collision, since an
+    // app overriding a platform route's docs is deliberate.
+    let mut openapi_paths = parts.openapi_paths.clone();
+    if parts.enable_llm {
+        if let (Some(dst), Some(src)) = (
+            openapi_paths.as_object_mut(),
+            crate::llm::openapi_paths().as_object(),
+        ) {
+            for (k, v) in src {
+                dst.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+    let openapi_router = crate::openapi::build_router(&specs, &openapi_paths);
     let router = app::build_router(
         state,
         read_router,
