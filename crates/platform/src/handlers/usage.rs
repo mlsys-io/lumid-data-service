@@ -508,7 +508,7 @@ tr:last-child td { border-bottom:none; }
 .full { grid-column:1 / -1; }
 </style></head><body><div class="wrap">
 <h1>API usage</h1>
-<div class="sub">kv.run:5000 · since {since} · {now} · auto-refresh 15s</div>
+<div class="sub">lum.id/findata · since {since} · {now} · auto-refresh 15s</div>
 <div class="windows">window: {selector}</div>
 
 <div class="cards">

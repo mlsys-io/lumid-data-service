@@ -88,6 +88,9 @@ impl ParamSpec {
 #[derive(Debug, Clone, Deserialize)]
 pub struct EndpointSpec {
     pub id: String,
+    /// Human-readable description surfaced in OpenAPI + MCP tool docs.
+    #[serde(default)]
+    pub description: String,
     #[serde(default = "default_method")]
     pub method: String,
     pub path: String,

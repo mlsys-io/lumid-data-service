@@ -47,6 +47,7 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
         let op = json!({
             "summary": s.id,
             "operationId": s.id.replace('.', "_"),
+            "description": if s.description.is_empty() { s.id.clone() } else { s.description.clone() },
             "parameters": params,
             "responses": {"200": {"description": "OK"}},
         });
@@ -76,13 +77,13 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
 
     // --- Catalog / lineage (discovery; read-only) ---
     add("/catalog/schemas", "get", "List schemas", vec![], "User schemas in the warehouse.");
-    add("/catalog/schemas/{schema}/tables", "get", "List tables in a schema", vec![p("schema", "path", true)], "");
+    add("/catalog/schemas/{schema}/tables", "get", "List tables in a schema", vec![p("schema", "path", true)], "Tables + row estimates for one schema.");
     add("/catalog/tables/{schema}/{table}", "get", "Table profile", vec![p("schema", "path", true), p("table", "path", true)], "Columns, row estimate, provenance.");
-    add("/catalog/tables/{schema}/{table}/schema.json", "get", "Table JSON Schema", vec![p("schema", "path", true), p("table", "path", true)], "");
-    add("/catalog/sources", "get", "Ingest sources", vec![], "");
-    add("/catalog/submitters", "get", "Ingest submitters", vec![], "");
-    add("/catalog/lineage/runs", "get", "Recent ingest runs", vec![], "");
-    add("/catalog/lineage/run/{run_id}", "get", "Lineage for a run", vec![p("run_id", "path", true)], "");
+    add("/catalog/tables/{schema}/{table}/schema.json", "get", "Table JSON Schema", vec![p("schema", "path", true), p("table", "path", true)], "Column shape (name, type) for a table.");
+    add("/catalog/sources", "get", "Ingest sources", vec![], "Configured ingest source systems.");
+    add("/catalog/submitters", "get", "Ingest submitters", vec![], "Who/what may submit to the ingress surface.");
+    add("/catalog/lineage/runs", "get", "Recent ingest runs", vec![], "Recent ingest runs with status + row counts.");
+    add("/catalog/lineage/run/{run_id}", "get", "Lineage for a run", vec![p("run_id", "path", true)], "The lineage chain for one ingest run.");
     add("/catalog/lineage/row", "get", "Lineage for a row", vec![p("schema", "query", true), p("table", "query", true)], "Trace a row back to its ingest run.");
 
     // Realtime SSE/WebSocket routes are app-contributed (the platform names no
