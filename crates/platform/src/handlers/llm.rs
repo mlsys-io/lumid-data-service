@@ -88,6 +88,26 @@ fn wants_stream(body: &Value) -> bool {
     matches!(body.get("stream"), Some(Value::Bool(true)))
 }
 
+/// Rewrite `model` per `llm_openrouter_model_map` before forwarding to
+/// OpenRouter. Local pool ids (e.g. `deepseek-v4-flash`) are not valid
+/// OpenRouter ids; sending them verbatim 400s there. Only applied on the
+/// OpenRouter path — local-backend requests never see this. A model not in
+/// the map (kimi-k3, GLM-5.2, an already-OpenRouter-shaped id) passes through
+/// unchanged, since those are already the correct external id.
+fn rewrite_model_for_openrouter(st: &AppState, body: &Value) -> Value {
+    let Some(local) = model_of(body) else {
+        return body.clone();
+    };
+    let Some(or_id) = st.settings.llm_openrouter_model_map.get(&local) else {
+        return body.clone();
+    };
+    let mut b = body.clone();
+    if let Value::Object(map) = &mut b {
+        map.insert("model".into(), Value::String(or_id.clone()));
+    }
+    b
+}
+
 fn require_object(body: Value) -> Result<Value, ApiError> {
     if body.is_object() {
         Ok(body)
@@ -102,6 +122,21 @@ fn add_auth(st: &AppState, req: reqwest::RequestBuilder) -> reqwest::RequestBuil
         req
     } else {
         req.header("Authorization", format!("Bearer {}", st.settings.llm_api_key))
+    }
+}
+
+/// Inject auth for the OpenRouter catch-all path. Uses `llm_openrouter_key` when
+/// set; falls back to `llm_api_key`. Local tailnet backends always use `add_auth`.
+fn add_openrouter_auth(st: &AppState, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let key = if !st.settings.llm_openrouter_key.is_empty() {
+        &st.settings.llm_openrouter_key
+    } else {
+        &st.settings.llm_api_key
+    };
+    if key.is_empty() {
+        req
+    } else {
+        req.header("Authorization", format!("Bearer {key}"))
     }
 }
 
@@ -276,8 +311,42 @@ fn resolve(
     st: &AppState,
     model: Option<&str>,
 ) -> Result<Option<Vec<std::sync::Arc<crate::llm_pool::BackendHandle>>>, ApiError> {
+    // CLAUDE NEVER GOES TO OPENROUTER. Claude models (claude-sonnet-*, claude-haiku-*,
+    // claude-opus-*, claude-fable-*) are proprietary pooled-account models served by
+    // claude-proxy against the Anthropic subscription — they must NEVER fall through
+    // to the metered OpenRouter catch-all. claude-proxy already rewrites ordinary
+    // users' sonnet/haiku to deepseek-v4-flash before routing, so a `claude-*` reaching
+    // lumid-llm is either a direct call or an admin's genuine pooled request — neither
+    // belongs on OpenRouter. Refuse it outright (a claude id has no local backend here;
+    // the only thing it could ever resolve to is the catch-all). This is what was
+    // silently billing metered sonnet on OpenRouter.
+    let is_claude = model.map_or(false, |m| m.to_ascii_lowercase().starts_with("claude-"));
+    if is_claude {
+        return Err(ApiError::Unavailable(
+            "Claude models are served by the Anthropic pool via claude-proxy, not here — refusing (never OpenRouter)".into(),
+        ));
+    }
+
     let backends = st.llm_pool.backends_for(model);
     if !backends.is_empty() {
+        // Overflow to OpenRouter when EVERY local backend for this model is at its
+        // concurrency roof (healthy but saturated) AND OpenRouter is configured.
+        // Rationale: piling onto the saturated on-prem GB10 pushes it into the
+        // saturation-tipping-into-prefill-stall regime (many concurrent users evict
+        // each other's prefix cache and every turn pays cold prefill). Sending the
+        // overflow to the metered OpenRouter version is a deliberate availability
+        // trade: the on-prem roof is the guardrail, OpenRouter absorbs the peak.
+        let all_at_roof = st.settings.llm_backend_max_concurrency > 0
+            && backends.iter().all(|h| h.at_roof());
+        if all_at_roof && !st.llm_pool.openrouter_url.is_empty() {
+            tracing::warn!(
+                "llm resolve: model={:?} all {} local backends at concurrency \
+                 roof — overflowing to OpenRouter",
+                model,
+                backends.len()
+            );
+            return Ok(None); // caller will proxy to openrouter_url
+        }
         return Ok(Some(backends));
     }
     // Unknown explicit model → OpenRouter catch-all.
@@ -377,7 +446,7 @@ async fn proxy_json_openrouter(st: &AppState, method: reqwest::Method, path: &st
     if let Some(b) = body {
         req = req.json(b);
     }
-    req = add_auth(st, req);
+    req = add_openrouter_auth(st, req);
     match req.send().await {
         Ok(r) => {
             let status = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -479,7 +548,7 @@ async fn proxy_stream(
 async fn proxy_stream_openrouter(st: &AppState, path: &str, body: &Value) -> Response {
     let base = &st.llm_pool.openrouter_url;
     let url = format!("{base}{path}");
-    let req = add_auth(st, st.http_stream.post(&url).json(body));
+    let req = add_openrouter_auth(st, st.http_stream.post(&url).json(body));
     match req.send().await {
         Ok(upstream) if upstream.status().as_u16() < 400 => {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
@@ -539,7 +608,10 @@ async fn dispatch_json(
         }
         Ok(None) => match resolve(st, model_of(body).as_deref()) {
             Err(e) => e.into_response(),
-            Ok(None) => proxy_json_openrouter(st, method, path, Some(body)).await,
+            Ok(None) => {
+                let body = rewrite_model_for_openrouter(st, body);
+                proxy_json_openrouter(st, method, path, Some(&body)).await
+            }
             Ok(Some(backends)) => proxy_json(st, &backends, method, path, Some(body)).await,
         },
     }
@@ -558,7 +630,10 @@ async fn dispatch_stream(
         Ok(Some(peer)) => proxy_stream_peer(st, &peer, path, body, &origin_of(ident)).await,
         Ok(None) => match resolve(st, model_of(body).as_deref()) {
             Err(e) => e.into_response(),
-            Ok(None) => proxy_stream_openrouter(st, path, body).await,
+            Ok(None) => {
+                let body = rewrite_model_for_openrouter(st, body);
+                proxy_stream_openrouter(st, path, &body).await
+            }
             Ok(Some(backends)) => proxy_stream(st, &backends, path, body).await,
         },
     }

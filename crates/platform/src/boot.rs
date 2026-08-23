@@ -204,6 +204,10 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     let llm_pool = {
         let pool = Arc::new(crate::llm_pool::BackendPool::from_settings(&settings));
         pool.clone().start_health_prober(http.clone());
+        // Scrape each backend's engine queue depth so the resolver can spill to
+        // OpenRouter BEFORE queueing. The in-flight roof only counts requests
+        // this process issued and is blind to other clients on the same GPU.
+        pool.clone().start_queue_scraper(http.clone());
         tracing::info!(
             "llm pool: {} unique backend(s)",
             pool.all.len()
