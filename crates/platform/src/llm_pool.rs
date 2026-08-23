@@ -296,8 +296,17 @@ impl BackendPool {
                             h.set_queue_depth(n);
                             // Log only on a saturation EDGE, so this is quiet in
                             // steady state but visible when spill begins/ends.
-                            let was = prev >= 0 && prev >= 1;
-                            let now = n >= 1;
+                            //
+                            // The edge must be the ROOF, not a hardcoded 1. With
+                            // queue_roof=4 this warned "treating as saturated, new
+                            // requests spill to OpenRouter" every time depth merely
+                            // reached 1 -- 15 times in 24h, none of which spilled
+                            // anything, because the actual gate (at_queue_roof) is
+                            // q >= queue_roof. The log was reporting a fallback that
+                            // never happened.
+                            let roof = h.queue_roof.max(1) as i32;
+                            let was = prev >= roof;
+                            let now = n >= roof;
                             if now != was {
                                 if now {
                                     tracing::warn!(
@@ -411,5 +420,36 @@ vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4-flash",re
         h.set_queue_depth(99);
         assert!(!h.at_queue_roof());
         assert!(!h.at_roof());
+    }
+}
+
+#[cfg(test)]
+mod queue_roof_edge_tests {
+    use super::*;
+
+    // The saturation warning must fire on the ROOF, not on any queue at all.
+    // With queue_roof=4 the old edge (hardcoded 1) warned "new requests spill to
+    // OpenRouter" whenever depth reached 1 — 15 times in 24h of production, none
+    // of which spilled anything, because at_queue_roof gates on q >= queue_roof.
+    #[test]
+    fn saturation_edge_follows_the_roof() {
+        let h = BackendHandle::new("http://x".into(), 8, 4);
+        for (depth, want) in [(0, false), (1, false), (3, false), (4, true), (9, true)] {
+            h.set_queue_depth(depth);
+            assert_eq!(
+                h.at_queue_roof(),
+                want,
+                "queue depth {depth} with roof 4 should saturate={want}"
+            );
+        }
+    }
+
+    // roof=0 disables the queue signal entirely; only in-flight applies.
+    #[test]
+    fn zero_roof_disables_queue_gate() {
+        let h = BackendHandle::new("http://x".into(), 8, 0);
+        h.set_queue_depth(50);
+        assert!(!h.at_queue_roof(), "roof 0 must disable the queue gate");
+        assert!(!h.at_roof(), "in-flight is 0, so the backend is not at roof");
     }
 }
