@@ -206,10 +206,30 @@ impl BackendPool {
     /// Backends to try for `model`, sorted: healthy-least-loaded first, then
     /// unhealthy (fallback of last resort). Returns empty when nothing is configured.
     pub fn backends_for(&self, model: Option<&str>) -> Vec<Arc<BackendHandle>> {
+        // The primary is a fallback for a request that names NO model, or for a
+        // deployment with no OpenRouter catch-all to fall through to.
+        //
+        // It must NOT swallow an explicitly-named unknown model while a catch-all
+        // exists. It did: an unknown id missed `by_model`, fell back to the
+        // primary, and `resolve()` then took its `!backends.is_empty()` branch --
+        // making the "unknown explicit model -> OpenRouter catch-all" arm
+        // unreachable whenever LUMID_LLM_BACKEND_URL is set, which is always.
+        // Measured: `z-ai/glm-5.2` and `deepseek/deepseek-v4-flash-0731` both came
+        // back as vLLM `NotFoundError` 404s from the LOCAL backend instead of
+        // routing to OpenRouter.
+        let named_unknown = model.is_some()
+            && model.map_or(false, |m| !self.by_model.contains_key(m))
+            && !self.openrouter_url.is_empty();
         let handles = model
             .and_then(|m| self.by_model.get(m))
             .map(|v| v.as_slice())
-            .or_else(|| self.primary.as_ref().map(std::slice::from_ref));
+            .or_else(|| {
+                if named_unknown {
+                    None
+                } else {
+                    self.primary.as_ref().map(std::slice::from_ref)
+                }
+            });
 
         let Some(handles) = handles else {
             return vec![];
@@ -451,5 +471,64 @@ mod queue_roof_edge_tests {
         h.set_queue_depth(50);
         assert!(!h.at_queue_roof(), "roof 0 must disable the queue gate");
         assert!(!h.at_roof(), "in-flight is 0, so the backend is not at roof");
+    }
+}
+
+#[cfg(test)]
+mod catchall_tests {
+    use super::*;
+
+    /// Build a pool the way from_settings would, without needing a Settings.
+    fn pool(known: &[&str], with_primary: bool, openrouter: &str) -> BackendPool {
+        let h = Arc::new(BackendHandle::new("http://gb10:8090".into(), 8, 4));
+        let mut by_model: HashMap<String, Vec<Arc<BackendHandle>>> = HashMap::new();
+        for m in known {
+            by_model.insert((*m).to_string(), vec![h.clone()]);
+        }
+        BackendPool {
+            by_model,
+            primary: if with_primary { Some(h.clone()) } else { None },
+            all: vec![h],
+            openrouter_url: openrouter.to_string(),
+        }
+    }
+
+    // An explicitly-named UNKNOWN model must fall through to the OpenRouter
+    // catch-all, not be swallowed by the primary backend. It WAS swallowed:
+    // `z-ai/glm-5.2` came back as a vLLM NotFoundError 404 from the LOCAL
+    // backend, because the primary fallback made resolve()'s catch-all arm
+    // unreachable whenever LUMID_LLM_BACKEND_URL was set — which is always.
+    #[test]
+    fn named_unknown_model_falls_through_to_catchall() {
+        let p = pool(&["deepseek-v4-flash"], true, "https://openrouter.ai/api");
+        assert!(
+            p.backends_for(Some("z-ai/glm-5.2")).is_empty(),
+            "unknown model must resolve to NO local backend so resolve() reaches the catch-all"
+        );
+    }
+
+    #[test]
+    fn known_model_still_resolves_locally() {
+        let p = pool(&["deepseek-v4-flash"], true, "https://openrouter.ai/api");
+        assert_eq!(p.backends_for(Some("deepseek-v4-flash")).len(), 1);
+    }
+
+    // With NO catch-all configured the primary fallback must still apply,
+    // otherwise a legacy single-backend deployment (only LUMID_LLM_BACKEND_URL
+    // set, clients naming a model) would start failing.
+    #[test]
+    fn primary_fallback_survives_without_a_catchall() {
+        let p = pool(&[], true, "");
+        assert_eq!(
+            p.backends_for(Some("anything-at-all")).len(),
+            1,
+            "without OpenRouter the primary must still absorb a named model"
+        );
+    }
+
+    #[test]
+    fn unnamed_request_uses_primary() {
+        let p = pool(&["deepseek-v4-flash"], true, "https://openrouter.ai/api");
+        assert_eq!(p.backends_for(None).len(), 1);
     }
 }
