@@ -307,6 +307,21 @@ async fn proxy_stream_peer(
 /// Resolve backends for `model`. Returns `Err` (503) when pool is empty and
 /// there's no OpenRouter catch-all. Returns `Ok(None)` when OpenRouter should
 /// handle the request (model unknown + openrouter configured).
+/// Whether `model` is served BY OpenRouter rather than merely overflowed to it.
+///
+/// True only for a model an operator explicitly listed in
+/// `LUMID_LLM_OPENROUTER_MODEL_MAP` while OpenRouter is configured. That map is
+/// the allowlist, which is the whole safety property: a typo, a hallucinated
+/// id, or a model we simply do not carry is NOT in it and is refused with our
+/// own error instead of being forwarded to a metered upstream and billed.
+fn openrouter_serves(
+    map: &std::collections::HashMap<String, String>,
+    openrouter_url: &str,
+    model: &str,
+) -> bool {
+    !openrouter_url.is_empty() && map.contains_key(model)
+}
+
 fn resolve(
     st: &AppState,
     model: Option<&str>,
@@ -349,6 +364,26 @@ fn resolve(
         }
         return Ok(Some(backends));
     }
+    // OPENROUTER-SERVED MODELS: a KNOWN id with no local backend (yet).
+    //
+    // A model listed in LUMID_LLM_OPENROUTER_MODEL_MAP is one an operator
+    // explicitly configured, so serving it from OpenRouter is a deliberate
+    // routing choice -- not the "a typo became money" catch-all that
+    // llm-0d342a8 removed and 85acad7 removed again. The distinction that
+    // matters is CONFIGURED vs UNRECOGNISED, not local vs remote: the map IS
+    // the allowlist, and an id in neither LUMID_LLM_BACKENDS nor the map is
+    // still refused below, with our own error.
+    //
+    // This is what lets a model be OpenRouter-only today and on-prem-first
+    // tomorrow with NO code change: add it to LUMID_LLM_BACKENDS and the
+    // branch above takes over automatically -- concurrency roof, queue roof
+    // and the hedge all apply, with OpenRouter demoted from sole server to
+    // bounded overflow. Claude ids can never reach here (refused at the top).
+    if let Some(m) = model {
+        if openrouter_serves(&st.settings.llm_openrouter_model_map, &st.llm_pool.openrouter_url, m) {
+            return Ok(None); // caller will proxy to openrouter_url
+        }
+    }
     // UNKNOWN MODEL IDS ARE REFUSED, NEVER FORWARDED TO OPENROUTER.
     //
     // There used to be a catch-all here: "unknown explicit model -> OpenRouter".
@@ -370,7 +405,7 @@ fn resolve(
     // a real outage 503s honestly.
     if let Some(m) = model {
         return Err(ApiError::Unavailable(format!(
-            "unknown model {m:?} — not in LUMID_LLM_BACKENDS (unknown ids are never forwarded to OpenRouter)"
+            "unknown model {m:?} — not in LUMID_LLM_BACKENDS nor LUMID_LLM_OPENROUTER_MODEL_MAP (unrecognised ids are never forwarded to OpenRouter)"
         )));
     }
     Err(ApiError::Unavailable(
@@ -849,9 +884,27 @@ pub async fn list_models(
         )
         .await;
     }
+    // The OpenRouter leg is FILTERED to the configured map and relabelled to
+    // the local id, rather than merged verbatim.
+    //
+    // Merging it verbatim advertised OpenRouter's entire catalog -- measured
+    // 2026-08-23: 423 models, of which resolve() would actually serve ONE.
+    // Every other id 503'd as an unknown model, so /v1/models was a menu of
+    // things the gateway refuses to cook. A client must send the LOCAL id, so
+    // that is what the catalog lists; the upstream metadata (context length,
+    // pricing) is preserved by rewriting only the `id` field.
+    let or_base = st.llm_pool.openrouter_url.trim_end_matches('/').to_string();
+    let or_reverse: std::collections::HashMap<&str, &str> = st
+        .settings
+        .llm_openrouter_model_map
+        .iter()
+        .map(|(local, or)| (or.as_str(), local.as_str()))
+        .collect();
+
     let mut data: Vec<Value> = Vec::new();
     let mut seen = std::collections::HashSet::<String>::new();
     for base in &bases {
+        let is_or = !or_base.is_empty() && base.as_str() == or_base.as_str();
         let mut req = st.http.get(format!("{base}/v1/models"));
         if !st.settings.llm_api_key.is_empty() {
             req = req.header("Authorization", format!("Bearer {}", st.settings.llm_api_key));
@@ -872,9 +925,24 @@ pub async fn list_models(
         };
         if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
             for m in arr {
-                let id = m.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
-                if seen.insert(id) {
+                let raw_id = m.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                // On the OpenRouter leg: skip anything not explicitly mapped,
+                // and advertise the local id the client must actually send.
+                let id = if is_or {
+                    match or_reverse.get(raw_id) {
+                        Some(local) => (*local).to_string(),
+                        None => continue,
+                    }
+                } else {
+                    raw_id.to_string()
+                };
+                if seen.insert(id.clone()) {
                     let mut m = m.clone();
+                    if is_or {
+                        if let Some(obj) = m.as_object_mut() {
+                            obj.insert("id".into(), json!(id));
+                        }
+                    }
                     // Normalize across serving stacks: vLLM advertises
                     // `max_model_len`; llama.cpp reports the per-slot window
                     // as `meta.n_ctx` instead. Surface the same field for
@@ -1016,5 +1084,49 @@ mod hedge_tests {
     #[test]
     fn non_utf8_counts_as_data() {
         assert!(chunk_has_data_frame(&[0xff, 0xfe, 0x00]));
+    }
+}
+
+
+#[cfg(test)]
+mod openrouter_roster_tests {
+    use super::openrouter_serves;
+    use std::collections::HashMap;
+
+    fn map() -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("qwen/qwen3-coder".to_string(), "qwen/qwen3-coder".to_string());
+        m.insert("deepseek-v4-flash".to_string(), "deepseek/deepseek-v4-flash-0731".to_string());
+        m
+    }
+
+    // A configured model with no local backend is SERVED by OpenRouter. This is
+    // what lets a model be OpenRouter-only today and on-prem-first later with no
+    // code change -- adding it to LUMID_LLM_BACKENDS moves it to the local
+    // branch of resolve() and demotes OpenRouter to bounded overflow.
+    #[test]
+    fn configured_model_is_served_by_openrouter() {
+        assert!(openrouter_serves(&map(), "https://openrouter.ai/api", "qwen/qwen3-coder"));
+    }
+
+    // THE billing property. An id nobody configured must never reach a metered
+    // upstream -- llm-0d342a8 closed exactly this hole after an e2e test caught
+    // a nonexistent model being forwarded to real OpenRouter and billed, and
+    // 70fc036 reopened it by accident. The map, not "is it unknown", is the gate.
+    #[test]
+    fn unconfigured_model_is_never_served() {
+        for m in ["z-ai/glm-5.2", "qwen/qwen3-codr", "gpt-9", ""] {
+            assert!(
+                !openrouter_serves(&map(), "https://openrouter.ai/api", m),
+                "unconfigured id {m:?} must not be routed to OpenRouter"
+            );
+        }
+    }
+
+    // With OpenRouter switched off, even a mapped model is not served -- the
+    // request must fail honestly rather than silently find another route.
+    #[test]
+    fn no_openrouter_url_serves_nothing() {
+        assert!(!openrouter_serves(&map(), "", "qwen/qwen3-coder"));
     }
 }
