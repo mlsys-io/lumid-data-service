@@ -367,27 +367,54 @@ async fn scrape_queue_depth(http: &reqwest::Client, base: &str) -> Option<i32> {
     parse_num_requests_waiting(&body)
 }
 
-/// Parse the Prometheus exposition line for `vllm:num_requests_waiting`.
-/// Sums across engines/models so a multi-engine backend reports total pressure.
+/// Parse the backend's engine queue depth out of its Prometheus exposition.
+///
+/// Prefers `vllm:num_requests_waiting_by_reason{reason="capacity"}` and falls
+/// back to the aggregate `vllm:num_requests_waiting`.
+///
+/// The distinction is load-bearing at a low roof. The aggregate counts BOTH
+/// requests blocked on capacity and requests merely `deferred` by the scheduler
+/// -- and this backend runs `--enable-chunked-prefill` with
+/// `--long-prefill-token-threshold 1024`, which defers long prefills BY DESIGN.
+/// So a single large-context turn can show waiting=1..2 with no congestion at
+/// all. Gating on the aggregate would then spill paying traffic to the metered
+/// OpenRouter path for a scheduling artifact rather than for real contention.
+/// "Capacity" is what the roof is actually meant to mean: someone is blocked
+/// because the engine is full.
+///
+/// Both forms are summed across engines/models so a multi-engine backend
+/// reports total pressure. The fallback keeps older vLLM builds (which do not
+/// export the by_reason breakdown) working exactly as before.
 fn parse_num_requests_waiting(body: &str) -> Option<i32> {
-    let mut total: f64 = 0.0;
-    let mut seen = false;
+    let mut capacity: f64 = 0.0;
+    let mut capacity_seen = false;
+    let mut aggregate: f64 = 0.0;
+    let mut aggregate_seen = false;
+
     for line in body.lines() {
         let line = line.trim();
         if line.starts_with('#') || !line.starts_with("vllm:num_requests_waiting") {
             continue;
         }
-        // Skip the _by_reason breakdown: it double-counts the same requests.
+        let Some(v) = line.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok()) else {
+            continue;
+        };
         if line.starts_with("vllm:num_requests_waiting_by_reason") {
+            // Only the capacity reason counts as congestion.
+            if line.contains(r#"reason="capacity""#) {
+                capacity += v;
+                capacity_seen = true;
+            }
             continue;
         }
-        if let Some(v) = line.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok()) {
-            total += v;
-            seen = true;
-        }
+        aggregate += v;
+        aggregate_seen = true;
     }
-    if seen {
-        Some(total.round() as i32)
+
+    if capacity_seen {
+        Some(capacity.round() as i32)
+    } else if aggregate_seen {
+        Some(aggregate.round() as i32)
     } else {
         None
     }
@@ -406,9 +433,15 @@ vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4-flash",re
 "#;
 
     #[test]
-    fn parses_waiting_and_ignores_by_reason() {
-        // 5, not 10: the _by_reason lines break down the SAME requests.
-        assert_eq!(parse_num_requests_waiting(SAMPLE), Some(5));
+    fn prefers_capacity_over_the_aggregate() {
+        // CONTRACT CHANGE (2026-08-23). This used to assert Some(5) -- the
+        // aggregate -- on the reasoning that the _by_reason lines merely break
+        // down the same requests. True, but the breakdown is the point: of
+        // those 5, only 3 are blocked on capacity and 2 are `deferred` by
+        // chunked prefill, which is normal scheduling and not congestion.
+        // Gating on 5 would spill paying traffic to metered OpenRouter for a
+        // scheduling artifact. Never 10: the two forms are not added together.
+        assert_eq!(parse_num_requests_waiting(SAMPLE), Some(3));
     }
 
     #[test]
@@ -530,5 +563,68 @@ mod catchall_tests {
     fn unnamed_request_uses_primary() {
         let p = pool(&["deepseek-v4-flash"], true, "https://openrouter.ai/api");
         assert_eq!(p.backends_for(None).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod queue_reason_tests {
+    use super::*;
+
+    // The real shape emitted by the GB10 backend (captured 2026-08-23).
+    const DEFERRED_ONLY: &str = r#"
+vllm:num_requests_running{engine="0",model_name="deepseek-v4-flash"} 3.0
+vllm:num_requests_waiting{engine="0",model_name="deepseek-v4-flash"} 2.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4-flash",reason="capacity"} 0.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4-flash",reason="deferred"} 2.0
+"#;
+
+    const REAL_CONGESTION: &str = r#"
+vllm:num_requests_running{engine="0",model_name="deepseek-v4-flash"} 16.0
+vllm:num_requests_waiting{engine="0",model_name="deepseek-v4-flash"} 5.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4-flash",reason="capacity"} 3.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4-flash",reason="deferred"} 2.0
+"#;
+
+    // Chunked prefill DEFERS long prefills by design. Those must not count as
+    // congestion: at roof=2 the aggregate (2.0) would spill paying traffic to
+    // the metered OpenRouter path while the engine is not full at all.
+    #[test]
+    fn deferred_requests_are_not_congestion() {
+        assert_eq!(parse_num_requests_waiting(DEFERRED_ONLY), Some(0));
+    }
+
+    // Genuine capacity blocking is reported, and the deferred requests riding
+    // alongside it are excluded rather than inflating the depth.
+    #[test]
+    fn capacity_blocked_requests_are_congestion() {
+        assert_eq!(parse_num_requests_waiting(REAL_CONGESTION), Some(3));
+    }
+
+    // Older vLLM builds export no by_reason breakdown — fall back to the
+    // aggregate so they behave exactly as before.
+    #[test]
+    fn falls_back_to_aggregate_without_by_reason() {
+        let legacy = r#"
+vllm:num_requests_running{engine="0"} 4.0
+vllm:num_requests_waiting{engine="0"} 7.0
+"#;
+        assert_eq!(parse_num_requests_waiting(legacy), Some(7));
+    }
+
+    // Multi-engine backends sum.
+    #[test]
+    fn sums_across_engines() {
+        let multi = r#"
+vllm:num_requests_waiting_by_reason{engine="0",reason="capacity"} 2.0
+vllm:num_requests_waiting_by_reason{engine="1",reason="capacity"} 3.0
+vllm:num_requests_waiting_by_reason{engine="0",reason="deferred"} 9.0
+"#;
+        assert_eq!(parse_num_requests_waiting(multi), Some(5));
+    }
+
+    // No metrics at all -> unknown, which never gates (queue_depth stays -1).
+    #[test]
+    fn absent_metric_is_unknown() {
+        assert_eq!(parse_num_requests_waiting("# nothing here\n"), None);
     }
 }
