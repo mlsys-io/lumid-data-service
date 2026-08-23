@@ -328,8 +328,19 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     tracing::info!("mcp: {} tools (POST /mcp)", mcp_registry.len());
     let mut ext_router = parts.ext_routes.merge(mcp::build_router(mcp_registry));
     if parts.enable_llm {
-        ext_router = ext_router.merge(crate::llm::routes());
-        tracing::info!("llm proxy enabled (/v1/*)");
+        // A large-context turn exceeds axum's 2 MiB default and comes back 413
+        // ("Failed to buffer the request body: length limit exceeded"). Measured
+        // on this path: p99 2.08 MB and max 2.16 MB, so the default was
+        // rejecting the top ~1% of real requests outright. Same treatment the
+        // sync plane already gets below.
+        ext_router = ext_router.merge(
+            crate::llm::routes()
+                .layer(axum::extract::DefaultBodyLimit::max(state.settings.llm_max_body_bytes as usize)),
+        );
+        tracing::info!(
+            "llm proxy enabled (/v1/*), max body {} MiB",
+            state.settings.llm_max_body_bytes / (1024 * 1024)
+        );
     }
     if parts.enable_agent {
         ext_router = ext_router.merge(crate::agent::routes());

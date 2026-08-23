@@ -200,6 +200,22 @@ pub struct Settings {
     /// Must be well above a normal cold prefill (~75s at the ~124k mean context,
     /// ~1.65k tok/s) so healthy turns are never hedged. Measured tail: 150-180s.
     pub llm_hedge_after_s: u64,
+
+    /// Max request body accepted on the LLM proxy routes (`LLM_MAX_BODY_BYTES`).
+    ///
+    /// axum's DefaultBodyLimit is 2 MiB and the LLM routes were never given an
+    /// override, so large-context Claude Code turns were rejected with HTTP 413
+    /// ("Failed to buffer the request body: length limit exceeded") — a hard
+    /// user-facing failure, not a stall. Measured request sizes on this path:
+    /// p50 622 KB, p90 1.58 MB, p99 2.08 MB, max 2.16 MB, i.e. the 2 MiB
+    /// default was cutting off the top ~1% of real traffic.
+    ///
+    /// Sized at 8 MiB: ~4x the observed maximum, while staying bounded. The
+    /// body is buffered AND parsed into a serde_json::Value, which costs
+    /// several times the raw size, so this multiplies against
+    /// LUMID_LLM_BACKEND_MAX_CONCURRENCY — do not raise it without raising the
+    /// pod memory limit to match.
+    pub llm_max_body_bytes: u64,
     /// Catch-all backend URL for any explicitly-specified model that isn't the
     /// primary and isn't in `llm_backends`. When set (e.g. `https://openrouter.ai/api`),
     /// unknown model IDs are forwarded there rather than rejected or sent to local.
@@ -389,6 +405,7 @@ impl Settings {
             llm_backend_max_concurrency: env_u32("LLM_BACKEND_MAX_CONCURRENCY", 16),
             llm_backend_queue_roof: env_u32("LLM_BACKEND_QUEUE_ROOF", 1),
             llm_hedge_after_s: env_u32("LLM_HEDGE_AFTER_S", 0) as u64,
+            llm_max_body_bytes: env_u32("LLM_MAX_BODY_BYTES", 8 * 1024 * 1024) as u64,
             llm_openrouter_url: env_str("LLM_OPENROUTER_URL", "")
                 .trim_end_matches('/')
                 .to_string(),
@@ -496,5 +513,38 @@ mod tests {
     #[test]
     fn parse_peers_empty_input() {
         assert!(parse_peers("", &|_| None).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod llm_body_limit_tests {
+    use super::*;
+
+    // The LLM proxy must accept more than axum's 2 MiB default. Large-context
+    // Claude Code turns measured p99 2.08 MB / max 2.16 MB on this path and were
+    // being rejected with HTTP 413.
+    #[test]
+    fn default_llm_body_limit_clears_observed_traffic() {
+        const AXUM_DEFAULT: u64 = 2 * 1024 * 1024;
+        const OBSERVED_MAX: u64 = 2_156_555;
+        let s = Settings::from_env();
+        assert!(
+            s.llm_max_body_bytes > AXUM_DEFAULT,
+            "must exceed axum's 2 MiB default, got {}",
+            s.llm_max_body_bytes
+        );
+        assert!(
+            s.llm_max_body_bytes > OBSERVED_MAX * 2,
+            "want real headroom over the observed max {OBSERVED_MAX}, got {}",
+            s.llm_max_body_bytes
+        );
+        // Bounded: the body is parsed into a serde_json::Value (several times the
+        // raw size) and multiplies by backend concurrency, so an unbounded value
+        // trades a 413 for an OOM.
+        assert!(
+            s.llm_max_body_bytes <= 32 * 1024 * 1024,
+            "limit is unbounded enough to risk OOM: {}",
+            s.llm_max_body_bytes
+        );
     }
 }
