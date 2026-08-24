@@ -316,9 +316,11 @@ impl BackendPool {
                         // must not gate. `at_roof()` consults `at_queue_roof()` FIRST and is
                         // deliberately orthogonal to health, so a value frozen at >= roof
                         // would spill every request to OpenRouter for as long as the circuit
-                        // stayed open -- and because nothing is then sent locally, nothing
-                        // calls `on_connect_ok()` to close it. Self-sustaining. Clear to -1
-                        // ("unknown, never gate") and let health be the only gate here.
+                        // stayed open. Clear to -1 ("unknown, never gate") and let health
+                        // decide, which `resolve()` now does explicitly. NOTE: the circuit
+                        // does NOT depend on routed traffic to close -- `start_health_prober`
+                        // probes every unhealthy backend on its own interval and calls
+                        // `on_connect_ok()`, so recovery is automatic.
                         h.set_queue_depth(-1);
                         continue;
                     }
@@ -530,8 +532,8 @@ mod queue_roof_edge_tests {
 
     // A stale queue depth must never outlive the scrape that produced it. When the
     // circuit opens the scraper stops sampling, and a depth frozen at >= roof would
-    // keep `at_queue_roof()` true forever -- while nothing is routed locally, so
-    // nothing calls on_connect_ok() to close the circuit. Self-sustaining spill.
+    // keep `at_queue_roof()` true even after the health prober has closed the
+    // circuit and the engine has drained.
     #[test]
     fn cleared_depth_releases_the_queue_gate() {
         let h = BackendHandle::new("http://x".into(), 8, 3);

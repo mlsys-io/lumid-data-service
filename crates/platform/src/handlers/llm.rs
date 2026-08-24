@@ -353,12 +353,26 @@ fn resolve(
         // trade: the on-prem roof is the guardrail, OpenRouter absorbs the peak.
         let all_at_roof = st.settings.llm_backend_max_concurrency > 0
             && backends.iter().all(|h| h.at_roof());
-        if all_at_roof && !st.llm_pool.openrouter_url.is_empty() {
+        // Health must be an EXPLICIT spill trigger. It never was: an outage only
+        // reached OpenRouter by accident, because a backend that died under load
+        // left a last-scraped queue depth >= roof and `at_roof()` stayed true off
+        // that stale value. Now that the scraper clears a skipped (unhealthy)
+        // backend's depth to -1, the accident is gone -- and without this arm a
+        // circuit-open GB10 resolves to itself (`backends_for` sorts unhealthy
+        // last but never drops it, and nothing else here filters on health), so
+        // every request would fail `all LLM backends unavailable` with OpenRouter
+        // sitting configured and able to serve.
+        let all_down = backends.iter().all(|h| !h.is_healthy());
+        if (all_at_roof || all_down) && !st.llm_pool.openrouter_url.is_empty() {
+            // Name the ACTUAL reason. "at concurrency roof" was printed for every
+            // spill; a saturated pool and a dead pool are different incidents with
+            // different remedies, and the operator reads this line first.
+            let why = if all_down { "circuit-open (unhealthy)" } else { "at concurrency roof" };
             tracing::warn!(
-                "llm resolve: model={:?} all {} local backends at concurrency \
-                 roof — overflowing to OpenRouter",
+                "llm resolve: model={:?} all {} local backends {} — overflowing to OpenRouter",
                 model,
-                backends.len()
+                backends.len(),
+                why
             );
             return Ok(None); // caller will proxy to openrouter_url
         }
@@ -640,7 +654,15 @@ async fn proxy_stream(
             ka.tick().await;
             let mut upstream = Box::pin(upstream.bytes_stream());
 
+            // `hx_tx` is an Option so the parent can MOVE it into the hedge task
+            // rather than clone it. Cloning left a live sender owned by this task
+            // forever, which made `hx_rx.recv()` in the drain arm below never
+            // return None (and `hx_rx.is_closed()` permanently false): the drain
+            // hung for good, holding `_guard` and leaking an in-flight slot on
+            // every hedged turn. That is the fast leak -- one per hedge, and under
+            // saturation OpenRouter wins essentially every hedge.
             let (hx_tx, mut hx_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+            let mut hx_tx = Some(hx_tx);
             let mut hedge_started = false;
             let mut winner: Option<StreamSide> = None;
             let hedge_at = tokio::time::sleep(Duration::from_secs(hedge_after.max(1)));
@@ -689,13 +711,17 @@ async fn proxy_stream(
                             break;
                         }
                     }
-                    _ = &mut hedge_at, if !hedge_started && winner.is_none() => {
+                    // `hedge_plan.is_some()` is part of the GUARD, not just the body.
+                    // Without it the timer still armed (`hedge_after.max(1)`, so 1s
+                    // even when hedging is disabled) and set `hedge_started` with no
+                    // hedge task ever spawned -- arming the drain arm below for a
+                    // hedge that could never answer.
+                    _ = &mut hedge_at, if !hedge_started && winner.is_none() && hedge_plan.is_some() => {
                         hedge_started = true;
-                        if let Some((url, key, body, http)) = hedge_plan.clone() {
+                        if let (Some(hx_tx), Some((url, key, body, http))) = (hx_tx.take(), hedge_plan.clone()) {
                             tracing::warn!(
                                 "llm stream {path_owned}: no data from local backend in {hedge_after}s — hedging to OpenRouter"
                             );
-                            let hx_tx = hx_tx.clone();
                             tokio::spawn(async move {
                                 let req = http.post(&url).bearer_auth(&key).json(&body);
                                 match req.send().await {
