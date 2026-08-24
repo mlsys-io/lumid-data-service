@@ -302,6 +302,21 @@ async fn proxy_stream_peer(
     sse_response(Body::from_stream(body_stream))
 }
 
+/// A short, non-PII-ish label for the caller, for cost attribution in logs.
+///
+/// Email when we have it (that is what an operator recognises), else the sub,
+/// else "anon". Deliberately not the whole Identity: this lands on every
+/// metered request, and a log line is not an audit record.
+fn caller_label(ident: &Option<Extension<Identity>>) -> String {
+    match ident {
+        Some(Extension(i)) => i
+            .email
+            .clone()
+            .unwrap_or_else(|| if i.sub.is_empty() { "anon".into() } else { i.sub.clone() }),
+        None => "anon".into(),
+    }
+}
+
 // ───────────────────────────────── local backend pool — non-streaming (retry)
 
 /// Resolve backends for `model`. Returns `Err` (503) when pool is empty and
@@ -325,6 +340,7 @@ fn openrouter_serves(
 fn resolve(
     st: &AppState,
     model: Option<&str>,
+    caller: &str,
 ) -> Result<Option<Vec<std::sync::Arc<crate::llm_pool::BackendHandle>>>, ApiError> {
     // CLAUDE NEVER GOES TO OPENROUTER. Claude models (claude-sonnet-*, claude-haiku-*,
     // claude-opus-*, claude-fable-*) are proprietary pooled-account models served by
@@ -395,6 +411,24 @@ fn resolve(
     // bounded overflow. Claude ids can never reach here (refused at the top).
     if let Some(m) = model {
         if openrouter_serves(&st.settings.llm_openrouter_model_map, &st.llm_pool.openrouter_url, m) {
+            // THIS BRANCH SPENDS MONEY AND USED TO SAY NOTHING.
+            //
+            // Only the roof-overflow branch above warned, so the logs described
+            // the path that was NOT billing and stayed silent on the one that
+            // was. On 2026-08-24 that cost an hour of archaeology: OpenRouter
+            // spend continued at $0.20-0.43/hr through windows with zero
+            // overflow and zero hedges, and nothing in this service could say
+            // which model or whose request it was. The answer had to be
+            // reconstructed from the edge nginx access log.
+            //
+            // INFO, not WARN: being served by OpenRouter is the CONFIGURED
+            // behaviour for a mapped id with no local backend, not a fault.
+            // Volume is bounded by real traffic (~200/h when this was written),
+            // which is two orders of magnitude under the old RUST_LOG=debug.
+            tracing::info!(
+                "llm resolve: model={m} served BY OpenRouter (mapped, no local backend) \
+                 — metered, caller={caller}"
+            );
             return Ok(None); // caller will proxy to openrouter_url
         }
     }
@@ -835,7 +869,7 @@ async fn dispatch_json(
         Ok(Some(peer)) => {
             proxy_json_peer(st, &peer, method, path, Some(body), &origin_of(ident)).await
         }
-        Ok(None) => match resolve(st, model_of(body).as_deref()) {
+        Ok(None) => match resolve(st, model_of(body).as_deref(), &caller_label(&ident)) {
             Err(e) => e.into_response(),
             Ok(None) => {
                 let body = rewrite_model_for_openrouter(st, body);
@@ -857,7 +891,7 @@ async fn dispatch_stream(
     match federation_peer(st) {
         Err(e) => e.into_response(),
         Ok(Some(peer)) => proxy_stream_peer(st, &peer, path, body, &origin_of(ident)).await,
-        Ok(None) => match resolve(st, model_of(body).as_deref()) {
+        Ok(None) => match resolve(st, model_of(body).as_deref(), &caller_label(&ident)) {
             Err(e) => e.into_response(),
             Ok(None) => {
                 let body = rewrite_model_for_openrouter(st, body);
