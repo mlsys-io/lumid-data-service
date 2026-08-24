@@ -714,6 +714,21 @@ async fn proxy_stream(
                         }
                     }
                     _ = ka.tick() => {
+                        // LIVENESS MUST BE PROBED ON EVERY TICK.
+                        //
+                        // This check used to live inside `winner.is_none()`. Once a data
+                        // frame arrived (`winner = Some(Local)`) the send was skipped, so
+                        // `tx.send(..).is_err()` -- the ONLY way this loop notices a
+                        // disconnected client on a quiet stream -- stopped being evaluated.
+                        // A local upstream that stalled after its first frame then left
+                        // this task alive forever holding the InFlightGuard, pinning
+                        // `inflight`. Six leaked slots reached `max_concurrency` and every
+                        // later request overflowed to metered OpenRouter while the GB10 sat
+                        // idle -- ~$40/day, and it never self-healed without a restart
+                        // (2026-08-24). Chatbox children reaped mid-turn are the source.
+                        if tx.is_closed() {
+                            break;
+                        }
                         if winner.is_none() && tx.send(Bytes::from_static(KEEPALIVE_FRAME)).is_err() {
                             break;
                         }

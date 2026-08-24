@@ -312,6 +312,14 @@ impl BackendPool {
                 tick.tick().await;
                 for h in &self.all {
                     if !h.is_healthy() {
+                        // We are not scraping this backend, so its last depth is STALE and
+                        // must not gate. `at_roof()` consults `at_queue_roof()` FIRST and is
+                        // deliberately orthogonal to health, so a value frozen at >= roof
+                        // would spill every request to OpenRouter for as long as the circuit
+                        // stayed open -- and because nothing is then sent locally, nothing
+                        // calls `on_connect_ok()` to close it. Self-sustaining. Clear to -1
+                        // ("unknown, never gate") and let health be the only gate here.
+                        h.set_queue_depth(-1);
                         continue;
                     }
                     let prev = h.queue_depth();
@@ -499,6 +507,39 @@ mod queue_roof_edge_tests {
                 "queue depth {depth} with roof 4 should saturate={want}"
             );
         }
+    }
+
+    // An InFlightGuard MUST decrement on drop. This is the counter that, when
+    // leaked, pins `at_roof()` true forever and sends every request to metered
+    // OpenRouter while the local GPU is idle (2026-08-24, ~$40/day). The leak was
+    // not here -- the guard is correct -- but in the stream task that HOLDS it;
+    // this pins the invariant the fix depends on.
+    #[test]
+    fn inflight_guard_releases_on_drop() {
+        let h = std::sync::Arc::new(BackendHandle::new("http://x".into(), 2, 0));
+        assert_eq!(h.inflight(), 0);
+        {
+            let _a = h.acquire();
+            let _b = h.acquire();
+            assert_eq!(h.inflight(), 2);
+            assert!(h.at_roof(), "two in-flight against max_concurrency 2 is the roof");
+        }
+        assert_eq!(h.inflight(), 0, "guards must decrement on drop");
+        assert!(!h.at_roof(), "a drained backend must leave the roof");
+    }
+
+    // A stale queue depth must never outlive the scrape that produced it. When the
+    // circuit opens the scraper stops sampling, and a depth frozen at >= roof would
+    // keep `at_queue_roof()` true forever -- while nothing is routed locally, so
+    // nothing calls on_connect_ok() to close the circuit. Self-sustaining spill.
+    #[test]
+    fn cleared_depth_releases_the_queue_gate() {
+        let h = BackendHandle::new("http://x".into(), 8, 3);
+        h.set_queue_depth(5);
+        assert!(h.at_queue_roof(), "depth 5 against roof 3 saturates");
+        h.set_queue_depth(-1); // what the scraper now does for an unhealthy backend
+        assert!(!h.at_queue_roof(), "unknown depth must not gate");
+        assert!(!h.at_roof(), "with inflight 0 and depth unknown, not at roof");
     }
 
     // roof=0 disables the queue signal entirely; only in-flight applies.
