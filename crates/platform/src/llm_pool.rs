@@ -43,16 +43,28 @@ pub struct BackendHandle {
     /// Queue roof: treat the backend as full once `queue_depth` reaches this.
     /// 0 disables. See `Settings::llm_backend_queue_roof` for why this exists.
     queue_roof: u32,
+    /// Routing tier. LOWER is preferred: a tier-1 backend receives traffic only
+    /// once every tier-0 backend is at its roof (or unhealthy). Parsed from an
+    /// optional `#tier=N` suffix on the backend URL; absent => 0, so every
+    /// existing single-tier roster behaves exactly as before.
+    ///
+    /// This exists because the roof is a single GLOBAL value while backends are
+    /// NOT interchangeable. Sorting by in-flight alone sends the SECOND
+    /// concurrent request to whichever backend happens to be idle — which for a
+    /// GPU+CPU roster means a 3.7x slower box while the GPU sits at 1/32.
+    /// Tier makes "spill", not "balance", the semantics.
+    pub tier: u32,
 }
 
 impl BackendHandle {
-    fn new(url: String, max_concurrency: u32, queue_roof: u32) -> Self {
+    fn new(url: String, max_concurrency: u32, queue_roof: u32, tier: u32) -> Self {
         Self {
             url,
             inflight: AtomicI32::new(0),
             healthy: AtomicBool::new(true),
             failures: AtomicU32::new(0),
             max_concurrency,
+            tier,
             // -1 = not yet observed. Until metrics are actually read, the queue
             // roof must never gate a backend: an unreachable /metrics endpoint
             // (non-vLLM backend, scrape blocked) would otherwise silently push
@@ -152,6 +164,22 @@ impl Drop for InFlightGuard {
 
 // ──────────────────────────────────────────── BackendPool
 
+/// Split an optional `#tier=N` suffix off a backend URL.
+///
+/// The suffix is ROUTING metadata and must never be dialed — a URL fragment is
+/// not sent on the wire by most clients, but relying on that would leave the
+/// fragment in `h.url`, which is what health probes, `/metrics` scrapes and
+/// every log line use. So it is stripped here, once, at parse time.
+///
+/// Anything unparseable degrades to tier 0 rather than erroring: a typo must
+/// not take a backend out of the roster, it should just lose its promotion.
+fn split_tier(url: &str) -> (&str, u32) {
+    match url.split_once("#tier=") {
+        Some((base, t)) => (base, t.trim().parse::<u32>().unwrap_or(0)),
+        None => (url, 0),
+    }
+}
+
 pub struct BackendPool {
     /// Model name → ordered backend list (config order; routing sorts at call time).
     pub by_model: HashMap<String, Vec<Arc<BackendHandle>>>,
@@ -171,10 +199,11 @@ impl BackendPool {
         let max_concurrency = s.llm_backend_max_concurrency;
         let queue_roof = s.llm_backend_queue_roof;
         let mut intern = |url: &str| -> Arc<BackendHandle> {
-            let key = url.trim_end_matches('/').to_string();
+            let (base, tier) = split_tier(url);
+            let key = base.trim_end_matches('/').to_string();
             seen.entry(key.clone())
                 .or_insert_with(|| {
-                    let h = Arc::new(BackendHandle::new(key, max_concurrency, queue_roof));
+                    let h = Arc::new(BackendHandle::new(key, max_concurrency, queue_roof, tier));
                     all.push(h.clone());
                     h
                 })
@@ -241,12 +270,16 @@ impl BackendPool {
 
         let mut sorted: Vec<Arc<BackendHandle>> = handles.iter().cloned().collect();
         sorted.sort_by_key(|h| {
-            // Sort order: healthy < unhealthy; within each, not-at-roof < at-roof;
-            // within each tier, fewer in-flight first. A saturated backend is tried
+            // Sort order: healthy < unhealthy; then not-at-roof < at-roof; then
+            // LOWER tier first; then fewer in-flight. A saturated backend is tried
             // last (still a retry candidate), never silently dropped.
-            let health = if h.is_healthy() { 0i32 } else { 1_000_000 };
-            let roof = if h.at_roof() { 100_000 } else { 0 };
-            health + roof + h.inflight()
+            //
+            // A tuple, not the previous weighted sum (`health + roof + inflight`).
+            // That encoding assumed in-flight stays far below its 100_000 bucket —
+            // an assumption this service has already violated once, in the in-flight
+            // SLOT LEAK fixed by c1900a6. Tuple ordering cannot be corrupted by a
+            // runaway counter, and it makes the tier rung explicit.
+            (!h.is_healthy(), h.at_roof(), h.tier, h.inflight())
         });
         sorted
     }
@@ -465,7 +498,7 @@ vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4-flash",re
 
     #[test]
     fn unknown_depth_never_saturates() {
-        let h = BackendHandle::new("http://x".into(), 8, 1);
+        let h = BackendHandle::new("http://x".into(), 8, 1, 0);
         assert_eq!(h.queue_depth(), -1);
         assert!(!h.at_queue_roof(), "unknown depth must not gate");
         assert!(!h.at_roof(), "unknown depth must not saturate the backend");
@@ -475,7 +508,7 @@ vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4-flash",re
     fn queue_roof_saturates_even_with_idle_inflight() {
         // The whole point: zero in-flight HERE, but the engine is queued because
         // other clients share the GPU.
-        let h = BackendHandle::new("http://x".into(), 8, 1);
+        let h = BackendHandle::new("http://x".into(), 8, 1, 0);
         h.set_queue_depth(5);
         assert_eq!(h.inflight(), 0);
         assert!(h.at_roof(), "engine queue must saturate regardless of inflight");
@@ -483,7 +516,7 @@ vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4-flash",re
 
     #[test]
     fn queue_roof_zero_disables() {
-        let h = BackendHandle::new("http://x".into(), 8, 0);
+        let h = BackendHandle::new("http://x".into(), 8, 0, 0);
         h.set_queue_depth(99);
         assert!(!h.at_queue_roof());
         assert!(!h.at_roof());
@@ -500,7 +533,7 @@ mod queue_roof_edge_tests {
     // of which spilled anything, because at_queue_roof gates on q >= queue_roof.
     #[test]
     fn saturation_edge_follows_the_roof() {
-        let h = BackendHandle::new("http://x".into(), 8, 4);
+        let h = BackendHandle::new("http://x".into(), 8, 4, 0);
         for (depth, want) in [(0, false), (1, false), (3, false), (4, true), (9, true)] {
             h.set_queue_depth(depth);
             assert_eq!(
@@ -518,7 +551,7 @@ mod queue_roof_edge_tests {
     // this pins the invariant the fix depends on.
     #[test]
     fn inflight_guard_releases_on_drop() {
-        let h = std::sync::Arc::new(BackendHandle::new("http://x".into(), 2, 0));
+        let h = std::sync::Arc::new(BackendHandle::new("http://x".into(), 2, 0, 0));
         assert_eq!(h.inflight(), 0);
         {
             let _a = h.acquire();
@@ -536,7 +569,7 @@ mod queue_roof_edge_tests {
     // circuit and the engine has drained.
     #[test]
     fn cleared_depth_releases_the_queue_gate() {
-        let h = BackendHandle::new("http://x".into(), 8, 3);
+        let h = BackendHandle::new("http://x".into(), 8, 3, 0);
         h.set_queue_depth(5);
         assert!(h.at_queue_roof(), "depth 5 against roof 3 saturates");
         h.set_queue_depth(-1); // what the scraper now does for an unhealthy backend
@@ -547,10 +580,99 @@ mod queue_roof_edge_tests {
     // roof=0 disables the queue signal entirely; only in-flight applies.
     #[test]
     fn zero_roof_disables_queue_gate() {
-        let h = BackendHandle::new("http://x".into(), 8, 0);
+        let h = BackendHandle::new("http://x".into(), 8, 0, 0);
         h.set_queue_depth(50);
         assert!(!h.at_queue_roof(), "roof 0 must disable the queue gate");
         assert!(!h.at_roof(), "in-flight is 0, so the backend is not at roof");
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+
+    fn h(url: &str, roof: u32, tier: u32) -> Arc<BackendHandle> {
+        Arc::new(BackendHandle::new(url.into(), roof, 0, tier))
+    }
+    fn pool_of(hs: &[Arc<BackendHandle>]) -> BackendPool {
+        let mut by_model: HashMap<String, Vec<Arc<BackendHandle>>> = HashMap::new();
+        by_model.insert("m".to_string(), hs.to_vec());
+        BackendPool {
+            by_model,
+            primary: None,
+            all: hs.to_vec(),
+            openrouter_url: String::new(),
+        }
+    }
+
+    // The `#tier=` suffix must not survive into the dialed URL: health probes,
+    // /metrics scrapes and every log line read `h.url` directly.
+    #[test]
+    fn tier_suffix_is_parsed_and_stripped() {
+        assert_eq!(split_tier("http://s0:4001#tier=1"), ("http://s0:4001", 1));
+        assert_eq!(split_tier("http://gb10:8090"), ("http://gb10:8090", 0));
+        // A typo must cost the promotion, never the backend.
+        assert_eq!(split_tier("http://x:1#tier=abc"), ("http://x:1", 0));
+    }
+
+    // THE POINT OF THE FEATURE. Sorting on in-flight alone sends the SECOND
+    // concurrent request to whichever backend is idle -- for a GPU+CPU roster
+    // that is a 3.7x slower box while the GPU sits at 1/32.
+    #[test]
+    fn lower_tier_wins_even_when_busier() {
+        let gpu = h("http://gb10:8090", 16, 0);
+        let cpu = h("http://s0:4001", 16, 1);
+        let p = pool_of(&[gpu.clone(), cpu.clone()]);
+        let _g = gpu.acquire(); // gpu: 1 in-flight, cpu: 0
+        assert_eq!(
+            p.backends_for(Some("m"))[0].url,
+            gpu.url,
+            "tier-0 must keep traffic while it still has room"
+        );
+    }
+
+    // ...but a saturated tier-0 MUST yield, or the ladder never spills.
+    #[test]
+    fn tier_zero_at_roof_yields_to_tier_one() {
+        let gpu = h("http://gb10:8090", 1, 0);
+        let cpu = h("http://s0:4001", 16, 1);
+        let p = pool_of(&[gpu.clone(), cpu.clone()]);
+        let _g = gpu.acquire();
+        assert!(gpu.at_roof(), "precondition: gpu is at its roof");
+        assert_eq!(
+            p.backends_for(Some("m"))[0].url,
+            cpu.url,
+            "a tier-0 at its roof must spill to tier-1"
+        );
+    }
+
+    // Health still outranks tier -- an open circuit yields regardless.
+    #[test]
+    fn unhealthy_tier_zero_yields() {
+        let gpu = h("http://gb10:8090", 16, 0);
+        let cpu = h("http://s0:4001", 16, 1);
+        for _ in 0..CIRCUIT_OPEN_AFTER {
+            gpu.on_connect_err();
+        }
+        assert!(!gpu.is_healthy());
+        let p = pool_of(&[gpu.clone(), cpu.clone()]);
+        assert_eq!(p.backends_for(Some("m"))[0].url, cpu.url);
+    }
+
+    // No `#tier=` anywhere => all tier 0 => the previous pure least-in-flight
+    // behaviour is preserved for every existing roster (e.g. qwen-image, which
+    // depends on it).
+    #[test]
+    fn absent_tier_preserves_least_inflight() {
+        let a = h("http://a", 16, 0);
+        let b = h("http://b", 16, 0);
+        let p = pool_of(&[a.clone(), b.clone()]);
+        let _g = a.acquire();
+        assert_eq!(
+            p.backends_for(Some("m"))[0].url,
+            b.url,
+            "equal tiers must fall back to least-in-flight"
+        );
     }
 }
 
@@ -560,7 +682,7 @@ mod catchall_tests {
 
     /// Build a pool the way from_settings would, without needing a Settings.
     fn pool(known: &[&str], with_primary: bool, openrouter: &str) -> BackendPool {
-        let h = Arc::new(BackendHandle::new("http://gb10:8090".into(), 8, 4));
+        let h = Arc::new(BackendHandle::new("http://gb10:8090".into(), 8, 4, 0));
         let mut by_model: HashMap<String, Vec<Arc<BackendHandle>>> = HashMap::new();
         for m in known {
             by_model.insert((*m).to_string(), vec![h.clone()]);
