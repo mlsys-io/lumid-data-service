@@ -532,6 +532,36 @@ async fn proxy_json(
         };
     }
 
+    // EXHAUSTED: every local backend failed at connect. Spill to OpenRouter
+    // rather than returning the stored error.
+    //
+    // resolve() already routes here when `all_down`, but that is BREAKER-GATED:
+    // a backend is only "down" after CIRCUIT_OPEN_AFTER (3) consecutive
+    // failures, and on a SUDDEN total outage the handles are still flagged
+    // healthy. So the first ~3 requests of a hard outage ran this loop, failed
+    // every backend, and returned 502 while a healthy paid offload sat unused —
+    // the exact defect llm-68bf556 set out to remove, surviving in the window
+    // before the breakers latch. Measured 2026-08-26 when the relay died:
+    // `upstream LLM unreachable` instead of a spill.
+    //
+    // Gated on openrouter_serves(), NOT merely on the URL being set, so the
+    // allowlist property holds: a typo or an id we do not carry is still
+    // refused with our own error and never forwarded to a metered upstream.
+    if let Some(m) = body.and_then(model_of) {
+        if openrouter_serves(
+            &st.settings.llm_openrouter_model_map,
+            &st.llm_pool.openrouter_url,
+            &m,
+        ) {
+            tracing::warn!(
+                "llm {method} {path}: all {} local backends failed at connect — spilling to OpenRouter (model={m})",
+                backends.len()
+            );
+            let rewritten = body.map(|b| rewrite_model_for_openrouter(st, b));
+            return proxy_json_openrouter(st, method, path, rewritten.as_ref()).await;
+        }
+    }
+
     last_err.unwrap_or_else(|| {
         (
             StatusCode::BAD_GATEWAY,
@@ -803,7 +833,23 @@ async fn proxy_stream(
         return sse_response(Body::from_stream(stream));
     }
 
-    // All backends failed at connect.
+    // All backends failed at connect. Same breaker-gate gap as proxy_json: on a
+    // SUDDEN outage the handles are still flagged healthy, so resolve()'s
+    // `all_down` arm has not fired yet and we would otherwise emit a one-frame
+    // error stream while a healthy offload sits unused. Allowlist-gated, so an
+    // unknown id is still refused rather than billed.
+    if openrouter_serves(
+        &st.settings.llm_openrouter_model_map,
+        &st.llm_pool.openrouter_url,
+        &model_of(body).unwrap_or_default(),
+    ) {
+        tracing::warn!(
+            "llm stream {path}: all {} local backends failed at connect — spilling to OpenRouter",
+            backends.len()
+        );
+        let rewritten = rewrite_model_for_openrouter(st, body);
+        return proxy_stream_openrouter(st, path, &rewritten).await;
+    }
     let frame = format!("data: {}\n\n", json!({ "error": "all LLM backends unavailable" }));
     sse_response(Body::from(frame))
 }
