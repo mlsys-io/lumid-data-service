@@ -204,8 +204,38 @@ pub fn parse(text: &str) -> Result<Vec<EndpointSpec>, ApiError> {
     let root: Root = toml::from_str(text)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("parse read config: {e}")))?;
     let mut specs = root.read.endpoint;
-    for ep in &specs {
-        lint(ep)?;
+    // A spec that fails lint is DROPPED, not fatal. Failing the whole parse takes
+    // the entire read layer down — every endpoint 404s because one is malformed,
+    // which is far worse than the defect being linted for. (Learned the hard way:
+    // the self_tenant lint landed, one real spec tripped it, and `lqt-inspect`
+    // booted with `read layer disabled` and served nothing.)
+    //
+    // Dropping is also the SAFE outcome for the case this lint exists to catch: a
+    // `self_tenant` spec with no `:tenant` predicate would otherwise serve
+    // cross-tenant rows. Not registering it 404s the route instead of leaking.
+    //
+    // Every rejection is logged at ERROR with the spec id — a dropped endpoint
+    // must never be silent, or it looks identical to one that was never written.
+    let mut rejected: Vec<String> = Vec::new();
+    specs.retain(|ep| match lint(ep) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(
+                spec = %ep.id,
+                "read spec '{}' REJECTED at load and will NOT be served: {}",
+                ep.id, e
+            );
+            rejected.push(ep.id.clone());
+            false
+        }
+    });
+    if !rejected.is_empty() {
+        tracing::error!(
+            rejected_count = rejected.len(),
+            "{} read spec(s) rejected at load and NOT served: {}",
+            rejected.len(),
+            rejected.join(", ")
+        );
     }
     // Compile each spec's SQL to the backend-neutral query IR (`T-READ-IR-001`).
     // A spec whose SQL fits the bounded read-only SELECT grammar gets an IR and
@@ -350,19 +380,33 @@ mod self_tenant_lint_tests {
     }
 
     #[test]
-    fn rejects_self_tenant_whose_sql_ignores_the_bind() {
-        // The dangerous shape: looks scoped, reads every tenant. Must not load.
-        let err = parse(&toml_for(true, "SELECT 1 FROM core.x", true)).unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(msg.contains("ACROSS tenants"), "got: {msg}");
+    fn drops_self_tenant_whose_sql_ignores_the_bind() {
+        // The dangerous shape: looks scoped, reads every tenant. It must not be
+        // SERVED — but it must also not take the rest of the config down with it.
+        let specs = parse(&toml_for(true, "SELECT 1 FROM core.x", true)).expect("must not be fatal");
+        assert!(specs.is_empty(), "the offending spec must not be registered");
     }
 
     #[test]
-    fn rejects_self_tenant_with_no_tenant_param_declared() {
-        let err = parse(&toml_for(true, "SELECT 1 FROM core.x WHERE t::text = :tenant", false))
-            .unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(msg.contains("no `tenant` param"), "got: {msg}");
+    fn drops_self_tenant_with_no_tenant_param_declared() {
+        let specs = parse(&toml_for(true, "SELECT 1 FROM core.x WHERE t::text = :tenant", false))
+            .expect("must not be fatal");
+        assert!(specs.is_empty(), "the offending spec must not be registered");
+    }
+
+    #[test]
+    fn one_bad_spec_does_not_take_down_the_others() {
+        // The regression that broke lqt-inspect: a single tripping spec made
+        // parse() fail, disabling the ENTIRE read layer. Mirrors the real
+        // lqt.toml, where obs.runtime.funnel trips while the two inspect
+        // endpoints are fine.
+        let good = toml_for(true, "SELECT 1 FROM core.x WHERE t::text = :tenant", true);
+        let bad = "[[read.endpoint]]\nid = \"bad\"\nmethod = \"GET\"\npath = \"/bad\"\n\
+                   tables = [\"core.x\"]\nttl = \"5s\"\nshape = \"rows\"\n\
+                   self_tenant = true\nsql = \"\"\"\nSELECT 1 FROM core.x\n\"\"\"\n";
+        let specs = parse(&format!("{bad}{good}")).expect("must not be fatal");
+        let ids: Vec<&str> = specs.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["t"], "good spec survives, bad one is dropped");
     }
 
     #[test]
