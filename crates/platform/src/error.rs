@@ -28,6 +28,23 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// Full cause chain, for SERVER-SIDE LOGS only.
+    ///
+    /// `Display` on `Internal` is deliberately opaque — it renders "internal
+    /// error" so an HTTP response never leaks internals to a client. The cost is
+    /// that a log line written as `{e}` says exactly nothing, which is how
+    /// `read layer disabled: internal error` cost two production deploys and two
+    /// rollbacks to learn nothing from. Log sites should use this instead; it
+    /// renders the anyhow chain (`{:#}`) so the ROOT cause is named.
+    ///
+    /// Never put this in a response body.
+    pub fn log_detail(&self) -> String {
+        match self {
+            ApiError::Internal(e) => format!("{e:#}"),
+            other => other.to_string(),
+        }
+    }
+
     /// Shallow clone for cache single-flight (`moka::try_get_with` hands back
     /// `Arc<ApiError>`; the caller needs an owned `ApiError` to return). The
     /// `Internal` source chain isn't `Clone`, so it's flattened to its message.
