@@ -220,7 +220,13 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
             s
         }
         Err(e) => {
-            tracing::warn!("read layer disabled: {e}");
+            // A disabled read layer means every declarative endpoint 404s —
+            // that is an outage, not a warning, and the message must name the
+            // cause (see `ApiError::log_detail`).
+            tracing::error!(
+                "read layer DISABLED (all declarative endpoints will 404): {}",
+                e.log_detail()
+            );
             Vec::new()
         }
     };
