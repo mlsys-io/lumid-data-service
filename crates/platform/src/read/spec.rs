@@ -139,6 +139,24 @@ pub struct EndpointSpec {
     /// No-op unless `LUMID_ADMIN_READ_ROLE` is also set. Default false.
     #[serde(default)]
     pub admin_cross_tenant: bool,
+    /// Self-tenant scoping. When `true`, the server OVERRIDES the endpoint's
+    /// `tenant` bind with the authenticated caller's `sub` before the query is
+    /// bound — any client-supplied `?tenant=` is discarded. An endpoint that
+    /// sets this MUST reference `:tenant` in its SQL: that predicate is the
+    /// scoping control.
+    ///
+    /// NOTE: earlier config comments described this as pinning an
+    /// `app.tenant_id` GUC for RLS. It never did — no GUC is set anywhere in
+    /// this crate. The `:tenant` predicate is the whole mechanism, which is why
+    /// a `self_tenant` endpoint whose SQL omits the bind is rejected at load
+    /// rather than silently reading cross-tenant.
+    ///
+    /// Before this field existed the key was accepted by TOML and silently
+    /// dropped (no `deny_unknown_fields`), so `:tenant` was never bound and
+    /// every such endpoint returned 500 `bind ':tenant' has no resolved value`.
+    /// It failed closed, but the isolation it advertised was not running.
+    #[serde(default)]
+    pub self_tenant: bool,
     /// Parsed backend-neutral query IR (`T-READ-IR-001`). Populated at spec-load
     /// when `sql` fits the bounded read-only SELECT grammar; `None` ⇒ the spec
     /// fell back to the raw-SQL Postgres path (the un-parseable construct was
@@ -240,6 +258,24 @@ fn lint(ep: &EndpointSpec) -> Result<(), ApiError> {
     if humantime::parse_duration(&ep.ttl).is_err() {
         return Err(bail(format!("bad ttl '{}'", ep.ttl)));
     }
+    // A self-tenant endpoint is scoped ONLY by its `:tenant` predicate — there is
+    // no RLS GUC behind it. If the SQL never references the bind, the injected
+    // caller sub is inert and the endpoint reads every tenant's rows while
+    // looking scoped. Fail at load, loudly, rather than serve that.
+    if ep.self_tenant {
+        if !ep.sql.contains(":tenant") {
+            return Err(bail(
+                "self_tenant = true but the SQL never references `:tenant`; the endpoint                  would read ACROSS tenants while appearing scoped"
+                    .into(),
+            ));
+        }
+        if !ep.params.iter().any(|p| p.name == "tenant") {
+            return Err(bail(
+                "self_tenant = true but no `tenant` param is declared; the bind cannot lower"
+                    .into(),
+            ));
+        }
+    }
     // Collect fragment names produced by params.
     let mut produced: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for p in &ep.params {
@@ -277,4 +313,61 @@ pub fn fragment_names(sql: &str) -> Vec<String> {
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod self_tenant_lint_tests {
+    use super::*;
+
+    fn toml_for(self_tenant: bool, sql: &str, with_param: bool) -> String {
+        let param = if with_param {
+            "[[read.endpoint.param]]\nname = \"tenant\"\nkind = \"query\"\ntype = \"str\"\n"
+        } else {
+            ""
+        };
+        format!(
+            "[[read.endpoint]]\nid = \"t\"\nmethod = \"GET\"\npath = \"/t\"\n\
+             tables = [\"core.x\"]\nttl = \"5s\"\nshape = \"rows\"\n\
+             self_tenant = {self_tenant}\nsql = \"\"\"\n{sql}\n\"\"\"\n{param}"
+        )
+    }
+
+    #[test]
+    fn self_tenant_is_parsed_not_silently_dropped() {
+        // The original defect: the key was accepted by TOML and dropped, so the
+        // bind was never injected and the endpoint 500'd in production.
+        let specs = parse(&toml_for(true, "SELECT 1 FROM core.x WHERE t::text = :tenant", true))
+            .expect("should parse");
+        assert!(specs[0].self_tenant, "self_tenant must round-trip from TOML");
+    }
+
+    #[test]
+    fn defaults_false_so_existing_specs_are_unaffected() {
+        let t = "[[read.endpoint]]\nid = \"t\"\nmethod = \"GET\"\npath = \"/t\"\n\
+                 tables = [\"core.x\"]\nttl = \"5s\"\nshape = \"rows\"\n\
+                 sql = \"\"\"\nSELECT 1 FROM core.x\n\"\"\"\n";
+        assert!(!parse(t).expect("parses")[0].self_tenant);
+    }
+
+    #[test]
+    fn rejects_self_tenant_whose_sql_ignores_the_bind() {
+        // The dangerous shape: looks scoped, reads every tenant. Must not load.
+        let err = parse(&toml_for(true, "SELECT 1 FROM core.x", true)).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("ACROSS tenants"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_self_tenant_with_no_tenant_param_declared() {
+        let err = parse(&toml_for(true, "SELECT 1 FROM core.x WHERE t::text = :tenant", false))
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("no `tenant` param"), "got: {msg}");
+    }
+
+    #[test]
+    fn non_self_tenant_sql_without_bind_still_loads() {
+        // The guard must not tighten anything for endpoints that never opted in.
+        assert!(parse(&toml_for(false, "SELECT 1 FROM core.x", false)).is_ok());
+    }
 }
