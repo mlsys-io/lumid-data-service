@@ -83,6 +83,58 @@ fn apply_default_model(st: &AppState, mut body: Value) -> Value {
     body
 }
 
+/// Map Anthropic's `thinking` control onto the knob the on-prem backend
+/// actually reads.
+///
+/// The Anthropic shape is `{"thinking": {"type": "disabled"}}`, and vLLM
+/// IGNORES it — measured against the GB10 head on /v1/messages: 116s and an
+/// 11k-character thinking block, byte-identical to not sending it at all. What
+/// vLLM does read is `chat_template_kwargs.thinking`, which suppresses the
+/// preamble entirely (same prompt: 1s, no thinking block). So the documented
+/// control silently did nothing, which is worse than not offering one — a
+/// caller has no way to tell "ignored" from "had no effect".
+///
+/// Only `disabled` is mapped. `enabled` is already the default, and Anthropic's
+/// `budget_tokens` has no vLLM equivalent, so forwarding it as-is is honest:
+/// upstreams that understand it still get it.
+///
+/// The original `thinking` field is deliberately LEFT IN the body. Not every
+/// backend behind this gateway is vLLM — OpenRouter and a real Anthropic
+/// endpoint honour it natively, and stripping it would break the callers this
+/// is meant to serve.
+///
+/// An explicit `chat_template_kwargs.thinking` from the caller WINS: it is the
+/// backend-level control, so someone who set it deliberately is not overridden
+/// by the higher-level alias.
+///
+/// NOTE FOR CALLERS: this changes ANSWERS, not just latency. Measured on a
+/// scoring task, suppressing the preamble moved the verdict (2/13 -> 0/13) and
+/// widened run-to-run spread on identical input. It is a per-request opt-in for
+/// work that does not need deliberation (classification, extraction, routing),
+/// never a default, and never for anything whose output is compared over time.
+fn apply_thinking_control(mut body: Value) -> Value {
+    let disabled = body
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t.eq_ignore_ascii_case("disabled"));
+    if !disabled {
+        return body;
+    }
+    let Value::Object(map) = &mut body else {
+        return body;
+    };
+    let ctk = map
+        .entry("chat_template_kwargs")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Value::Object(ctk) = ctk {
+        if !ctk.contains_key("thinking") {
+            ctk.insert("thinking".into(), Value::Bool(false));
+        }
+    }
+    body
+}
+
 /// `stream: true` → SSE.
 fn wants_stream(body: &Value) -> bool {
     matches!(body.get("stream"), Some(Value::Bool(true)))
@@ -1145,7 +1197,7 @@ pub async fn messages(
     body: Json<Value>,
 ) -> Response {
     let body = match require_object(body.0) {
-        Ok(b) => apply_default_model(&st, b),
+        Ok(b) => apply_thinking_control(apply_default_model(&st, b)),
         Err(e) => return e.into_response(),
     };
     if wants_stream(&body) {
@@ -1249,5 +1301,71 @@ mod openrouter_roster_tests {
     #[test]
     fn no_openrouter_url_serves_nothing() {
         assert!(!openrouter_serves(&map(), "", "qwen/qwen3-coder"));
+    }
+}
+
+#[cfg(test)]
+mod thinking_control_tests {
+    use super::apply_thinking_control;
+    use serde_json::json;
+
+    fn ctk_thinking(v: &serde_json::Value) -> Option<&serde_json::Value> {
+        v.get("chat_template_kwargs")?.get("thinking")
+    }
+
+    #[test]
+    fn disabled_maps_to_the_knob_vllm_actually_reads() {
+        let out = apply_thinking_control(json!({
+            "model": "deepseek-v4-flash",
+            "thinking": {"type": "disabled"},
+        }));
+        assert_eq!(ctk_thinking(&out), Some(&json!(false)));
+        // Left in place: OpenRouter and Anthropic honour it natively.
+        assert_eq!(out["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn enabled_is_left_alone() {
+        let out = apply_thinking_control(json!({
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+        }));
+        assert!(out.get("chat_template_kwargs").is_none());
+        assert_eq!(out["thinking"]["budget_tokens"], 4096);
+    }
+
+    #[test]
+    fn absent_thinking_changes_nothing() {
+        let out = apply_thinking_control(json!({"model": "m", "max_tokens": 8}));
+        assert!(out.get("chat_template_kwargs").is_none());
+    }
+
+    // The backend-level control is more specific than the alias, so a caller who
+    // set it deliberately must not be overridden.
+    #[test]
+    fn explicit_chat_template_kwargs_wins() {
+        let out = apply_thinking_control(json!({
+            "thinking": {"type": "disabled"},
+            "chat_template_kwargs": {"thinking": true},
+        }));
+        assert_eq!(ctk_thinking(&out), Some(&json!(true)));
+    }
+
+    // Merging into an existing map must not drop the caller's other keys.
+    #[test]
+    fn other_chat_template_kwargs_are_preserved() {
+        let out = apply_thinking_control(json!({
+            "thinking": {"type": "disabled"},
+            "chat_template_kwargs": {"custom_flag": "keep-me"},
+        }));
+        assert_eq!(ctk_thinking(&out), Some(&json!(false)));
+        assert_eq!(out["chat_template_kwargs"]["custom_flag"], "keep-me");
+    }
+
+    #[test]
+    fn malformed_thinking_is_ignored_not_fatal() {
+        for bad in [json!({"thinking": "disabled"}), json!({"thinking": null}), json!({"thinking": {}})] {
+            let out = apply_thinking_control(bad);
+            assert!(out.get("chat_template_kwargs").is_none());
+        }
     }
 }
