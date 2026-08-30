@@ -173,10 +173,32 @@ impl Drop for InFlightGuard {
 ///
 /// Anything unparseable degrades to tier 0 rather than erroring: a typo must
 /// not take a backend out of the roster, it should just lose its promotion.
-fn split_tier(url: &str) -> (&str, u32) {
-    match url.split_once("#tier=") {
-        Some((base, t)) => (base, t.trim().parse::<u32>().unwrap_or(0)),
-        None => (url, 0),
+/// Parses a backend URL's optional `#key=value&key=value...` suffix.
+///
+/// Recognized keys: `tier` (routing tier, absent => 0 — see `BackendHandle::tier`)
+/// and `max_concurrency` (per-backend override of the global
+/// `LUMID_LLM_BACKEND_MAX_CONCURRENCY`, absent => `None`, falls back to the
+/// global value). This exists because the global roof is tuned to match the
+/// SLOWEST backend behind a model id (e.g. an 8-slot GPU or CPU box); a much
+/// more capable backend sharing that id — same tier or a different one — would
+/// otherwise sit far under its real capacity with no way to say so per-URL.
+fn parse_suffix(url: &str) -> (&str, u32, Option<u32>) {
+    match url.split_once('#') {
+        Some((base, suffix)) => {
+            let mut tier = 0u32;
+            let mut max_concurrency = None;
+            for kv in suffix.split('&') {
+                if let Some((k, v)) = kv.split_once('=') {
+                    match k.trim() {
+                        "tier" => tier = v.trim().parse::<u32>().unwrap_or(0),
+                        "max_concurrency" => max_concurrency = v.trim().parse::<u32>().ok(),
+                        _ => {}
+                    }
+                }
+            }
+            (base, tier, max_concurrency)
+        }
+        None => (url, 0, None),
     }
 }
 
@@ -196,10 +218,11 @@ impl BackendPool {
         let mut all: Vec<Arc<BackendHandle>> = Vec::new();
         let mut seen: HashMap<String, Arc<BackendHandle>> = HashMap::new();
 
-        let max_concurrency = s.llm_backend_max_concurrency;
+        let default_max_concurrency = s.llm_backend_max_concurrency;
         let queue_roof = s.llm_backend_queue_roof;
         let mut intern = |url: &str| -> Arc<BackendHandle> {
-            let (base, tier) = split_tier(url);
+            let (base, tier, max_concurrency_override) = parse_suffix(url);
+            let max_concurrency = max_concurrency_override.unwrap_or(default_max_concurrency);
             let key = base.trim_end_matches('/').to_string();
             seen.entry(key.clone())
                 .or_insert_with(|| {
@@ -605,14 +628,51 @@ mod tier_tests {
         }
     }
 
-    // The `#tier=` suffix must not survive into the dialed URL: health probes,
-    // /metrics scrapes and every log line read `h.url` directly.
+    // The `#tier=`/`#max_concurrency=` suffix must not survive into the dialed
+    // URL: health probes, /metrics scrapes and every log line read `h.url`
+    // directly.
     #[test]
     fn tier_suffix_is_parsed_and_stripped() {
-        assert_eq!(split_tier("http://s0:4001#tier=1"), ("http://s0:4001", 1));
-        assert_eq!(split_tier("http://gb10:8090"), ("http://gb10:8090", 0));
+        assert_eq!(
+            parse_suffix("http://s0:4001#tier=1"),
+            ("http://s0:4001", 1, None)
+        );
+        assert_eq!(
+            parse_suffix("http://gb10:8090"),
+            ("http://gb10:8090", 0, None)
+        );
         // A typo must cost the promotion, never the backend.
-        assert_eq!(split_tier("http://x:1#tier=abc"), ("http://x:1", 0));
+        assert_eq!(
+            parse_suffix("http://x:1#tier=abc"),
+            ("http://x:1", 0, None)
+        );
+    }
+
+    // THE POINT OF THIS SUFFIX: the global roof is tuned to the slowest backend
+    // behind an id (see `parse_suffix`'s doc comment) -- a per-URL override lets
+    // one capable backend use more of its real capacity without touching that
+    // global value, which every other backend (same id or not) still depends on.
+    #[test]
+    fn max_concurrency_suffix_is_parsed_and_stripped() {
+        assert_eq!(
+            parse_suffix("http://h100:4011#tier=0&max_concurrency=64"),
+            ("http://h100:4011", 0, Some(64))
+        );
+        // Order must not matter.
+        assert_eq!(
+            parse_suffix("http://h100:4011#max_concurrency=64&tier=0"),
+            ("http://h100:4011", 0, Some(64))
+        );
+        // No override present => None, caller falls back to the global default.
+        assert_eq!(
+            parse_suffix("http://gb10:8090#tier=1"),
+            ("http://gb10:8090", 1, None)
+        );
+        // A typo must cost the override, never the backend (same policy as tier).
+        assert_eq!(
+            parse_suffix("http://x:1#max_concurrency=abc"),
+            ("http://x:1", 0, None)
+        );
     }
 
     // THE POINT OF THE FEATURE. Sorting on in-flight alone sends the SECOND
