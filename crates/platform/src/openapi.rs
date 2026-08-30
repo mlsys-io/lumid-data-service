@@ -29,6 +29,39 @@ fn oapi_path(path: &str) -> String {
         .join("/")
 }
 
+/// Insert one operation into `paths`. Free function (rather than the local
+/// closure it used to be) so it can be called both from the `add(...)`
+/// shorthand below (no request body) and directly for routes that need one
+/// (`/retrieve`) — a closure capturing `paths` mutably can only be borrowed
+/// once, so a second call site needs a plain function instead.
+#[allow(clippy::too_many_arguments)]
+fn add_op(
+    paths: &mut Map<String, Value>,
+    path: &str,
+    method: &str,
+    summary: &str,
+    params: Vec<Value>,
+    desc: &str,
+    request_body: Option<Value>,
+) {
+    let mut op = json!({
+        "summary": summary,
+        "operationId": format!("{}_{}", method, path.replace(['/', '{', '}'], "_").trim_matches('_')),
+        "description": desc,
+        "parameters": params,
+        "responses": {"200": {"description": "OK"}},
+    });
+    if let Some(rb) = request_body {
+        if let Some(o) = op.as_object_mut() {
+            o.insert("requestBody".to_string(), rb);
+        }
+    }
+    let entry = paths.entry(path.to_string()).or_insert_with(|| json!({}));
+    if let Some(m) = entry.as_object_mut() {
+        m.insert(method.to_string(), op);
+    }
+}
+
 fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
     let mut paths = Map::new();
     for s in specs {
@@ -62,17 +95,7 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
         json!({"name": name, "in": loc, "required": required, "schema": {"type": "string"}})
     };
     let mut add = |path: &str, method: &str, summary: &str, params: Vec<Value>, desc: &str| {
-        let op = json!({
-            "summary": summary,
-            "operationId": format!("{}_{}", method, path.replace(['/', '{', '}'], "_").trim_matches('_')),
-            "description": desc,
-            "parameters": params,
-            "responses": {"200": {"description": "OK"}},
-        });
-        let entry = paths.entry(path.to_string()).or_insert_with(|| json!({}));
-        if let Some(m) = entry.as_object_mut() {
-            m.insert(method.to_string(), op);
-        }
+        add_op(&mut paths, path, method, summary, params, desc, None);
     };
 
     // --- Catalog / lineage (discovery; read-only) ---
@@ -84,7 +107,11 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
     add("/catalog/submitters", "get", "Ingest submitters", vec![], "Who/what may submit to the ingress surface.");
     add("/catalog/lineage/runs", "get", "Recent ingest runs", vec![], "Recent ingest runs with status + row counts.");
     add("/catalog/lineage/run/{run_id}", "get", "Lineage for a run", vec![p("run_id", "path", true)], "The lineage chain for one ingest run.");
-    add("/catalog/lineage/row", "get", "Lineage for a row", vec![p("schema", "query", true), p("table", "query", true)], "Trace a row back to its ingest run.");
+    add("/catalog/lineage/row", "get", "Lineage for a row", vec![p("schema", "query", true), p("table", "query", true)],
+        "Trace a row back to its ingest run. Every query param besides 'schema'/'table' is a \
+         natural-key column=value filter — the required key is per-table and is published as \
+         the `natural_key` field of GET /catalog/tables/{schema}/{table}; omitting the key \
+         returns 400 naming it.");
 
     // Realtime SSE/WebSocket routes are app-contributed (the platform names no
     // such path) — see `extra_paths` below.
@@ -130,6 +157,57 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
     add("/usage", "get", "Usage dashboard", vec![], "Global request dashboard (all callers, aggregate).");
     add("/openapi.json", "get", "OpenAPI document", vec![], "This document.");
 
+    // `add` (the closure above) is done being used past this point, so `paths`
+    // can be borrowed directly again for the one route that needs a
+    // requestBody (a closure's captured mutable borrow can't be interleaved
+    // with a second direct borrow of the same variable while still in scope).
+    //
+    // --- Direct SQL/storage retrieval ---
+    // Historically missing from this document (LUMID-004) even though /profile
+    // above refers to it ("Same safety boundary as POST /retrieve") — a
+    // read-only, gated surface that just never got an `add()` call.
+    add_op(
+        &mut paths,
+        "/retrieve",
+        "post",
+        "Direct SQL/storage retrieval",
+        vec![],
+        "Executes a single read-only SELECT (or a pre-built retrieval plan) and materializes \
+         the result to object storage, returning a materialized_uri to fetch it from. Safety \
+         model: SELECT-only parser, the query runs in a READ ONLY transaction, and a row cap \
+         is enforced by injecting LIMIT <cap>+1 server-side (exceeding it is a 400, not a \
+         silently truncated result). The connection's statement_timeout \
+         (STATEMENT_TIMEOUT_MS, default 30000ms) applies; a query that exceeds it returns 400 \
+         naming the timeout rather than hanging. 'sql' and 'plan' are mutually exclusive — \
+         exactly one is required.",
+        Some(json!({
+            "required": true,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "sql": {
+                                "type": "string",
+                                "description": "A single SELECT statement. Mutually exclusive with 'plan'."
+                            },
+                            "plan": {
+                                "type": "object",
+                                "description": "A pre-built RetrievalPlan (ops sequence). Mutually exclusive with 'sql'."
+                            },
+                            "output_format": {
+                                "type": "string",
+                                "enum": ["jsonl", "csv", "raw"],
+                                "default": "jsonl",
+                                "description": "'parquet' is not implemented and returns 400."
+                            }
+                        }
+                    }
+                }
+            }
+        })),
+    );
+
     // App-contributed paths (e.g. realtime SSE/WS the app mounts) — merged last
     // so the app can document routes the platform doesn't name. Shape is an
     // OpenAPI paths object: `{ "/path": { "get": {<operation>} } }`.
@@ -147,7 +225,14 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
             "description": "Read + discovery + realtime + MCP surface. Declarative read \
                 endpoints, catalog/lineage, SSE/WebSocket streams, and POST /mcp. \
                 App-compiled reads and the optional /v1 LLM proxy are at /reference. \
-                Write/ingest/admin routes are operator-only and intentionally not listed here.",
+                Write/ingest/admin routes are operator-only and intentionally not listed here. \
+                \n\nAuthentication: every route below except /health requires a bearer identity \
+                (`Authorization: Bearer <token>`) at this service. When reached through \
+                https://lum.id/findata/*, the edge proxy grants a rate-limited, read-only \
+                anonymous tier automatically to any request that presents no Authorization \
+                header at all — this is intentional (research/reproducibility use), and a \
+                caller's own PAT, when presented, always takes precedence and is passed through \
+                unmodified.",
         },
         "servers": [{"url": "/"}],
         "components": {"securitySchemes": {"bearer": {"type": "http", "scheme": "bearer"}}},

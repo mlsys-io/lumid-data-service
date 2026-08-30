@@ -51,8 +51,11 @@ pub fn parse_request(body: &Value) -> ApiResult<(RetrievalPlan, OutputFormat)> {
         .and_then(|v| v.as_str())
         .unwrap_or("jsonl");
 
-    let output_format = OutputFormat::from_str(fmt_str)
-        .ok_or_else(|| ApiError::BadRequest(format!("unknown output_format: {fmt_str}")))?;
+    let output_format = OutputFormat::from_str(fmt_str).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "unknown output_format: '{fmt_str}' (supported: jsonl, csv, raw — parquet is not implemented)"
+        ))
+    })?;
 
     Ok((plan, output_format))
 }
@@ -68,4 +71,33 @@ pub async fn post_retrieve(
         serde_json::to_value(&result)
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("serializing result: {e}")))?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// LUMID-005: the error should name the supported enum, not just echo
+    /// the caller's bad value back.
+    #[test]
+    fn unknown_output_format_names_supported_values() {
+        let err = parse_request(&json!({"sql": "select 1", "output_format": "parquet"}))
+            .err()
+            .unwrap();
+        let msg = err.to_string();
+        assert!(msg.contains("parquet"), "{msg}");
+        assert!(msg.contains("jsonl"), "{msg}");
+        assert!(msg.contains("csv"), "{msg}");
+        assert!(msg.contains("raw"), "{msg}");
+    }
+
+    #[test]
+    fn known_output_formats_still_accepted() {
+        for fmt in ["jsonl", "csv", "raw"] {
+            let (_, out) =
+                parse_request(&json!({"sql": "select 1", "output_format": fmt})).unwrap();
+            assert_eq!(out.format_name(), fmt);
+        }
+    }
 }

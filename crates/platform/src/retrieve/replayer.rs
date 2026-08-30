@@ -193,6 +193,15 @@ fn quote_pg_ident(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// Returns true when a `tokio_postgres::Error` is `query_canceled` (57014),
+/// which is what Postgres raises when `statement_timeout` fires.
+fn is_query_canceled(e: &tokio_postgres::Error) -> bool {
+    use tokio_postgres::error::SqlState;
+    e.as_db_error()
+        .map(|db| *db.code() == SqlState::QUERY_CANCELED)
+        .unwrap_or(false)
+}
+
 /// Execute a single SQL SELECT op and stream rows into the materializer.
 /// Returns `(rows_written, rowcount)`.
 ///
@@ -246,7 +255,20 @@ async fn execute_sql_op(
     let limited = wrap_select_with_cap(cleaned, probe_limit);
 
     let rows = tx.query(&limited, &[]).await.map_err(|e| {
-        ApiError::BadRequest(format!("SQL execution failed: {e}"))
+        if is_query_canceled(&e) {
+            // LUMID-006: a statement_timeout cancellation was previously
+            // surfaced through the generic "SQL execution failed: {e}" branch
+            // below, indistinguishable from a syntax error or a permissions
+            // problem — and only visible as a client-side stall lasting
+            // exactly `stmt_timeout_ms`. Name it explicitly.
+            ApiError::BadRequest(format!(
+                "query exceeded the {stmt_timeout_ms}ms statement timeout — narrow the scan \
+                 (add a WHERE bound, use an index, or query a smaller time window) rather than \
+                 retrying as-is"
+            ))
+        } else {
+            ApiError::BadRequest(format!("SQL execution failed: {e}"))
+        }
     })?;
 
     // Transaction is read-only; drop (implicit rollback) is fine.

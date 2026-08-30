@@ -152,89 +152,159 @@ pub async fn list_tables(pool: &Pool, schema: &str) -> ApiResult<Vec<Map<String,
 
 const PROV_SET: &[&str] = &["source", "source_endpoint", "source_run_id", "ingest_ts", "raw"];
 
-/// Full profile of one table. Returns None (→ 404) when the table doesn't exist.
-pub async fn table_profile(
-    pool: &Pool,
+/// One live column of a table, view, or materialized view.
+pub struct ColumnMeta {
+    pub name: String,
+    pub data_type: Option<String>,
+    pub udt_name: Option<String>,
+    pub nullable: bool,
+    pub default_val: Option<String>,
+    pub is_generated: bool,
+}
+
+/// Every live column of `schema.table`, via `pg_attribute` rather than
+/// `information_schema.columns`. Deliberately NOT `information_schema` here:
+/// that view silently excludes materialized views (relkind='m') — they aren't
+/// part of the SQL standard — which is why `fundamentals.latest_per_symbol`
+/// and `reference.active_symbols` (both matviews) came back with zero columns
+/// everywhere this used information_schema (LUMID-003). `pg_attribute` is
+/// relkind-agnostic, so this works uniformly for tables, views, and matviews.
+/// Returns an empty Vec when the relation doesn't exist.
+pub async fn full_table_columns(
+    client: &tokio_postgres::Client,
     schema: &str,
     table: &str,
-) -> ApiResult<Option<Value>> {
-    let client = pool.get().await?;
-
-    // Table meta — also tells us whether the relation exists at all.
-    // Two SQL variants: TimescaleDB-aware (with hypertable check) and plain fallback.
-    let meta_ts = "
-    SELECT pg_total_relation_size(c.oid)::bigint AS size_bytes,
-           c.reltuples::bigint                   AS est_rows,
-           obj_description(c.oid, 'pg_class')    AS comment,
-           EXISTS (
-              SELECT 1 FROM _timescaledb_catalog.hypertable h
-               WHERE h.schema_name = n.nspname AND h.table_name = c.relname
-           ) AS is_hypertable
-      FROM pg_class c
-      JOIN pg_namespace n ON n.oid = c.relnamespace
-     WHERE n.nspname = $1 AND c.relname = $2";
-    let meta_plain = "
-    SELECT pg_total_relation_size(c.oid)::bigint AS size_bytes,
-           c.reltuples::bigint                   AS est_rows,
-           obj_description(c.oid, 'pg_class')    AS comment,
-           false                                 AS is_hypertable
-      FROM pg_class c
-      JOIN pg_namespace n ON n.oid = c.relnamespace
-     WHERE n.nspname = $1 AND c.relname = $2";
-    let meta = match client.query_opt(meta_ts, &[&schema, &table]).await {
-        Ok(r) => r,
-        Err(ref e) if is_undefined_table(e) => {
-            client.query_opt(meta_plain, &[&schema, &table]).await?
-        }
-        Err(e) => return Err(e.into()),
-    };
-    let meta = match meta {
-        Some(m) => m,
-        None => return Ok(None),
-    };
-
-    // Columns.
-    let col_rows = client
+) -> Result<Vec<ColumnMeta>, tokio_postgres::Error> {
+    let rows = client
         .query(
             "
-    SELECT column_name AS name, data_type AS type, udt_name,
-           is_nullable = 'YES' AS nullable,
-           column_default AS default_val,
-           is_generated, identity_generation,
-           ordinal_position AS pos
-      FROM information_schema.columns
-     WHERE table_schema = $1 AND table_name = $2
-     ORDER BY ordinal_position",
+    SELECT a.attname AS name,
+           CASE WHEN tt.typcategory::text = 'A' THEN 'ARRAY'
+                ELSE format_type(a.atttypid, NULL) END AS type,
+           tt.typname AS udt,
+           NOT a.attnotnull AS nullable,
+           pg_get_expr(ad.adbin, ad.adrelid) AS default_val,
+           (a.attgenerated::text <> '') AS is_generated
+      FROM pg_attribute a
+      JOIN pg_class c ON c.oid = a.attrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      JOIN pg_type tt ON tt.oid = a.atttypid
+      LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+     WHERE n.nspname = $1 AND c.relname = $2
+       AND a.attnum > 0 AND NOT a.attisdropped
+     ORDER BY a.attnum",
             &[&schema, &table],
         )
         .await?;
-    let mut cols: Vec<Value> = Vec::with_capacity(col_rows.len());
-    let mut has_source = false;
-    for r in &col_rows {
-        let name: String = r.get("name");
-        if name == "source" {
-            has_source = true;
-        }
-        let is_generated: Option<String> = r.try_get("is_generated").ok();
-        let identity_generation: Option<String> = r.try_get("identity_generation").ok();
-        let generated = is_generated.as_deref() == Some("ALWAYS")
-            || identity_generation.as_deref() == Some("ALWAYS");
-        let default_val: Option<String> = r.try_get("default_val").ok().flatten();
-        let ty: Option<String> = r.try_get("type").ok().flatten();
-        let udt: Option<String> = r.try_get("udt_name").ok().flatten();
-        let nullable: Option<bool> = r.try_get("nullable").ok().flatten();
-        cols.push(json!({
-            "name": name,
-            "type": ty,
-            "udt": udt,
-            "nullable": nullable.unwrap_or(false),
-            "default": default_val,
-            "is_generated": generated,
-            "is_provenance": PROV_SET.contains(&name.as_str()),
-        }));
-    }
+    Ok(rows
+        .iter()
+        .map(|r| ColumnMeta {
+            name: r.get("name"),
+            data_type: r.try_get("type").ok().flatten(),
+            udt_name: r.try_get("udt").ok().flatten(),
+            nullable: r.try_get("nullable").ok().flatten().unwrap_or(false),
+            default_val: r.try_get("default_val").ok().flatten(),
+            is_generated: r.try_get("is_generated").ok().flatten().unwrap_or(false),
+        })
+        .collect())
+}
 
-    // UNIQUE / PRIMARY KEY constraints → natural key.
+/// Map a Postgres display type (`ColumnMeta::data_type`) → JSON Schema type
+/// fragment. Moved here from `validation` (2026-08-30): its only caller was
+/// the ingest-input schema, now retired in favor of `table_schema_json` below.
+fn json_schema_type(data_type: &str, udt_name: &str) -> Value {
+    let t = data_type.to_lowercase();
+    if t == "array" {
+        return json!({"type": "array", "items": json_schema_type_for_udt(udt_name)});
+    }
+    match t.as_str() {
+        "text" | "character varying" | "varchar" | "character" | "char" | "uuid"
+        | "tsvector" => json!({"type": "string"}),
+        "boolean" | "bool" => json!({"type": "boolean"}),
+        "bigint" | "integer" | "smallint" | "int8" | "int4" | "int2" => {
+            json!({"type": "integer"})
+        }
+        "numeric" | "decimal" | "real" | "double precision" | "float8" | "float4" => {
+            json!({"type": "number"})
+        }
+        "date" => json!({"type": "string", "format": "date"}),
+        "time without time zone" | "time with time zone" => {
+            json!({"type": "string", "format": "time"})
+        }
+        "timestamp without time zone" | "timestamp with time zone" => {
+            json!({"type": "string", "format": "date-time"})
+        }
+        "json" | "jsonb" => json!({"type": ["object", "array", "string", "number", "boolean", "null"]}),
+        "bytea" => json!({"type": "string", "contentEncoding": "base64"}),
+        _ => json!({"type": "string"}),
+    }
+}
+
+fn json_schema_type_for_udt(udt_name: &str) -> Value {
+    // udt like "_text", "_int4" → element type.
+    match udt_name.trim_start_matches('_') {
+        "int2" | "int4" | "int8" => json!({"type": "integer"}),
+        "numeric" | "float4" | "float8" => json!({"type": "number"}),
+        "bool" => json!({"type": "boolean"}),
+        _ => json!({"type": "string"}),
+    }
+}
+
+/// Read-facing JSON Schema for `schema.table`: every live column, including
+/// server-stamped provenance columns (`id`, `source`, `source_endpoint`,
+/// `source_run_id`, `ingest_ts`) and generated columns (e.g. `search_tsv`) —
+/// this is what a `SELECT *` actually returns (LUMID-001). Distinct from the
+/// old `validation::schema_json_for`, which described the write/ingest input
+/// model (server-stamped + generated columns excluded, since a submitter must
+/// not and cannot supply them) and had exactly one caller: this same route,
+/// which is why the published schema silently omitted those 6 columns.
+/// Returns None (→ 404) when the relation doesn't exist.
+pub async fn table_schema_json(pool: &Pool, schema: &str, table: &str) -> ApiResult<Option<Value>> {
+    let client = pool.get().await?;
+    let columns = full_table_columns(&client, schema, table).await?;
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    let mut properties = Map::new();
+    let mut required: Vec<Value> = Vec::new();
+    for c in &columns {
+        let data_type = c.data_type.as_deref().unwrap_or("text");
+        let udt = c.udt_name.as_deref().unwrap_or(data_type);
+        let mut frag = json_schema_type(data_type, udt);
+        if c.nullable {
+            if let Some(o) = frag.as_object_mut() {
+                o.insert("nullable".into(), Value::Bool(true));
+            }
+        }
+        properties.insert(c.name.clone(), frag);
+        if !c.nullable {
+            required.push(Value::String(c.name.clone()));
+        }
+    }
+    Ok(Some(json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": format!("{schema}_{table}"),
+        "description": format!(
+            "Every queryable column of {schema}.{table} — what a SELECT returns, \
+             including server-stamped provenance columns and generated columns. \
+             Not an ingest/write model."
+        ),
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties,
+        "required": required,
+    })))
+}
+
+/// Derive the natural key for one relation: the first non-`id` UNIQUE
+/// constraint's columns, falling back to the first UNIQUE/PRIMARY KEY group
+/// found. Empty when the relation has no such constraint (materialized views
+/// never do — Postgres doesn't support constraints on them) or doesn't exist.
+pub async fn natural_key_for(
+    client: &tokio_postgres::Client,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<String>, tokio_postgres::Error> {
     let unique_rows = client
         .query(
             "
@@ -276,9 +346,83 @@ pub async fn table_profile(
             natural_key = groups[first].clone();
         }
     }
+    Ok(natural_key)
+}
+
+/// Full profile of one table. Returns None (→ 404) when the table doesn't exist.
+pub async fn table_profile(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+) -> ApiResult<Option<Value>> {
+    let mut client = pool.get().await?;
+
+    // Table meta — also tells us whether the relation exists at all.
+    // Two SQL variants: TimescaleDB-aware (with hypertable check) and plain fallback.
+    let meta_ts = "
+    SELECT pg_total_relation_size(c.oid)::bigint AS size_bytes,
+           c.reltuples::bigint                   AS est_rows,
+           obj_description(c.oid, 'pg_class')    AS comment,
+           EXISTS (
+              SELECT 1 FROM _timescaledb_catalog.hypertable h
+               WHERE h.schema_name = n.nspname AND h.table_name = c.relname
+           ) AS is_hypertable
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = $1 AND c.relname = $2";
+    let meta_plain = "
+    SELECT pg_total_relation_size(c.oid)::bigint AS size_bytes,
+           c.reltuples::bigint                   AS est_rows,
+           obj_description(c.oid, 'pg_class')    AS comment,
+           false                                 AS is_hypertable
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = $1 AND c.relname = $2";
+    let meta = match client.query_opt(meta_ts, &[&schema, &table]).await {
+        Ok(r) => r,
+        Err(ref e) if is_undefined_table(e) => {
+            client.query_opt(meta_plain, &[&schema, &table]).await?
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let meta = match meta {
+        Some(m) => m,
+        None => return Ok(None),
+    };
+
+    // Columns (pg_attribute-based — see `full_table_columns`; also fixes the
+    // matview blind spot for the profile view itself, not just schema.json).
+    let columns = full_table_columns(&client, schema, table).await?;
+    let mut cols: Vec<Value> = Vec::with_capacity(columns.len());
+    let mut has_source = false;
+    for c in &columns {
+        if c.name == "source" {
+            has_source = true;
+        }
+        cols.push(json!({
+            "name": c.name,
+            "type": c.data_type,
+            "udt": c.udt_name,
+            "nullable": c.nullable,
+            "default": c.default_val,
+            "is_generated": c.is_generated,
+            "is_provenance": PROV_SET.contains(&c.name.as_str()),
+        }));
+    }
+
+    let natural_key = natural_key_for(&client, schema, table).await?;
 
     // Top-5 (source, source_endpoint) by row count — only if a `source` column
     // exists. Best-effort: failures are swallowed (Python logged + continued).
+    //
+    // Bounded to a short LOCAL statement_timeout, tighter than the connection's
+    // default (`STATEMENT_TIMEOUT_MS`, 30s): this is an unindexed full-table
+    // GROUP BY, and on the largest tables (hundreds of millions of rows) it ran
+    // long enough to hit that 30s default, which is exactly what surfaced as a
+    // ~30s catalog-profile timeout (LUMID-002). A large/slow table should
+    // degrade to an empty top_sources list quickly, not stall the whole
+    // response for tens of seconds.
+    const TOP_SOURCES_TIMEOUT_MS: u32 = 3_000;
     let mut top_sources: Vec<Map<String, Value>> = Vec::new();
     if has_source && ident_ok(schema) && ident_ok(table) {
         let sources_sql = format!(
@@ -288,7 +432,15 @@ pub async fn table_profile(
               ORDER BY rows DESC
               LIMIT 5"
         );
-        if let Ok(src_rows) = client.query(sources_sql.as_str(), &[]).await {
+        let bounded: Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> = async {
+            let tx = client.transaction().await?;
+            tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOP_SOURCES_TIMEOUT_MS}"))
+                .await?;
+            let rows = tx.query(sources_sql.as_str(), &[]).await?;
+            Ok(rows)
+        }
+        .await;
+        if let Ok(src_rows) = bounded {
             top_sources = rows_to_objects(&src_rows);
         }
     }

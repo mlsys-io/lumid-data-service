@@ -53,6 +53,26 @@ pub async fn get_table_profile(
     }
 }
 
+/// GET /catalog/tables/{schema}/{table}/schema.json — read-facing JSON Schema
+/// (every live column). Moved here from `handlers::ingest` (2026-08-30): it was
+/// built from the write/ingest input model (`validation::schema_json_for`),
+/// which silently excluded server-stamped + generated columns (LUMID-001) and
+/// only ever covered `information_schema.columns`, which excludes materialized
+/// views (LUMID-003). See `queries::catalog::table_schema_json`.
+pub async fn get_table_schema_json(
+    State(st): State<AppState>,
+    Path((schema, table)): Path<(String, String)>,
+) -> ApiResult<Json<Value>> {
+    // No `is_user_schema` gate, matching the route's prior behavior (it
+    // introspected any schema/table via `write::introspect::table_meta`,
+    // unrestricted) — some ACL-only write targets live outside `USER_SCHEMAS`
+    // and their `schema_url` (see `list_writable_for_role`) must keep resolving.
+    match q::table_schema_json(&st.pool, &schema, &table).await? {
+        Some(schema_json) => Ok(Json(schema_json)),
+        None => Err(ApiError::NotFound(format!("unknown table: {schema}.{table}"))),
+    }
+}
+
 /// GET /catalog/ingress/writable — what THIS identity can write.
 pub async fn get_writable(
     State(st): State<AppState>,
@@ -135,14 +155,24 @@ pub async fn get_lineage_row(
     let table = raw
         .remove("table")
         .ok_or_else(|| ApiError::BadRequest("missing 'table' query parameter".into()))?;
-    if raw.is_empty() {
-        return Err(ApiError::BadRequest(
-            "supply at least one <column>=<value> query parameter (natural key)".into(),
-        ));
-    }
     let effective = q::effective_schemas(&st.settings.user_schemas);
     if !q::is_user_schema(&schema, &effective) {
         return Err(ApiError::NotFound(format!("unknown schema '{schema}'")));
+    }
+    if raw.is_empty() {
+        // LUMID-007: name the actual natural key instead of a generic 400, so
+        // the caller doesn't have to separately fetch the table profile first.
+        let client = st.pool.get().await?;
+        let key_cols = q::natural_key_for(&client, &schema, &table).await.unwrap_or_default();
+        let msg = if key_cols.is_empty() {
+            "supply at least one <column>=<value> query parameter (natural key)".to_string()
+        } else {
+            format!(
+                "supply at least one <column>=<value> query parameter — natural key for {schema}.{table} is ({})",
+                key_cols.join(", ")
+            )
+        };
+        return Err(ApiError::BadRequest(msg));
     }
     match q::trace_by_natural_key(&st.pool, &schema, &table, &raw, &effective).await? {
         Some(out) => Ok(Json(out)),
