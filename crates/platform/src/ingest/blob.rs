@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use deadpool_postgres::Pool;
-use object_store::{path::Path as ObjPath, Attribute, Attributes, ObjectStore, PutOptions, PutPayload};
+use object_store::{path::Path as ObjPath, Attribute, Attributes, ObjectStore};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -183,14 +183,17 @@ pub async fn ingest_blob(
     //    these CAS keys are extension-free, so `raw.blobs` is otherwise the
     //    only place it survives.
     let attrs = Attributes::from_iter([(Attribute::ContentType, ct.clone())]);
-    blob_store
-        .put_opts(
-            &ObjPath::from(key.as_str()),
-            PutPayload::from(body.to_vec()),
-            PutOptions::from(attrs),
-        )
-        .await
-        .map_err(|e| ApiError::Internal(anyhow::anyhow!("blob put: {e}")))?;
+    // Same LocalFileSystem trap as the retrieval writer: a non-empty attribute
+    // set makes `put_opts` return NotImplemented, which would fail blob INGEST
+    // outright on a store with no metadata support. See crate::objstore.
+    crate::objstore::put_with_optional_attrs(
+        &blob_store,
+        &ObjPath::from(key.as_str()),
+        bytes::Bytes::from(body.to_vec()),
+        attrs,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(anyhow::anyhow!("blob put: {e}")))?;
 
     let storage_url = public_url_for(settings, &key);
 
