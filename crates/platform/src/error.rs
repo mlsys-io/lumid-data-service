@@ -107,12 +107,35 @@ impl IntoResponse for ApiError {
         let body = match &self {
             ApiError::Validation(v) => json!({"detail": v}),
             ApiError::Internal(e) => {
-                tracing::error!("internal error: {e:#}");
-                json!({"detail": "internal server error"})
+                // A CORRELATION ID ON BOTH SIDES.
+                //
+                // The body stays deliberately opaque — an internal error must
+                // not leak a query plan, a DSN or a path to the caller. But
+                // "internal server error" with nothing else meant a reporter
+                // could describe a two-day outage precisely and still leave the
+                // operator grepping by timestamp across two clusters to find
+                // the matching line. Both users who reported the 2026-08-30/31
+                // `/retrieve` outage asked for exactly this.
+                //
+                // The id is generated here, logged beside the real cause, and
+                // returned in the body and the `x-request-id` header, so a bug
+                // report can quote one token that finds the server-side error.
+                let rid = uuid::Uuid::new_v4().to_string();
+                tracing::error!(request_id = %rid, "internal error: {e:#}");
+                json!({"detail": "internal server error", "request_id": rid})
             }
             other => json!({"detail": other.to_string()}),
         };
-        (status, Json(body)).into_response()
+        let rid = body.get("request_id").and_then(|v| v.as_str()).map(str::to_owned);
+        let mut resp = (status, Json(body)).into_response();
+        // Mirror the id into a header so proxies and clients that discard the
+        // body on 5xx still surface something traceable.
+        if let Some(rid) = rid {
+            if let Ok(v) = rid.parse() {
+                resp.headers_mut().insert("x-request-id", v);
+            }
+        }
+        resp
     }
 }
 
