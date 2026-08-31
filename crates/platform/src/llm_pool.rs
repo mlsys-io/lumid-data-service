@@ -15,9 +15,10 @@
 //! via `GET /health`; on a <500 response the circuit closes and the backend
 //! re-enters normal rotation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering::Relaxed};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const CIRCUIT_OPEN_AFTER: u32 = 3;
 const PROBE_INTERVAL_S: u64 = 10;
@@ -25,6 +26,11 @@ const PROBE_INTERVAL_S: u64 = 10;
 /// depth. Must be short relative to how long a queued request waits (observed
 /// 300-570s) but long enough to cost nothing: one cheap GET per backend.
 const QUEUE_SCRAPE_INTERVAL_S: u64 = 5;
+/// Rolling window for the tok/s + QPS throughput figures reported by
+/// `/admin/llm-backend-stats`. Sampled on the SAME tick as the queue-depth
+/// scrape (`QUEUE_SCRAPE_INTERVAL_S`) so no second HTTP round-trip is added
+/// per backend. 5 minutes at 5s resolution = 60 samples/backend, negligible.
+pub const THROUGHPUT_WINDOW_S: u64 = 300;
 
 // ──────────────────────────────────────────── BackendHandle
 
@@ -54,6 +60,22 @@ pub struct BackendHandle {
     /// GPU+CPU roster means a 3.7x slower box while the GPU sits at 1/32.
     /// Tier makes "spill", not "balance", the semantics.
     pub tier: u32,
+    /// Rolling window of throughput samples for `/admin/llm-backend-stats`.
+    /// Populated by `start_queue_scraper` on the same tick as the queue-depth
+    /// scrape (see `THROUGHPUT_WINDOW_S`). A `Mutex<VecDeque<_>>` rather than
+    /// atomics: tok/s and QPS both need the OLDEST sample still in the window
+    /// compared against the NEWEST, which is a multi-field read that must not
+    /// tear — an `Arc<AtomicU64>` per counter could still race a push against a
+    /// read (e.g. read a stale generation_tokens paired with a just-pushed
+    /// requests_success). One lock, one struct, no partial reads.
+    throughput_samples: Mutex<VecDeque<ThroughputSample>>,
+}
+
+#[derive(Clone, Copy)]
+struct ThroughputSample {
+    at: Instant,
+    generation_tokens: u64,
+    requests_success: u64,
 }
 
 impl BackendHandle {
@@ -71,7 +93,51 @@ impl BackendHandle {
             // all traffic to OpenRouter.
             queue_depth: AtomicI32::new(-1),
             queue_roof,
+            throughput_samples: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// Record a throughput sample (raw cumulative counters from `/metrics`) and
+    /// evict anything older than `THROUGHPUT_WINDOW_S`. Cheap: at most ~60
+    /// entries, called once per scrape tick.
+    fn push_throughput_sample(&self, generation_tokens: u64, requests_success: u64) {
+        let Ok(mut buf) = self.throughput_samples.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        buf.push_back(ThroughputSample {
+            at: now,
+            generation_tokens,
+            requests_success,
+        });
+        let window = std::time::Duration::from_secs(THROUGHPUT_WINDOW_S);
+        while buf.len() > 1 && now.duration_since(buf.front().unwrap().at) > window {
+            buf.pop_front();
+        }
+    }
+
+    /// Compute (tok/s, qps) from the oldest vs newest sample still in the
+    /// window. `None` when fewer than 2 samples have been collected (backend
+    /// just started, or /metrics has never been reachable) — the caller
+    /// renders that as "warming up", not zero, which would misreport a
+    /// genuinely busy backend as idle during its first ~10s.
+    ///
+    /// Counters can legitimately go backwards (vLLM process restart resets
+    /// them to 0) — a negative delta is clamped to `None` for that tick rather
+    /// than reported as a negative rate.
+    pub fn throughput_rates(&self) -> Option<(f64, f64)> {
+        let buf = self.throughput_samples.lock().ok()?;
+        let oldest = buf.front()?;
+        let newest = buf.back()?;
+        let elapsed = newest.at.duration_since(oldest.at).as_secs_f64();
+        if elapsed <= 0.0 {
+            return None;
+        }
+        let tok_delta = newest
+            .generation_tokens
+            .checked_sub(oldest.generation_tokens)?;
+        let req_delta = newest.requests_success.checked_sub(oldest.requests_success)?;
+        Some((tok_delta as f64 / elapsed, req_delta as f64 / elapsed))
     }
 
     /// Engine queue depth last observed, or -1 when unknown.
@@ -381,7 +447,13 @@ impl BackendPool {
                         continue;
                     }
                     let prev = h.queue_depth();
-                    match scrape_queue_depth(&http, &h.url).await {
+                    // One GET per backend per tick, shared by BOTH signals below
+                    // (queue depth AND throughput) — the throughput scraper was
+                    // added later and deliberately reuses this fetch rather than
+                    // issuing its own, per the same "cost nothing" rule the queue
+                    // scraper was built under.
+                    let body = fetch_metrics_body(&http, &h.url).await;
+                    match body.as_deref().and_then(parse_num_requests_waiting) {
                         Some(n) => {
                             h.set_queue_depth(n);
                             // Log only on a saturation EDGE, so this is quiet in
@@ -415,26 +487,30 @@ impl BackendPool {
                         // than gate on it forever.
                         None => h.set_queue_depth(-1),
                     }
+                    if let Some(counters) = body.as_deref().and_then(parse_throughput_counters) {
+                        h.push_throughput_sample(
+                            counters.generation_tokens,
+                            counters.requests_success,
+                        );
+                    }
                 }
             }
         });
     }
 }
 
-/// GET `<url>/metrics` and parse `vllm:num_requests_waiting`.
-/// Returns None when the endpoint is unreachable or the metric is absent.
-async fn scrape_queue_depth(http: &reqwest::Client, base: &str) -> Option<i32> {
+/// GET `<url>/metrics` as plain text. `None` on any connect/read failure —
+/// callers treat a missing body as "unreachable this tick", not an error.
+async fn fetch_metrics_body(http: &reqwest::Client, base: &str) -> Option<String> {
     let url = format!("{}/metrics", base);
-    let body = http
-        .get(&url)
+    http.get(&url)
         .timeout(std::time::Duration::from_secs(3))
         .send()
         .await
         .ok()?
         .text()
         .await
-        .ok()?;
-    parse_num_requests_waiting(&body)
+        .ok()
 }
 
 /// Parse the backend's engine queue depth out of its Prometheus exposition.
@@ -488,6 +564,55 @@ fn parse_num_requests_waiting(body: &str) -> Option<i32> {
     } else {
         None
     }
+}
+
+/// Raw cumulative counters read from one `/metrics` scrape, feeding the
+/// throughput rolling window (`BackendHandle::push_throughput_sample`).
+/// Only `generation_tokens` (tok/s) and `requests_success` (QPS) are tracked
+/// — the two figures this feature reports; prompt-token throughput is a
+/// different question this endpoint doesn't answer.
+struct ThroughputCounters {
+    generation_tokens: u64,
+    requests_success: u64,
+}
+
+/// Parse `vllm:generation_tokens_total` and `vllm:request_success_total`
+/// (summed across every `finished_reason` / `engine` label — a multi-engine
+/// backend reports total throughput, mirroring how `parse_num_requests_waiting`
+/// sums across labels). `None` when NEITHER metric family appears at all
+/// (non-vLLM backend, or /metrics format changed) — a genuinely idle vLLM
+/// backend still emits both families at value 0, so this only returns `None`
+/// on absence, not on zero.
+fn parse_throughput_counters(body: &str) -> Option<ThroughputCounters> {
+    let mut generation_tokens = 0.0f64;
+    let mut generation_seen = false;
+    let mut requests_success = 0.0f64;
+    let mut requests_seen = false;
+
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(v) = line.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok()) else {
+            continue;
+        };
+        if line.starts_with("vllm:generation_tokens_total") {
+            generation_tokens += v;
+            generation_seen = true;
+        } else if line.starts_with("vllm:request_success_total") {
+            requests_success += v;
+            requests_seen = true;
+        }
+    }
+
+    if !generation_seen && !requests_seen {
+        return None;
+    }
+    Some(ThroughputCounters {
+        generation_tokens: generation_tokens.round() as u64,
+        requests_success: requests_success.round() as u64,
+    })
 }
 
 #[cfg(test)]
@@ -869,5 +994,101 @@ vllm:num_requests_waiting_by_reason{engine="0",reason="deferred"} 9.0
     #[test]
     fn absent_metric_is_unknown() {
         assert_eq!(parse_num_requests_waiting("# nothing here\n"), None);
+    }
+}
+
+#[cfg(test)]
+mod throughput_tests {
+    use super::*;
+
+    #[test]
+    fn parses_generation_tokens_and_requests_success() {
+        let body = r#"
+vllm:prompt_tokens_total{engine="0"} 1000.0
+vllm:generation_tokens_total{engine="0"} 250.0
+vllm:request_success_total{engine="0",finished_reason="stop"} 4.0
+vllm:request_success_total{engine="0",finished_reason="length"} 1.0
+"#;
+        let c = parse_throughput_counters(body).expect("should parse");
+        assert_eq!(c.generation_tokens, 250);
+        // Summed across finished_reason, same convention as num_requests_waiting.
+        assert_eq!(c.requests_success, 5);
+    }
+
+    #[test]
+    fn sums_across_engines() {
+        let body = r#"
+vllm:generation_tokens_total{engine="0"} 100.0
+vllm:generation_tokens_total{engine="1"} 50.0
+vllm:request_success_total{engine="0",finished_reason="stop"} 2.0
+vllm:request_success_total{engine="1",finished_reason="stop"} 3.0
+"#;
+        let c = parse_throughput_counters(body).expect("should parse");
+        assert_eq!(c.generation_tokens, 150);
+        assert_eq!(c.requests_success, 5);
+    }
+
+    #[test]
+    fn absent_metrics_is_none() {
+        assert!(parse_throughput_counters("# nothing here\n").is_none());
+    }
+
+    #[test]
+    fn idle_backend_at_zero_is_some_not_none() {
+        // A genuinely idle vLLM backend still emits the families at 0 -- must
+        // not be confused with "unreachable" (None), which the caller renders
+        // differently (no data yet vs. zero traffic).
+        let body = r#"
+vllm:generation_tokens_total{engine="0"} 0.0
+vllm:request_success_total{engine="0",finished_reason="stop"} 0.0
+"#;
+        let c = parse_throughput_counters(body).expect("zero is still Some");
+        assert_eq!(c.generation_tokens, 0);
+        assert_eq!(c.requests_success, 0);
+    }
+
+    #[test]
+    fn rates_none_before_two_samples() {
+        let h = BackendHandle::new("http://x".into(), 8, 1, 0);
+        assert!(h.throughput_rates().is_none(), "single sample must not report a rate");
+        h.push_throughput_sample(100, 1);
+        assert!(
+            h.throughput_rates().is_none(),
+            "still only one sample after the first push"
+        );
+    }
+
+    #[test]
+    fn rates_computed_from_oldest_to_newest_sample() {
+        let h = BackendHandle::new("http://x".into(), 8, 1, 0);
+        // Directly exercise the window math without sleeping in a test: push
+        // synthetic samples straight into the buffer via push_throughput_sample,
+        // then assert the delta is what the counters imply. Real elapsed time
+        // between the two pushes is whatever the test takes (microseconds), so
+        // assert on the RATIO (tok_delta/req_delta) rather than an absolute
+        // tok/s figure, which would be flaky under load.
+        h.push_throughput_sample(1000, 10);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        h.push_throughput_sample(1500, 15);
+        let (tok_s, qps) = h.throughput_rates().expect("two samples should yield a rate");
+        assert!(tok_s > 0.0, "generation delta is positive, rate must be positive");
+        assert!(qps > 0.0, "request delta is positive, rate must be positive");
+        // 500 tokens / 5 requests = 100 tokens per request, regardless of the
+        // actual elapsed wall time (which cancels out of the ratio).
+        assert!((tok_s / qps - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn counter_reset_yields_none_not_negative() {
+        // vLLM process restart resets its counters to 0. A naive delta would
+        // go negative and be misreported as a negative rate.
+        let h = BackendHandle::new("http://x".into(), 8, 1, 0);
+        h.push_throughput_sample(1000, 10);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        h.push_throughput_sample(50, 2); // counters went backwards
+        assert!(
+            h.throughput_rates().is_none(),
+            "a backwards counter delta must not be reported as a negative rate"
+        );
     }
 }
