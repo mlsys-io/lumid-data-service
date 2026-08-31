@@ -7,6 +7,21 @@
 //! the SAME scrape's parsed counters rather than triggering a new one, so a
 //! page hitting this endpoint on a fast poll costs nothing extra upstream).
 //!
+//! Scoped to `STATS_MODEL` (`deepseek-v4-flash`) only. The pool also carries
+//! two llama.cpp EMBEDDING backends (qwen3-emb-0.6b/4b on s0), which are
+//! excluded here — "tok/s of generated text" + "QPS of chat turns" aren't the
+//! right measure for an embedding endpoint, and they're registered under
+//! different model ids anyway, so `STATS_MODEL` naturally excludes them.
+//!
+//! Both backend dialects behind `deepseek-v4-flash` ARE supported for tok/s
+//! (h100/GX10 are vLLM; s0-CPU is llama.cpp with `--metrics` enabled
+//! 2026-08-31 specifically for this) — see `parse_throughput_counters` in
+//! `llm_pool.rs`. QPS is `None` for the llama.cpp legs specifically:
+//! llama.cpp's exposition has no cumulative request-completion counter at
+//! all (only point-in-time gauges), so there is nothing to compute a rate
+//! from — this is a real, permanent gap for that backend family, not a
+//! "still warming up" state.
+//!
 //! Admin-gated the same way as the other `/admin/*` routes in this crate
 //! (`ingest::require_admin` — `super_admin` or the local key).
 
@@ -21,6 +36,11 @@ use crate::llm_pool::BackendHandle;
 use crate::state::AppState;
 
 use super::ingest::require_admin;
+
+/// The only model id this endpoint reports on. See the module doc for why
+/// the embedding backends (registered under `qwen3-emb-*`) are excluded
+/// rather than shown with a metric that can never populate.
+const STATS_MODEL: &str = "deepseek-v4-flash";
 
 /// Static url→human-label map. Nothing in config carries operator-facing
 /// backend names today (only bare URLs + a numeric `#tier=`) — this is
@@ -51,6 +71,11 @@ struct BackendStats {
     /// distinct from a genuine 0.0, which means "no traffic in the window",
     /// not "no data yet".
     tok_s: Option<f64>,
+    /// `None` for two DIFFERENT reasons the client must not conflate: (a) not
+    /// warmed up yet (same as `tok_s: None` — check `tok_s` to tell them
+    /// apart: this backend's tok_s is also None), or (b) `tok_s` IS Some but
+    /// this backend's dialect (llama.cpp) has no request-completion counter
+    /// to compute a rate from at all — see the module doc.
     qps: Option<f64>,
     /// -1 = unknown/not yet scraped, mirrors `BackendHandle::queue_depth`'s own
     /// convention so this payload doesn't invent a second one.
@@ -59,7 +84,7 @@ struct BackendStats {
 
 fn stats_for(h: &BackendHandle) -> BackendStats {
     let (tok_s, qps) = match h.throughput_rates() {
-        Some((t, q)) => (Some(round2(t)), Some(round2(q))),
+        Some((t, q)) => (Some(round2(t)), q.map(round2)),
         None => (None, None),
     };
     BackendStats {
@@ -82,7 +107,12 @@ pub async fn llm_backend_stats(
     Extension(identity): Extension<Identity>,
 ) -> ApiResult<Json<Value>> {
     require_admin(&identity)?;
-    let backends: Vec<BackendStats> = st.llm_pool.all.iter().map(|h| stats_for(h)).collect();
+    let backends: Vec<BackendStats> = st
+        .llm_pool
+        .by_model
+        .get(STATS_MODEL)
+        .map(|hs| hs.iter().map(|h| stats_for(h)).collect())
+        .unwrap_or_default();
     Ok(Json(json!({
         "window_seconds": crate::llm_pool::THROUGHPUT_WINDOW_S,
         "backends": backends,

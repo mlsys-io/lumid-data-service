@@ -75,7 +75,11 @@ pub struct BackendHandle {
 struct ThroughputSample {
     at: Instant,
     generation_tokens: u64,
-    requests_success: u64,
+    /// `None` when the backend's exposition has no request-completion
+    /// counter at all — true for llama.cpp, which exposes `requests_processing`
+    /// / `requests_deferred` as point-in-time GAUGES but never a cumulative
+    /// "requests finished" counter. vLLM's `request_success_total` fills this.
+    requests_success: Option<u64>,
 }
 
 impl BackendHandle {
@@ -100,7 +104,7 @@ impl BackendHandle {
     /// Record a throughput sample (raw cumulative counters from `/metrics`) and
     /// evict anything older than `THROUGHPUT_WINDOW_S`. Cheap: at most ~60
     /// entries, called once per scrape tick.
-    fn push_throughput_sample(&self, generation_tokens: u64, requests_success: u64) {
+    fn push_throughput_sample(&self, generation_tokens: u64, requests_success: Option<u64>) {
         let Ok(mut buf) = self.throughput_samples.lock() else {
             return;
         };
@@ -117,15 +121,19 @@ impl BackendHandle {
     }
 
     /// Compute (tok/s, qps) from the oldest vs newest sample still in the
-    /// window. `None` when fewer than 2 samples have been collected (backend
-    /// just started, or /metrics has never been reachable) — the caller
-    /// renders that as "warming up", not zero, which would misreport a
-    /// genuinely busy backend as idle during its first ~10s.
+    /// window. The OUTER `Option` is `None` when fewer than 2 samples have
+    /// been collected (backend just started, or /metrics has never been
+    /// reachable) — the caller renders that as "warming up", not zero, which
+    /// would misreport a genuinely busy backend as idle during its first
+    /// ~10s. The INNER `Option<f64>` on qps is separately `None` when this
+    /// backend's exposition has no request-completion counter at all
+    /// (llama.cpp) — distinct from "0 requests", which is a real measurement
+    /// the vLLM backends can make and llama.cpp backends cannot.
     ///
-    /// Counters can legitimately go backwards (vLLM process restart resets
-    /// them to 0) — a negative delta is clamped to `None` for that tick rather
-    /// than reported as a negative rate.
-    pub fn throughput_rates(&self) -> Option<(f64, f64)> {
+    /// Counters can legitimately go backwards (process restart resets them to
+    /// 0) — a negative delta is clamped to `None` for that metric on that
+    /// tick rather than reported as a negative rate.
+    pub fn throughput_rates(&self) -> Option<(f64, Option<f64>)> {
         let buf = self.throughput_samples.lock().ok()?;
         let oldest = buf.front()?;
         let newest = buf.back()?;
@@ -136,8 +144,11 @@ impl BackendHandle {
         let tok_delta = newest
             .generation_tokens
             .checked_sub(oldest.generation_tokens)?;
-        let req_delta = newest.requests_success.checked_sub(oldest.requests_success)?;
-        Some((tok_delta as f64 / elapsed, req_delta as f64 / elapsed))
+        let qps = match (oldest.requests_success, newest.requests_success) {
+            (Some(o), Some(n)) => n.checked_sub(o).map(|d| d as f64 / elapsed),
+            _ => None,
+        };
+        Some((tok_delta as f64 / elapsed, qps))
     }
 
     /// Engine queue depth last observed, or -1 when unknown.
@@ -568,21 +579,35 @@ fn parse_num_requests_waiting(body: &str) -> Option<i32> {
 
 /// Raw cumulative counters read from one `/metrics` scrape, feeding the
 /// throughput rolling window (`BackendHandle::push_throughput_sample`).
-/// Only `generation_tokens` (tok/s) and `requests_success` (QPS) are tracked
-/// — the two figures this feature reports; prompt-token throughput is a
-/// different question this endpoint doesn't answer.
+/// `generation_tokens` (tok/s) is universal across both backend families this
+/// endpoint scrapes. `requests_success` (QPS) is `None` for a backend that
+/// exposes no request-completion COUNTER at all — see its doc on
+/// `ThroughputSample`.
 struct ThroughputCounters {
     generation_tokens: u64,
-    requests_success: u64,
+    requests_success: Option<u64>,
 }
 
-/// Parse `vllm:generation_tokens_total` and `vllm:request_success_total`
-/// (summed across every `finished_reason` / `engine` label — a multi-engine
-/// backend reports total throughput, mirroring how `parse_num_requests_waiting`
-/// sums across labels). `None` when NEITHER metric family appears at all
-/// (non-vLLM backend, or /metrics format changed) — a genuinely idle vLLM
-/// backend still emits both families at value 0, so this only returns `None`
-/// on absence, not on zero.
+/// Parses generation-token throughput and (where available) request-
+/// completion counters from BOTH exposition dialects this pool's backends
+/// use:
+///
+/// - **vLLM**: `vllm:generation_tokens_total`, `vllm:request_success_total`
+///   (summed across every `finished_reason` / `engine` label — a
+///   multi-engine backend reports total throughput, mirroring how
+///   `parse_num_requests_waiting` sums across labels).
+/// - **llama.cpp** (`--metrics`): `llamacpp:tokens_predicted_total` is the
+///   generation-token counter. llama.cpp has NO cumulative request-completion
+///   counter — `requests_processing`/`requests_deferred` are point-in-time
+///   GAUGES, not counters, so they cannot feed a rate-over-window the way
+///   `request_success_total` can. QPS is therefore left `None` for every
+///   llama.cpp backend; do not wire those gauges in here, they would produce
+///   a number shaped like a rate that isn't one.
+///
+/// `None` when NEITHER family's generation-token metric appears at all
+/// (backend unreachable, or exposes neither dialect) — a genuinely idle
+/// backend still emits the metric at value 0, so this only returns `None` on
+/// absence, not on zero.
 fn parse_throughput_counters(body: &str) -> Option<ThroughputCounters> {
     let mut generation_tokens = 0.0f64;
     let mut generation_seen = false;
@@ -597,21 +622,25 @@ fn parse_throughput_counters(body: &str) -> Option<ThroughputCounters> {
         let Some(v) = line.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok()) else {
             continue;
         };
-        if line.starts_with("vllm:generation_tokens_total") {
+        if line.starts_with("vllm:generation_tokens_total")
+            || line.starts_with("llamacpp:tokens_predicted_total")
+        {
             generation_tokens += v;
             generation_seen = true;
         } else if line.starts_with("vllm:request_success_total") {
+            // llama.cpp has no equivalent counter — deliberately not matched
+            // here. See the function doc.
             requests_success += v;
             requests_seen = true;
         }
     }
 
-    if !generation_seen && !requests_seen {
+    if !generation_seen {
         return None;
     }
     Some(ThroughputCounters {
         generation_tokens: generation_tokens.round() as u64,
-        requests_success: requests_success.round() as u64,
+        requests_success: requests_seen.then_some(requests_success.round() as u64),
     })
 }
 
@@ -1012,7 +1041,7 @@ vllm:request_success_total{engine="0",finished_reason="length"} 1.0
         let c = parse_throughput_counters(body).expect("should parse");
         assert_eq!(c.generation_tokens, 250);
         // Summed across finished_reason, same convention as num_requests_waiting.
-        assert_eq!(c.requests_success, 5);
+        assert_eq!(c.requests_success, Some(5));
     }
 
     #[test]
@@ -1025,7 +1054,7 @@ vllm:request_success_total{engine="1",finished_reason="stop"} 3.0
 "#;
         let c = parse_throughput_counters(body).expect("should parse");
         assert_eq!(c.generation_tokens, 150);
-        assert_eq!(c.requests_success, 5);
+        assert_eq!(c.requests_success, Some(5));
     }
 
     #[test]
@@ -1044,14 +1073,30 @@ vllm:request_success_total{engine="0",finished_reason="stop"} 0.0
 "#;
         let c = parse_throughput_counters(body).expect("zero is still Some");
         assert_eq!(c.generation_tokens, 0);
-        assert_eq!(c.requests_success, 0);
+        assert_eq!(c.requests_success, Some(0));
+    }
+
+    #[test]
+    fn llamacpp_dialect_has_tokens_but_no_requests() {
+        // llama.cpp's --metrics exposition: tokens_predicted_total exists,
+        // there is no request-completion counter at all (only point-in-time
+        // gauges, which must not be wired in as if they were one).
+        let body = r#"
+llamacpp:prompt_tokens_total 500
+llamacpp:tokens_predicted_total 120
+llamacpp:requests_processing 2
+llamacpp:requests_deferred 0
+"#;
+        let c = parse_throughput_counters(body).expect("should parse the llama.cpp dialect");
+        assert_eq!(c.generation_tokens, 120);
+        assert_eq!(c.requests_success, None, "llama.cpp has no request-completion counter");
     }
 
     #[test]
     fn rates_none_before_two_samples() {
         let h = BackendHandle::new("http://x".into(), 8, 1, 0);
         assert!(h.throughput_rates().is_none(), "single sample must not report a rate");
-        h.push_throughput_sample(100, 1);
+        h.push_throughput_sample(100, Some(1));
         assert!(
             h.throughput_rates().is_none(),
             "still only one sample after the first push"
@@ -1067,10 +1112,11 @@ vllm:request_success_total{engine="0",finished_reason="stop"} 0.0
         // between the two pushes is whatever the test takes (microseconds), so
         // assert on the RATIO (tok_delta/req_delta) rather than an absolute
         // tok/s figure, which would be flaky under load.
-        h.push_throughput_sample(1000, 10);
+        h.push_throughput_sample(1000, Some(10));
         std::thread::sleep(std::time::Duration::from_millis(20));
-        h.push_throughput_sample(1500, 15);
+        h.push_throughput_sample(1500, Some(15));
         let (tok_s, qps) = h.throughput_rates().expect("two samples should yield a rate");
+        let qps = qps.expect("both samples carried a request count, qps must be Some");
         assert!(tok_s > 0.0, "generation delta is positive, rate must be positive");
         assert!(qps > 0.0, "request delta is positive, rate must be positive");
         // 500 tokens / 5 requests = 100 tokens per request, regardless of the
@@ -1079,13 +1125,27 @@ vllm:request_success_total{engine="0",finished_reason="stop"} 0.0
     }
 
     #[test]
+    fn qps_is_none_when_backend_never_reports_requests() {
+        // A llama.cpp backend: every sample carries generation_tokens but no
+        // requests_success. tok/s must still compute; qps must stay None
+        // rather than silently reading as 0 requests.
+        let h = BackendHandle::new("http://x".into(), 8, 1, 0);
+        h.push_throughput_sample(1000, None);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        h.push_throughput_sample(1500, None);
+        let (tok_s, qps) = h.throughput_rates().expect("two samples should yield a tok/s rate");
+        assert!(tok_s > 0.0);
+        assert!(qps.is_none(), "no backend ever reported a request count, qps must be None");
+    }
+
+    #[test]
     fn counter_reset_yields_none_not_negative() {
         // vLLM process restart resets its counters to 0. A naive delta would
         // go negative and be misreported as a negative rate.
         let h = BackendHandle::new("http://x".into(), 8, 1, 0);
-        h.push_throughput_sample(1000, 10);
+        h.push_throughput_sample(1000, Some(10));
         std::thread::sleep(std::time::Duration::from_millis(5));
-        h.push_throughput_sample(50, 2); // counters went backwards
+        h.push_throughput_sample(50, Some(2)); // counters went backwards
         assert!(
             h.throughput_rates().is_none(),
             "a backwards counter delta must not be reported as a negative rate"
