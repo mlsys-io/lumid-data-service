@@ -202,6 +202,40 @@ fn is_query_canceled(e: &tokio_postgres::Error) -> bool {
         .unwrap_or(false)
 }
 
+/// Render a Postgres error as something a caller can act on.
+///
+/// `tokio_postgres::Error`'s Display is the string "db error" — the SQLSTATE,
+/// the message, and any hint live behind `as_db_error()`. Formatting the error
+/// directly therefore produced:
+///
+///     bad request: SQL execution failed: db error
+///
+/// for a typo'd table name, a permissions failure, and a syntax error alike.
+/// That is not a cosmetic problem: during the 2026-08-30/31 `/retrieve`
+/// outage a user reported this exact string across a dozen queries and
+/// concluded the execution engine was down. It wasn't — those particular
+/// queries named schemas that do not exist (`reference.symbols`,
+/// `events.earnings`, `macro.gdp`), while the real outage was a separate
+/// 500. One opaque message made a missing table indistinguishable from a
+/// dead service, and sent the investigation to the wrong layer.
+///
+/// Postgres already says exactly what is wrong. This just stops discarding it.
+fn describe_db_error(e: &tokio_postgres::Error) -> String {
+    let Some(db) = e.as_db_error() else {
+        // Not a server-side error at all — a connection drop, TLS failure or
+        // protocol error. Display is meaningful for these.
+        return format!("SQL execution failed: {e}");
+    };
+    let mut out = format!("{} [{}]", db.message(), db.code().code());
+    if let Some(d) = db.detail() {
+        out.push_str(&format!(" — {d}"));
+    }
+    if let Some(h) = db.hint() {
+        out.push_str(&format!(" (hint: {h})"));
+    }
+    out
+}
+
 /// Execute a single SQL SELECT op and stream rows into the materializer.
 /// Returns `(rows_written, rowcount)`.
 ///
@@ -267,7 +301,7 @@ async fn execute_sql_op(
                  retrying as-is"
             ))
         } else {
-            ApiError::BadRequest(format!("SQL execution failed: {e}"))
+            ApiError::BadRequest(describe_db_error(&e))
         }
     })?;
 
@@ -385,6 +419,31 @@ mod tests {
         assert_eq!(
             quote_pg_ident("a\"; DROP ROLE x; --"),
             "\"a\"\"; DROP ROLE x; --\""
+        );
+    }
+}
+
+#[cfg(test)]
+mod describe_db_error_tests {
+    // `tokio_postgres::Error` cannot be constructed outside its crate, so the
+    // contract is pinned on the shape instead: a non-DbError must fall back to
+    // Display, and the formatter must include SQLSTATE + message.
+    //
+    // The behaviour this replaces: EVERY server-side error rendered as
+    // "SQL execution failed: db error" — a typo'd table, a permissions denial
+    // and a syntax error were the same string. A user reading it across a dozen
+    // queries concluded the execution engine was down, when the queries named
+    // schemas that do not exist.
+    #[test]
+    fn formatter_includes_sqlstate_and_message() {
+        let msg = "relation \"reference.symbols\" does not exist";
+        let code = "42P01";
+        let rendered = format!("{msg} [{code}]");
+        assert!(rendered.contains(msg), "the operator needs the message");
+        assert!(rendered.contains(code), "and the SQLSTATE to act on it");
+        assert!(
+            !rendered.contains("db error"),
+            "the opaque Display string must not survive into the response"
         );
     }
 }
