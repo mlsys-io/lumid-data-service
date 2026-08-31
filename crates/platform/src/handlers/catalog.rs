@@ -22,7 +22,25 @@ use crate::state::AppState;
 pub async fn get_schemas(State(st): State<AppState>) -> ApiResult<Json<Value>> {
     let effective = q::effective_schemas(&st.settings.user_schemas);
     let schemas = q::list_schemas(&st.pool, &effective).await?;
-    Ok(Json(json!({ "schemas": schemas })))
+    // COVERAGE NOTE, served with the schema list.
+    //
+    // The warehouse holds 6.2B rows of 1-minute equity OHLCV, which reads as
+    // "equities are covered" — so a researcher reasonably goes looking for
+    // equity tick trades and L2 depth, finds nothing under `trade`, `l2`,
+    // `depth` or `nbbo`, and cannot tell an absent dataset from a broken
+    // search. Reported 2026-08-30 and verified: the only equity matches are
+    // `macro.commitment_of_traders*` (CFTC positioning, a false hit on the
+    // substring "trade").
+    //
+    // Tick-level and order-book data exist ONLY for prediction markets. Saying
+    // so here costs one field and saves the search.
+    Ok(Json(json!({
+        "schemas": schemas,
+        "coverage_notes": {
+            "equities": "OHLCV only (market.ohlc_1min, 1-minute bars). No tick/trade tape and no L2 depth.",
+            "prediction_markets": "Full depth: trades, L2 orderbook snapshots, and derived candles for Polymarket and Kalshi.",
+        },
+    })))
 }
 
 /// GET /catalog/schemas/{schema}/tables
