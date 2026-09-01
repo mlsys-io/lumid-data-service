@@ -389,6 +389,21 @@ fn openrouter_serves(
     !openrouter_url.is_empty() && map.contains_key(model)
 }
 
+/// Whether `resolve()`'s roof/health-overflow branch may hand this request to
+/// OpenRouter. `model: None` can never overflow — there is nothing to check
+/// against the allowlist, so the safe default is "stay local, fail honestly
+/// if every local backend is down" rather than guessing. Pulled out of
+/// `resolve()` as its own function so THIS gating condition — not just
+/// `openrouter_serves` in isolation — has a direct regression test; see
+/// `resolve()`'s call site comment for the incident this closes.
+fn can_overflow_to_openrouter(
+    map: &std::collections::HashMap<String, String>,
+    openrouter_url: &str,
+    model: Option<&str>,
+) -> bool {
+    model.map_or(false, |m| openrouter_serves(map, openrouter_url, m))
+}
+
 fn resolve(
     st: &AppState,
     model: Option<&str>,
@@ -431,7 +446,27 @@ fn resolve(
         // every request would fail `all LLM backends unavailable` with OpenRouter
         // sitting configured and able to serve.
         let all_down = backends.iter().all(|h| !h.is_healthy());
-        if (all_at_roof || all_down) && !st.llm_pool.openrouter_url.is_empty() {
+        // Gate on the SAME allowlist every other OpenRouter path in this
+        // function uses (openrouter_serves, i.e. the model must be in
+        // LUMID_LLM_OPENROUTER_MODEL_MAP) — not just "OpenRouter is
+        // configured at all". Before this fix, a model with local backends
+        // but NO map entry (qwen3-emb-0.6b/4b: on-prem-only by design, no
+        // OpenRouter fallback ever existed for them) would still overflow
+        // here on roof/health saturation, forwarding the bare LOCAL model id
+        // to real OpenRouter via rewrite_model_for_openrouter's no-op
+        // fallthrough (it returns the body unchanged when the map has no
+        // entry) — an id OpenRouter was never asked to serve, so the request
+        // either 404s from OpenRouter or, if a colliding id exists there,
+        // becomes an unaccountable charge. Found 2026-09-01 auditing the
+        // routing config after the GX10 tier bug. Same failure shape
+        // `llm-0d342a8`/`85acad7` already closed for the UNKNOWN-model catch
+        // -all; this closes it for the roof/health-overflow path too.
+        let can_overflow = can_overflow_to_openrouter(
+            &st.settings.llm_openrouter_model_map,
+            &st.llm_pool.openrouter_url,
+            model,
+        );
+        if (all_at_roof || all_down) && can_overflow {
             // Name the ACTUAL reason. "at concurrency roof" was printed for every
             // spill; a saturated pool and a dead pool are different incidents with
             // different remedies, and the operator reads this line first.
@@ -1263,7 +1298,7 @@ mod hedge_tests {
 
 #[cfg(test)]
 mod openrouter_roster_tests {
-    use super::openrouter_serves;
+    use super::{can_overflow_to_openrouter, openrouter_serves};
     use std::collections::HashMap;
 
     fn map() -> HashMap<String, String> {
@@ -1301,6 +1336,40 @@ mod openrouter_roster_tests {
     #[test]
     fn no_openrouter_url_serves_nothing() {
         assert!(!openrouter_serves(&map(), "", "qwen/qwen3-coder"));
+    }
+
+    // Regression, found 2026-09-01 auditing routing config after the GX10
+    // tier bug: the roof/health-overflow branch in resolve() used to check
+    // only "!openrouter_url.is_empty()" -- not this same allowlist -- so a
+    // model with local backends but NO map entry (qwen3-emb-0.6b/4b: on-prem
+    // only by design) would still overflow to OpenRouter under its bare,
+    // unmapped local id on roof saturation or a full outage.
+    #[test]
+    fn roof_overflow_requires_the_model_to_be_mapped() {
+        // Mapped model: overflow permitted, same as the direct-dispatch path.
+        assert!(can_overflow_to_openrouter(
+            &map(),
+            "https://openrouter.ai/api",
+            Some("qwen/qwen3-coder")
+        ));
+        // A local-only backend with NO map entry (e.g. the embeddings ids)
+        // must NEVER overflow, even with OpenRouter fully configured --
+        // exactly the case that reached real OpenRouter under a local id
+        // before this fix.
+        assert!(!can_overflow_to_openrouter(
+            &map(),
+            "https://openrouter.ai/api",
+            Some("qwen3-emb-0.6b")
+        ));
+    }
+
+    // model==None must never overflow -- there's nothing to check against
+    // the allowlist, so guessing is not an option. This is the ONE case
+    // can_overflow_to_openrouter must decide without delegating to
+    // openrouter_serves (which requires a &str).
+    #[test]
+    fn no_model_never_overflows() {
+        assert!(!can_overflow_to_openrouter(&map(), "https://openrouter.ai/api", None));
     }
 }
 
