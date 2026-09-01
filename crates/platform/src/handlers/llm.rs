@@ -369,6 +369,19 @@ fn caller_label(ident: &Option<Extension<Identity>>) -> String {
     }
 }
 
+/// The caller's role for `resolve()`'s admin-only-metered-model gate. `gate`
+/// (auth/mod.rs) already rejects an anonymous request on every data route
+/// before a handler runs, so `None` here in practice means "local key" — the
+/// same identity-less-but-trusted caller `Identity::role == "local"` would
+/// otherwise carry; treat it as at least as privileged as admin rather than
+/// denying an operator's own local-key tooling.
+fn caller_role(ident: &Option<Extension<Identity>>) -> String {
+    match ident {
+        Some(Extension(i)) => i.role.clone(),
+        None => "local".into(),
+    }
+}
+
 // ───────────────────────────────── local backend pool — non-streaming (retry)
 
 /// Resolve backends for `model`. Returns `Err` (503) when pool is empty and
@@ -404,10 +417,32 @@ fn can_overflow_to_openrouter(
     model.map_or(false, |m| openrouter_serves(map, openrouter_url, m))
 }
 
+/// Roles allowed to reach a model that has NO local backend (i.e. every
+/// request is a real, metered OpenRouter charge — see the "OPENROUTER-SERVED
+/// MODELS" branch below). Mirrors claude-proxy's `denyExternalModelForRole`
+/// policy (self-hosted models open to everyone, every other non-Anthropic
+/// model admin-only) — pulled into `lumid-llm` itself 2026-09-01 after an
+/// audit found that policy was enforced ONLY at the claude-proxy door.
+/// Calling `lumid-llm` directly (lum.id/llm, or any other caller holding a
+/// Lumid PAT) bypassed it entirely: two `role=user` accounts were observed
+/// live racking up real `qwen/qwen3.6-27b` charges with zero gate. Local
+/// (self-hosted) models are unaffected — the roof/health-overflow branch
+/// above, which only ever fires for a model that already has a local
+/// backend, deliberately keeps rescuing role=user's on-prem traffic during
+/// saturation; only "no local backend at all" is role-gated.
+fn role_may_use_metered_openrouter_model(role: &str) -> bool {
+    // "local" = a caller authenticated via a local API key (auth/mod.rs),
+    // e.g. an operator's own tooling or another in-cluster service — same
+    // trust tier as super_admin elsewhere in this crate (ingest.rs's
+    // require_admin, blobs.rs's local-key bypass).
+    role == "admin" || role == "super_admin" || role == "local"
+}
+
 fn resolve(
     st: &AppState,
     model: Option<&str>,
     caller: &str,
+    caller_role: &str,
 ) -> Result<Option<Vec<std::sync::Arc<crate::llm_pool::BackendHandle>>>, ApiError> {
     // CLAUDE NEVER GOES TO OPENROUTER. Claude models (claude-sonnet-*, claude-haiku-*,
     // claude-opus-*, claude-fable-*) are proprietary pooled-account models served by
@@ -498,6 +533,26 @@ fn resolve(
     // bounded overflow. Claude ids can never reach here (refused at the top).
     if let Some(m) = model {
         if openrouter_serves(&st.settings.llm_openrouter_model_map, &st.llm_pool.openrouter_url, m) {
+            // ROLE GATE (2026-09-01). A model with NO local backend is a pure
+            // OpenRouter pass-through — every single request is a real charge,
+            // with no on-prem "free at the margin" floor under it (unlike the
+            // roof-overflow branch above, which only ever fires for a model
+            // that ALSO has a local backend). Restricting this to admin+ is
+            // the exact policy claude-proxy already enforces for its own
+            // callers (denyExternalModelForRole); this closes the same door
+            // for anyone calling lumid-llm directly. Refused, not silently
+            // downgraded to a local backend — there is no local backend for
+            // these ids to fall back to, and pretending otherwise would be
+            // more confusing than an honest 403.
+            if !role_may_use_metered_openrouter_model(caller_role) {
+                tracing::warn!(
+                    "llm resolve: model={m} DENIED role={caller_role} caller={caller} — \
+                     metered OpenRouter-only model requires admin+"
+                );
+                return Err(ApiError::Forbidden(format!(
+                    "model {m:?} requires admin access on this platform (metered, no local backend)"
+                )));
+            }
             // THIS BRANCH SPENDS MONEY AND USED TO SAY NOTHING.
             //
             // Only the roof-overflow branch above warned, so the logs described
@@ -1002,7 +1057,7 @@ async fn dispatch_json(
         Ok(Some(peer)) => {
             proxy_json_peer(st, &peer, method, path, Some(body), &origin_of(ident)).await
         }
-        Ok(None) => match resolve(st, model_of(body).as_deref(), &caller_label(&ident)) {
+        Ok(None) => match resolve(st, model_of(body).as_deref(), &caller_label(&ident), &caller_role(&ident)) {
             Err(e) => e.into_response(),
             Ok(None) => {
                 let body = rewrite_model_for_openrouter(st, body);
@@ -1024,7 +1079,7 @@ async fn dispatch_stream(
     match federation_peer(st) {
         Err(e) => e.into_response(),
         Ok(Some(peer)) => proxy_stream_peer(st, &peer, path, body, &origin_of(ident)).await,
-        Ok(None) => match resolve(st, model_of(body).as_deref(), &caller_label(&ident)) {
+        Ok(None) => match resolve(st, model_of(body).as_deref(), &caller_label(&ident), &caller_role(&ident)) {
             Err(e) => e.into_response(),
             Ok(None) => {
                 let body = rewrite_model_for_openrouter(st, body);
@@ -1370,6 +1425,49 @@ mod openrouter_roster_tests {
     #[test]
     fn no_model_never_overflows() {
         assert!(!can_overflow_to_openrouter(&map(), "https://openrouter.ai/api", None));
+    }
+}
+
+#[cfg(test)]
+mod openrouter_role_gate_tests {
+    use super::role_may_use_metered_openrouter_model;
+
+    // Regression, found 2026-09-01 auditing OpenRouter spend: claude-proxy's
+    // admin-only policy for metered non-self-hosted models
+    // (denyExternalModelForRole) was enforced ONLY at the claude-proxy door.
+    // Calling lumid-llm directly bypassed it entirely -- confirmed live, two
+    // role=user accounts racking up real qwen/qwen3.6-27b charges with no
+    // gate at all. This is the policy ported into lumid-llm itself.
+    #[test]
+    fn admin_and_super_admin_may_use_metered_models() {
+        assert!(role_may_use_metered_openrouter_model("admin"));
+        assert!(role_may_use_metered_openrouter_model("super_admin"));
+    }
+
+    #[test]
+    fn plain_user_is_denied() {
+        assert!(!role_may_use_metered_openrouter_model("user"));
+    }
+
+    // An empty/unrecognised role string must deny, not default-allow --
+    // "unknown" must never be more privileged than "user".
+    #[test]
+    fn unknown_role_is_denied() {
+        for role in ["", "guest", "banned", "USER", "Admin"] {
+            assert!(
+                !role_may_use_metered_openrouter_model(role),
+                "role {role:?} must not be treated as admin -- exact match only, no case-folding"
+            );
+        }
+    }
+
+    // "local" (a caller authenticated via a local API key, e.g. this
+    // service's own tooling or another in-cluster service) is treated as
+    // at least as privileged as admin -- same convention as ingest.rs's
+    // require_admin and blobs.rs's local-key bypass elsewhere in this crate.
+    #[test]
+    fn local_key_caller_is_treated_as_privileged() {
+        assert!(role_may_use_metered_openrouter_model("local"));
     }
 }
 
