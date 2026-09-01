@@ -292,11 +292,54 @@ pub struct BackendPool {
 
 impl BackendPool {
     pub fn from_settings(s: &crate::config::Settings) -> Self {
+        Self::intern_backends(
+            &s.llm_backend_url,
+            &s.llm_backends,
+            s.llm_backend_max_concurrency,
+            s.llm_backend_queue_roof,
+            s.llm_openrouter_url.clone(),
+        )
+    }
+
+    /// The actual interning logic behind `from_settings`, pulled out so it is
+    /// testable without constructing a full `Settings` (which has no
+    /// `Default` and dozens of unrelated fields).
+    ///
+    /// `primary_url` is `LUMID_LLM_BACKEND_URL` — the legacy single-backend
+    /// fallback, interned FIRST and unconditionally at whatever tier/suffix
+    /// IT carries (usually none, i.e. tier 0). `backends` is
+    /// `LUMID_LLM_BACKENDS`, interned second.
+    ///
+    /// BUG FIXED HERE (found live 2026-08-31 via the on-prem GPU stats
+    /// panel): the SAME url can legitimately appear in both — an operator
+    /// pointed `LUMID_LLM_BACKEND_URL` at one of the roster's own backends
+    /// (GX10) as a fallback default, not realizing `LUMID_LLM_BACKENDS` also
+    /// lists that URL with `#tier=1`. The old code interned by URL with
+    /// `HashMap::entry().or_insert_with()`: first writer wins, so the
+    /// primary's bare (tier-0) entry silently WON over the later `#tier=1`
+    /// suffix for the identical host:port. GX10 then routed as an EQUAL peer
+    /// to h100 (both tier 0) instead of the documented "h100 first, GX10 only
+    /// on spillover" — confirmed live: GX10 was carrying real steady-state
+    /// traffic (43 tok/s) alongside h100, not spillover-shaped usage.
+    ///
+    /// Fix: intern `LUMID_LLM_BACKENDS` FIRST (it carries the operator's
+    /// explicit, per-backend routing intent — tier and max_concurrency
+    /// suffixes), then `LUMID_LLM_BACKEND_URL` second via the SAME
+    /// first-writer-wins map — so a roster entry for a URL always wins over
+    /// the bare fallback for that same URL, while a `LUMID_LLM_BACKEND_URL`
+    /// naming a genuinely new host (not in any roster) still gets its own
+    /// handle exactly as before. No existing behavior for the common case
+    /// (primary is a URL absent from every roster) changes.
+    fn intern_backends(
+        primary_url: &str,
+        backends: &[(String, Vec<String>)],
+        default_max_concurrency: u32,
+        queue_roof: u32,
+        openrouter_url: String,
+    ) -> Self {
         let mut all: Vec<Arc<BackendHandle>> = Vec::new();
         let mut seen: HashMap<String, Arc<BackendHandle>> = HashMap::new();
 
-        let default_max_concurrency = s.llm_backend_max_concurrency;
-        let queue_roof = s.llm_backend_queue_roof;
         let mut intern = |url: &str| -> Arc<BackendHandle> {
             let (base, tier, max_concurrency_override) = parse_suffix(url);
             let max_concurrency = max_concurrency_override.unwrap_or(default_max_concurrency);
@@ -310,25 +353,27 @@ impl BackendPool {
                 .clone()
         };
 
-        let primary = if !s.llm_backend_url.is_empty() {
-            Some(intern(&s.llm_backend_url))
-        } else {
-            None
-        };
-
+        // Roster FIRST: an explicit #tier=/#max_concurrency= suffix here must
+        // win over a bare LUMID_LLM_BACKEND_URL entry for the same host.
         let mut by_model: HashMap<String, Vec<Arc<BackendHandle>>> = HashMap::new();
-        for (model, urls) in &s.llm_backends {
+        for (model, urls) in backends {
             let handles: Vec<_> = urls.iter().map(|u| intern(u)).collect();
             if !handles.is_empty() {
                 by_model.insert(model.clone(), handles);
             }
         }
 
+        let primary = if !primary_url.is_empty() {
+            Some(intern(primary_url))
+        } else {
+            None
+        };
+
         Self {
             by_model,
             primary,
             all,
-            openrouter_url: s.llm_openrouter_url.clone(),
+            openrouter_url,
         }
     }
 
@@ -887,6 +932,73 @@ mod tier_tests {
             b.url,
             "equal tiers must fall back to least-in-flight"
         );
+    }
+}
+
+#[cfg(test)]
+mod intern_backends_tests {
+    use super::*;
+
+    // Regression for the bug found live 2026-08-31 via the on-prem GPU stats
+    // panel: LUMID_LLM_BACKEND_URL pointed at GX10's bare URL (no #tier=),
+    // and LUMID_LLM_BACKENDS ALSO listed that same URL with #tier=1. The old
+    // interning order (primary first) let the bare tier-0 entry win, so GX10
+    // silently ran as an equal peer to h100 instead of a tier-1 fallback.
+    #[test]
+    fn roster_tier_suffix_wins_over_a_colliding_primary_url() {
+        let backends = vec![(
+            "deepseek-v4-flash".to_string(),
+            vec![
+                "http://h100:4011#tier=0".to_string(),
+                "http://gx10:8090#tier=1".to_string(),
+            ],
+        )];
+        // The exact collision: LUMID_LLM_BACKEND_URL names the SAME host as a
+        // #tier=1 roster entry, with no suffix of its own.
+        let pool = BackendPool::intern_backends("http://gx10:8090", &backends, 16, 4, String::new());
+
+        let gx10 = pool
+            .all
+            .iter()
+            .find(|h| h.url == "http://gx10:8090")
+            .expect("gx10 should be interned");
+        assert_eq!(gx10.tier, 1, "the roster's #tier=1 must win over the bare primary URL");
+
+        // Exactly one handle for gx10, not two — the collision must still
+        // dedupe by URL, just with the right tier winning.
+        assert_eq!(
+            pool.all.iter().filter(|h| h.url == "http://gx10:8090").count(),
+            1,
+            "a colliding primary URL must not create a second handle"
+        );
+
+        // primary still resolves to that same (correctly tiered) handle.
+        assert!(
+            Arc::ptr_eq(pool.primary.as_ref().unwrap(), gx10),
+            "primary must point at the same interned handle, not a shadow copy"
+        );
+    }
+
+    // The common, non-colliding case must be completely unaffected: a
+    // primary URL that names a host absent from every roster still gets its
+    // own handle, own tier (0, since it carries no suffix), and still
+    // resolves via `primary`.
+    #[test]
+    fn non_colliding_primary_url_is_unaffected() {
+        let backends = vec![(
+            "deepseek-v4-flash".to_string(),
+            vec!["http://h100:4011#tier=0".to_string()],
+        )];
+        let pool = BackendPool::intern_backends("http://standalone:9999", &backends, 16, 4, String::new());
+
+        assert_eq!(pool.all.len(), 2, "two distinct hosts, two handles");
+        let standalone = pool
+            .all
+            .iter()
+            .find(|h| h.url == "http://standalone:9999")
+            .expect("standalone primary should be interned");
+        assert_eq!(standalone.tier, 0);
+        assert!(Arc::ptr_eq(pool.primary.as_ref().unwrap(), standalone));
     }
 }
 
