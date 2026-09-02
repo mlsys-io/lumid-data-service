@@ -507,3 +507,148 @@ pub fn build_router(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Router<
         }),
     )
 }
+
+
+#[cfg(test)]
+mod contract_tests {
+    //! Guards for LUMID-011. The defect these exist to prevent is not a crash —
+    //! it is a document that silently stops describing the service, which is
+    //! exactly what 172 operations declaring only `{"200": "OK"}` was. Each test
+    //! pins one claim the document makes to consumers.
+
+    use super::*;
+    use crate::read::spec::parse;
+
+    fn spec_toml(shape: &str, extra: &str, sql: &str) -> String {
+        format!(
+            "[[read.endpoint]]\nid = \"t.x\"\nmethod = \"GET\"\npath = \"/t/x\"\n\
+             tables = [\"news.articles\"]\nttl = \"5s\"\nshape = \"{shape}\"\n{extra}\
+             sql = \"\"\"\n{sql}\n\"\"\"\n"
+        )
+    }
+
+    fn doc_for(toml: &str) -> Value {
+        let specs: Vec<Arc<EndpointSpec>> =
+            parse(toml).expect("fixture parses").into_iter().map(Arc::new).collect();
+        generate(&specs, &json!({}))
+    }
+
+    fn op(doc: &Value, path: &str) -> Value {
+        doc["paths"][path]["get"].clone()
+    }
+
+    #[test]
+    fn every_operation_declares_the_error_contract() {
+        let doc = doc_for(&spec_toml("rows", "", "SELECT a FROM news.articles"));
+        // Not just the declarative one — the platform routes added via add_op
+        // share the contract, and drift between them is the bug.
+        for (path, item) in doc["paths"].as_object().expect("paths") {
+            for (method, o) in item.as_object().expect("item") {
+                let r = &o["responses"];
+                for code in ["400", "404", "422", "429", "500"] {
+                    assert!(
+                        !r[code].is_null(),
+                        "{method} {path} does not declare {code}"
+                    );
+                }
+                assert!(
+                    !r["200"]["content"].is_null(),
+                    "{method} {path} declares no 200 content"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn health_is_the_only_route_without_an_auth_error() {
+        let doc = doc_for(&spec_toml("rows", "", "SELECT a FROM news.articles"));
+        assert!(op(&doc, "/health")["responses"]["401"].is_null(),
+            "/health is unauthenticated and must not claim 401");
+        assert!(!op(&doc, "/catalog/schemas")["responses"]["401"].is_null(),
+            "a gated route must declare 401");
+    }
+
+    #[test]
+    fn success_body_is_derived_from_the_select_list() {
+        let doc = doc_for(&spec_toml(
+            "rows", "",
+            "SELECT published_at, headline, count(*) AS n FROM news.articles",
+        ));
+        let schema = &op(&doc, "/t/x")["responses"]["200"]["content"]["application/json"]["schema"];
+        assert_eq!(schema["type"], "array");
+        let props = &schema["items"]["properties"];
+        for k in ["published_at", "headline", "n"] {
+            assert!(!props[k].is_null(), "column {k} missing from the declared body");
+        }
+        // A type is claimed only when the SQL states it: count() is an integer,
+        // a bare column reference is not typed at all.
+        assert_eq!(props["n"]["type"], "integer");
+        assert!(props["published_at"]["type"].is_null(),
+            "an untyped column must NOT be given a guessed type");
+    }
+
+    #[test]
+    fn lineage_columns_are_not_declared_when_stripped() {
+        let doc = doc_for(&spec_toml(
+            "rows", "strip_lineage = true\n",
+            "SELECT headline, source, source_run_id FROM news.articles",
+        ));
+        let props = &op(&doc, "/t/x")["responses"]["200"]["content"]["application/json"]
+            ["schema"]["items"]["properties"];
+        assert!(!props["headline"].is_null());
+        for hidden in ["source", "source_run_id"] {
+            assert!(props[hidden].is_null(),
+                "{hidden} is stripped from the response and must not be declared");
+        }
+    }
+
+    #[test]
+    fn envelope_shape_nests_under_its_key() {
+        let doc = doc_for(&spec_toml(
+            "envelope", "envelope_key = \"categories\"\n",
+            "SELECT category FROM news.articles",
+        ));
+        let schema = &op(&doc, "/t/x")["responses"]["200"]["content"]["application/json"]["schema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["categories"]["type"], "array");
+    }
+
+    #[test]
+    fn unresolvable_columns_keep_additional_properties_open() {
+        // `max(a + b)` has no derivable output name. Declaring a closed object
+        // would make a VALID response fail a client's validation.
+        let doc = doc_for(&spec_toml(
+            "rows", "", "SELECT headline, max(a + b) FROM news.articles",
+        ));
+        let items = &op(&doc, "/t/x")["responses"]["200"]["content"]["application/json"]
+            ["schema"]["items"];
+        assert_eq!(items["additionalProperties"], json!(true));
+    }
+
+    #[test]
+    fn declared_param_bounds_reach_the_document() {
+        let toml = format!(
+            "{}[[read.endpoint.param]]\nname = \"limit\"\nkind = \"query\"\ntype = \"int\"\n\
+             default = 50\nmin = 1\nmax = 200\n",
+            spec_toml("rows", "", "SELECT a FROM news.articles LIMIT :limit")
+        );
+        let doc = doc_for(&toml);
+        let p = &op(&doc, "/t/x")["parameters"][0];
+        assert_eq!(p["name"], "limit");
+        assert_eq!(p["schema"]["minimum"], json!(1.0));
+        assert_eq!(p["schema"]["maximum"], json!(200.0));
+        assert_eq!(p["schema"]["default"], json!(50));
+    }
+
+    #[test]
+    fn error_schemas_are_defined_and_referenced() {
+        let doc = doc_for(&spec_toml("rows", "", "SELECT a FROM news.articles"));
+        let schemas = &doc["components"]["schemas"];
+        for name in ["Error", "ValidationError", "InternalError"] {
+            assert!(!schemas[name].is_null(), "components.schemas.{name} missing");
+        }
+        // A $ref pointing at nothing is worse than no $ref.
+        let r = &op(&doc, "/t/x")["responses"]["422"]["content"]["application/json"]["schema"]["$ref"];
+        assert_eq!(r, "#/components/schemas/ValidationError");
+    }
+}
