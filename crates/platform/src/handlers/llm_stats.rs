@@ -86,8 +86,25 @@ struct BackendStats {
     /// warmed up yet (same as `tok_s: None` — check `tok_s` to tell them
     /// apart: this backend's tok_s is also None), or (b) `tok_s` IS Some but
     /// this backend's dialect (llama.cpp) has no request-completion counter
-    /// to compute a rate from at all — see the module doc.
+    /// to compute a rate from at all — see the module doc. RETAINED for
+    /// completeness/tooltip detail, but no longer the primary "how loaded is
+    /// this backend" figure the UI leads with — see inflight/peak_inflight_5m.
     qps: Option<f64>,
+    /// ADDED 2026-09-02: an operator read the dashboard's `29.7 tok/s ·
+    /// 0.05 qps` pairing as contradictory — it isn't (qps is completions/s,
+    /// and a backend running few, individually SLOW requests generates
+    /// tokens steadily while finishing almost nothing per second), but the
+    /// UI gave no way to see what was actually meant: how many requests are
+    /// running AT ONCE, and whether there was a burst. inflight is this
+    /// process's own live in-flight count for the backend (not scraped —
+    /// works for every dialect, including llama.cpp, unlike qps).
+    inflight: i32,
+    /// Highest inflight seen across the same rolling window tok_s/qps are
+    /// computed over — answers "bursty in the last 5 min", which a single
+    /// current-inflight snapshot on a ~12-15s dashboard poll can miss
+    /// entirely between two short spikes. `None` until at least one sample
+    /// has landed (mirrors tok_s's own "warming up" convention).
+    peak_inflight_5m: Option<i32>,
     /// -1 = unknown/not yet scraped, mirrors `BackendHandle::queue_depth`'s own
     /// convention so this payload doesn't invent a second one.
     queue_depth: i32,
@@ -105,6 +122,8 @@ fn stats_for(h: &BackendHandle) -> BackendStats {
         healthy: h.is_healthy(),
         tok_s,
         qps,
+        inflight: h.inflight(),
+        peak_inflight_5m: h.peak_inflight_in_window(),
         queue_depth: h.queue_depth(),
     }
 }

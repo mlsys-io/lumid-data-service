@@ -80,6 +80,16 @@ struct ThroughputSample {
     /// / `requests_deferred` as point-in-time GAUGES but never a cumulative
     /// "requests finished" counter. vLLM's `request_success_total` fills this.
     requests_success: Option<u64>,
+    /// This PROCESS's own in-flight count at sample time (`inflight()`, not
+    /// scraped from the backend) — added alongside qps because qps answers
+    /// "how many requests FINISHED per second", which reads as contradictory
+    /// next to a healthy tok/s when requests are individually slow (few
+    /// completions, but each one streaming tokens the whole time it runs).
+    /// inflight answers the question operators actually asked when they saw
+    /// that: "how many are running AT ONCE, and was there a burst" — and
+    /// unlike qps, it's measurable for every backend dialect (gateway-side
+    /// counter, not a backend-exposed metric), including llama.cpp.
+    inflight: i32,
 }
 
 impl BackendHandle {
@@ -113,11 +123,23 @@ impl BackendHandle {
             at: now,
             generation_tokens,
             requests_success,
+            inflight: self.inflight(),
         });
         let window = std::time::Duration::from_secs(THROUGHPUT_WINDOW_S);
         while buf.len() > 1 && now.duration_since(buf.front().unwrap().at) > window {
             buf.pop_front();
         }
+    }
+
+    /// Highest in-flight count observed across the same rolling window
+    /// `throughput_rates()` reads — "was there a burst in the last 5 minutes",
+    /// distinct from `inflight()`'s instantaneous right-now snapshot, which a
+    /// ~12-15s dashboard poll cadence can easily land between two short spikes
+    /// and miss entirely. `None` when no samples exist yet (mirrors
+    /// `throughput_rates`'s own "warming up" convention).
+    pub fn peak_inflight_in_window(&self) -> Option<i32> {
+        let buf = self.throughput_samples.lock().ok()?;
+        buf.iter().map(|s| s.inflight).max()
     }
 
     /// Compute (tok/s, qps) from the oldest vs newest sample still in the
@@ -1261,6 +1283,41 @@ llamacpp:requests_deferred 0
         assert!(
             h.throughput_rates().is_none(),
             "a backwards counter delta must not be reported as a negative rate"
+        );
+    }
+
+    #[test]
+    fn peak_inflight_is_none_before_any_sample() {
+        let h = BackendHandle::new("http://x".into(), 8, 1, 0);
+        assert!(
+            h.peak_inflight_in_window().is_none(),
+            "no samples yet — must read as warming up, not a 0 burst"
+        );
+    }
+
+    #[test]
+    fn peak_inflight_survives_after_the_burst_ends() {
+        // The regression this pins: a single current-inflight snapshot on a
+        // ~12-15s dashboard poll can land AFTER a short burst has already
+        // drained, and would then report 0 -- exactly the "how do I see a
+        // burst that already happened" gap an operator hit. peak_inflight
+        // must remember the high-water mark for the rest of the window even
+        // once inflight has dropped back down.
+        let h = Arc::new(BackendHandle::new("http://x".into(), 8, 1, 0));
+        let g1 = h.acquire();
+        let g2 = h.acquire();
+        let g3 = h.acquire();
+        assert_eq!(h.inflight(), 3);
+        h.push_throughput_sample(100, Some(1)); // samples inflight=3 at push time
+        drop(g1);
+        drop(g2);
+        drop(g3);
+        assert_eq!(h.inflight(), 0, "burst has drained");
+        h.push_throughput_sample(150, Some(2)); // samples inflight=0
+        assert_eq!(
+            h.peak_inflight_in_window(),
+            Some(3),
+            "the 3-deep burst must still be visible as the window's peak"
         );
     }
 }
