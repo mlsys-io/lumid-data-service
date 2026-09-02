@@ -97,6 +97,48 @@ fn default_str(p: &ParamSpec) -> Option<String> {
     })
 }
 
+/// Reject a numeric parameter outside its declared `min`/`max` with 422.
+///
+/// THIS USED TO CLAMP, SILENTLY. `n.max(min).min(max)` rewrote the request and
+/// answered 200: `limit=5000` against a `max = 200` endpoint returned 200 rows
+/// with nothing anywhere saying the request had been reinterpreted, so a caller
+/// reading a window in pages could not tell an incomplete window from a
+/// complete one — and `limit=-1` / `limit=0` came back as one row rather than
+/// as errors (LUMID-010).
+///
+/// BREAKING BY INTENT, and it has to be. Silent coercion cannot be made safe by
+/// documenting it: the client is never told it happened, so every consumer has
+/// to already know the cap to avoid being misled. Refusing is the only
+/// behaviour a caller can detect.
+///
+/// Applies to EVERY declarative read spec, not just news.latest. Verified
+/// before the flip: of 231 params across 90 endpoints, zero declare a `default`
+/// outside their own range — so no endpoint 422s its own default.
+fn range_check(p: &ParamSpec, v: f64, raw: &str) -> Result<(), ApiError> {
+    let below = p.min.is_some_and(|mn| v < mn);
+    let above = p.max.is_some_and(|mx| v > mx);
+    if !below && !above {
+        return Ok(());
+    }
+    let bounds = match (p.min, p.max) {
+        (Some(mn), Some(mx)) => format!("expected {mn} <= {} <= {mx}", p.name),
+        (Some(mn), None) => format!("expected {} >= {mn}", p.name),
+        (None, Some(mx)) => format!("expected {} <= {mx}", p.name),
+        (None, None) => unreachable!("range_check only fails when a bound exists"),
+    };
+    // The payload is the `detail` VALUE, not a `{detail: ...}` wrapper:
+    // `IntoResponse` already renders `Validation(v)` as `{"detail": v}`, so
+    // wrapping here would nest it twice. Shape matches FastAPI's 422 body, which
+    // is what the Python services this mirrors emit.
+    Err(ApiError::Validation(serde_json::json!([{
+        "loc": ["query", p.name],
+        "msg": format!("value out of range: {bounds}, got {raw}"),
+        "type": "value_error.number.not_in_range",
+        "input": raw,
+        "ctx": {"min": p.min, "max": p.max},
+    }])))
+}
+
 fn coerce(p: &ParamSpec, raw: &str) -> Result<BindValue, ApiError> {
     let bad = |m: String| ApiError::BadRequest(m);
     match p.ty.as_str() {
@@ -120,15 +162,13 @@ fn coerce(p: &ParamSpec, raw: &str) -> Result<BindValue, ApiError> {
             Ok(BindValue::Text(s))
         }
         "int" => {
-            let mut n: i64 = raw.trim().parse().map_err(|_| bad(format!("'{}' must be an integer", p.name)))?;
-            if let Some(mn) = p.min { n = n.max(mn as i64); }
-            if let Some(mx) = p.max { n = n.min(mx as i64); }
+            let n: i64 = raw.trim().parse().map_err(|_| bad(format!("'{}' must be an integer", p.name)))?;
+            range_check(p, n as f64, raw)?;
             Ok(BindValue::Int(n))
         }
         "float" => {
-            let mut f: f64 = raw.trim().parse().map_err(|_| bad(format!("'{}' must be a number", p.name)))?;
-            if let Some(mn) = p.min { if f < mn { f = mn; } }
-            if let Some(mx) = p.max { if f > mx { f = mx; } }
+            let f: f64 = raw.trim().parse().map_err(|_| bad(format!("'{}' must be a number", p.name)))?;
+            range_check(p, f, raw)?;
             Ok(BindValue::Float(f))
         }
         "date" => {

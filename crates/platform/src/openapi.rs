@@ -9,7 +9,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::{json, Map, Value};
 
-use crate::read::spec::{EndpointSpec, Kind};
+use crate::read::spec::{EndpointSpec, Kind, Shape};
 use crate::state::AppState;
 
 fn json_type(ty: &str) -> &'static str {
@@ -44,12 +44,19 @@ fn add_op(
     desc: &str,
     request_body: Option<Value>,
 ) {
+    // `/health` is the one unauthenticated route, so it is the one route that
+    // cannot answer 401/403. Everything else shares the gated error contract.
+    let mut responses = error_responses(path != "/health");
+    responses.insert(
+        "200".into(),
+        json!({"description": "OK", "content": {"application/json": {"schema": {"type": "object"}}}}),
+    );
     let mut op = json!({
         "summary": summary,
         "operationId": format!("{}_{}", method, path.replace(['/', '{', '}'], "_").trim_matches('_')),
         "description": desc,
         "parameters": params,
-        "responses": {"200": {"description": "OK"}},
+        "responses": Value::Object(responses),
     });
     if let Some(rb) = request_body {
         if let Some(o) = op.as_object_mut() {
@@ -62,6 +69,231 @@ fn add_op(
     }
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Response contracts (LUMID-011)
+//
+// Every operation used to declare exactly `{"200": {"description": "OK"}}` and
+// no content schema — 172 operations, one status code, zero response bodies —
+// while the service really returned structured 400/401/404/422/429/500. A
+// generated client could not validate a success payload or tell a validation
+// failure from an outage.
+//
+// Success bodies are derived from the SPEC ITSELF rather than hand-maintained:
+// a declarative endpoint's output columns are exactly its SQL SELECT list, so
+// that list is the contract. Deriving it means the document cannot drift from
+// the query the way a hand-written schema does.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Columns hidden from every response when `strip_lineage` is set. Kept in
+/// sync with `db::lineage::HIDDEN_COLUMNS` — declaring a column the caller
+/// never receives is worse than declaring nothing.
+const LINEAGE_HIDDEN: [&str; 4] = ["source", "source_endpoint", "source_run_id", "raw"];
+
+/// Split a SELECT list on commas that sit at paren depth 0.
+fn split_top_level(list: &str) -> Vec<String> {
+    let (mut out, mut depth, mut cur) = (Vec::new(), 0i32, String::new());
+    for ch in list.chars() {
+        match ch {
+            '(' => { depth += 1; cur.push(ch); }
+            ')' => { depth -= 1; cur.push(ch); }
+            ',' if depth == 0 => { out.push(cur.trim().to_string()); cur = String::new(); }
+            _ => cur.push(ch),
+        }
+    }
+    if !cur.trim().is_empty() { out.push(cur.trim().to_string()); }
+    out
+}
+
+/// The JSON type of a select item, ONLY when the SQL states it outright.
+///
+/// Deliberately conservative: an explicit `::float8` or a `count(...)` is a
+/// fact, but `max(x)` depends on a column this function cannot see. An omitted
+/// `type` is an honest "any JSON value"; a guessed one is a lie a client will
+/// validate against.
+fn column_type(expr: &str) -> Option<&'static str> {
+    let e = expr.to_lowercase();
+    if e.contains("::float8") || e.contains("::double precision") || e.contains("::numeric")
+        || e.contains("::real") || e.contains("::float") {
+        return Some("number");
+    }
+    if e.contains("::bigint") || e.contains("::int") || e.contains("::smallint") {
+        return Some("integer");
+    }
+    if e.contains("::text") || e.contains("::varchar") { return Some("string"); }
+    if e.contains("::bool") { return Some("boolean"); }
+    if e.trim_start().starts_with("count(") { return Some("integer"); }
+    None
+}
+
+/// Output name of one select item: its `AS` alias, else the trailing
+/// identifier of a bare column reference. Returns None for an unaliased
+/// expression, whose response key cannot be known from the SQL alone.
+fn column_name(expr: &str) -> Option<String> {
+    let lower = expr.to_lowercase();
+    // Find " as " at depth 0, taking the LAST one (aliases end the item).
+    let (mut depth, mut as_at) = (0i32, None);
+    let bytes: Vec<char> = lower.chars().collect();
+    for (i, ch) in bytes.iter().enumerate() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {
+                if depth == 0 && i + 4 <= bytes.len() && lower[i..].starts_with(" as ") {
+                    as_at = Some(i + 4);
+                }
+            }
+        }
+    }
+    let raw = match as_at {
+        Some(i) => expr[i..].trim().to_string(),
+        None => {
+            // Bare reference like `news.articles.published_at` or `published_at`.
+            let t = expr.trim();
+            if t.contains(['(', ' ', '*']) { return None; }
+            t.rsplit('.').next().unwrap_or(t).to_string()
+        }
+    };
+    let name = raw.trim().trim_matches('"').to_string();
+    let ok = !name.is_empty()
+        && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    ok.then_some(name)
+}
+
+/// Properties object for one row of a spec's result set.
+fn row_properties(spec: &EndpointSpec) -> (Map<String, Value>, bool) {
+    let sql = &spec.sql;
+    let lower = sql.to_lowercase();
+    let Some(sel) = lower.find("select") else { return (Map::new(), false) };
+    let after = sel + "select".len();
+    // Matching FROM at depth 0.
+    let (mut depth, mut from_at) = (0i32, None);
+    for (i, ch) in lower[after..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {
+                if depth == 0 && lower[after + i..].starts_with("from ") && from_at.is_none() {
+                    from_at = Some(after + i);
+                }
+            }
+        }
+        if from_at.is_some() { break; }
+    }
+    let Some(end) = from_at else { return (Map::new(), false) };
+    let mut props = Map::new();
+    let mut complete = true;
+    for item in split_top_level(&sql[after..end]) {
+        if item.trim() == "*" { return (Map::new(), false); } // shape unknowable
+        match column_name(&item) {
+            Some(n) => {
+                if spec.strip_lineage && LINEAGE_HIDDEN.contains(&n.as_str()) { continue; }
+                let mut schema = Map::new();
+                if let Some(t) = column_type(&item) {
+                    schema.insert("type".into(), json!(t));
+                }
+                props.insert(n, Value::Object(schema));
+            }
+            None => complete = false,
+        }
+    }
+    (props, complete)
+}
+
+/// The 200 response for a declarative spec, shaped by its `shape`.
+fn success_response(spec: &EndpointSpec) -> Value {
+    let (props, complete) = row_properties(spec);
+    let row = if props.is_empty() {
+        json!({"type": "object"})
+    } else {
+        // `additionalProperties` stays true when a select item's name could not
+        // be derived — the row genuinely has more keys than are listed, and
+        // claiming otherwise would make a valid response fail validation.
+        json!({"type": "object", "properties": props, "additionalProperties": !complete})
+    };
+    let schema = match spec.shape {
+        Shape::One => row,
+        Shape::Rows => json!({"type": "array", "items": row}),
+        Shape::Envelope => {
+            let key = spec.envelope_key.clone().unwrap_or_else(|| "data".to_string());
+            json!({
+                "type": "object",
+                "properties": { key: {"type": "array", "items": row} },
+            })
+        }
+    };
+    json!({"description": "OK", "content": {"application/json": {"schema": schema}}})
+}
+
+/// Error responses every gated read operation can actually return.
+pub fn error_responses(auth: bool) -> Map<String, Value> {
+    let err = |d: &str| json!({
+        "description": d,
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+    });
+    let mut m = Map::new();
+    m.insert("400".into(), err("Malformed parameter (wrong type, too long, unparseable)."));
+    if auth {
+        m.insert("401".into(), err("Missing or invalid bearer identity."));
+        m.insert("403".into(), err("Authenticated but not permitted to read this resource."));
+    }
+    m.insert("404".into(), err("No such route, or no such resource."));
+    m.insert("422".into(), json!({
+        "description": "Parameter failed validation — e.g. outside its declared minimum/maximum.",
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ValidationError"}}}
+    }));
+    m.insert("429".into(), json!({
+        "description": "Rate limited. Carries Retry-After and X-RateLimit-Limit.",
+        "headers": {
+            "Retry-After": {"schema": {"type": "integer"}, "description": "Seconds to wait."},
+            "X-RateLimit-Limit": {"schema": {"type": "string"}, "description": "The limit that was hit."}
+        },
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}
+    }));
+    m.insert("500".into(), json!({
+        "description": "Internal error. The body carries a request_id echoed by the x-request-id header; quote it in a bug report.",
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/InternalError"}}}
+    }));
+    m.insert("503".into(), err("Upstream or database unavailable."));
+    m
+}
+
+/// Shared error schemas.
+pub fn error_schemas() -> Value {
+    json!({
+        "Error": {
+            "type": "object",
+            "required": ["detail"],
+            "properties": {"detail": {"type": "string", "description": "Human-readable cause."}}
+        },
+        "InternalError": {
+            "type": "object",
+            "required": ["detail"],
+            "properties": {
+                "detail": {"type": "string"},
+                "request_id": {"type": "string", "format": "uuid",
+                    "description": "Correlates with the server-side log line and the x-request-id header."}
+            }
+        },
+        "ValidationError": {
+            "type": "object",
+            "required": ["detail"],
+            "properties": {"detail": {"type": "array", "items": {
+                "type": "object",
+                "properties": {
+                    "loc": {"type": "array", "items": {"type": "string"},
+                        "description": "Where the bad value was, e.g. [\"query\",\"limit\"]."},
+                    "msg": {"type": "string"},
+                    "type": {"type": "string"},
+                    "input": {"type": "string"},
+                    "ctx": {"type": "object", "description": "Declared bounds, when the failure was a range check."}
+                }
+            }}}
+        }
+    })
+}
+
 fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
     let mut paths = Map::new();
     for s in specs {
@@ -69,20 +301,38 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
             .params
             .iter()
             .map(|p| {
+                // Constraints were declared in the spec all along and simply
+                // never reached the document, so a generated client could not
+                // know that `limit` tops out at 200 (LUMID-011).
+                let mut sch = Map::new();
+                sch.insert("type".into(), json!(json_type(&p.ty)));
+                if let Some(mn) = p.min { sch.insert("minimum".into(), json!(mn)); }
+                if let Some(mx) = p.max { sch.insert("maximum".into(), json!(mx)); }
+                if let Some(ml) = p.max_len { sch.insert("maxLength".into(), json!(ml)); }
+                if let Some(d) = &p.default {
+                    if let Ok(v) = serde_json::to_value(d) { sch.insert("default".into(), v); }
+                }
+                if !p.select.is_empty() {
+                    let mut vals: Vec<String> = p.select.keys().cloned().collect();
+                    vals.sort();
+                    sch.insert("enum".into(), json!(vals));
+                }
                 json!({
                     "name": p.name,
                     "in": if p.kind == Kind::Path { "path" } else { "query" },
                     "required": p.required || p.kind == Kind::Path,
-                    "schema": {"type": json_type(&p.ty)},
+                    "schema": Value::Object(sch),
                 })
             })
             .collect();
+        let mut responses = error_responses(true);
+        responses.insert("200".into(), success_response(s));
         let op = json!({
             "summary": s.id,
             "operationId": s.id.replace('.', "_"),
             "description": if s.description.is_empty() { s.id.clone() } else { s.description.clone() },
             "parameters": params,
-            "responses": {"200": {"description": "OK"}},
+            "responses": Value::Object(responses),
         });
         paths.insert(oapi_path(&s.path), json!({ s.method.to_lowercase(): op }));
     }
@@ -235,7 +485,10 @@ fn generate(specs: &[Arc<EndpointSpec>], extra_paths: &Value) -> Value {
                 unmodified.",
         },
         "servers": [{"url": "/"}],
-        "components": {"securitySchemes": {"bearer": {"type": "http", "scheme": "bearer"}}},
+        "components": {
+            "securitySchemes": {"bearer": {"type": "http", "scheme": "bearer"}},
+            "schemas": error_schemas(),
+        },
         "security": [{"bearer": []}],
         "paths": paths,
     })
