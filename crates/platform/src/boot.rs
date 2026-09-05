@@ -136,6 +136,13 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     validate_settings(&settings)?;
     let bind_addr = settings.bind_addr.clone();
     let pool = db::build_pool(&settings)?;
+    // Optional secondary pool for xpio/mailbox when that schema lives in a
+    // separate Postgres instance (findata: warehouse in the main pool, LQT
+    // mailbox + xpio.* in the LQT data DB). None ⇒ handlers use the main pool.
+    let xpio_pool = db::build_xpio_pool(&settings)?;
+    if xpio_pool.is_some() {
+        tracing::info!("xpio: dedicated secondary DB pool active (LUMID_XPIO_DB_HOST set)");
+    }
     let lumid = Arc::new(auth::lumid::LumidClient::new(&settings));
     let local_keys = Arc::new(auth::parse_local_keys(&settings.api_keys_raw));
     let rate = Arc::new(auth::ratelimit::RateLimiter::new(
@@ -318,7 +325,7 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     }
 
     let state = state::AppState {
-        pool, settings, lumid, local_keys, rate, concurrency, redis, redis_client, hub, http,
+        pool, xpio_pool, settings, lumid, local_keys, rate, concurrency, redis, redis_client, hub, http,
         http_stream, llm_pool, read_cache, blob_store, backends, feed_liveness, card_store,
         federation, shadow_cache,
     };
