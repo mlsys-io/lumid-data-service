@@ -15,12 +15,16 @@ use tokio_postgres::types::ToSql;
 use crate::db::rows::rows_to_objects;
 use crate::error::{ApiError, ApiResult};
 
-/// Returns true when a `tokio_postgres::Error` is an `UndefinedTable` (42P01),
-/// which happens when `_timescaledb_catalog.hypertable` doesn't exist (vanilla PG).
-fn is_undefined_table(e: &tokio_postgres::Error) -> bool {
+/// Returns true when a `tokio_postgres::Error` says the server has no
+/// TimescaleDB: `UndefinedTable` (42P01) for `_timescaledb_catalog.hypertable`,
+/// or `UndefinedFunction` (42883) for `approximate_row_count`/`hypertable_size`.
+/// Either way the caller retries the vanilla-Postgres variant of the query.
+fn is_missing_timescale(e: &tokio_postgres::Error) -> bool {
     use tokio_postgres::error::SqlState;
     e.as_db_error()
-        .map(|db| *db.code() == SqlState::UNDEFINED_TABLE)
+        .map(|db| {
+            *db.code() == SqlState::UNDEFINED_TABLE || *db.code() == SqlState::UNDEFINED_FUNCTION
+        })
         .unwrap_or(false)
 }
 
@@ -92,9 +96,49 @@ fn ident_ok(s: &str) -> bool {
 
 // --------------------------------------------------------------------- core
 
+// SIZING AND COUNTING ON A TIMESCALEDB WAREHOUSE
+//
+// `pg_class.reltuples` and `pg_total_relation_size(c.oid)` read the hypertable
+// PARENT, which stores nothing: every row lives in a child chunk, and chunks
+// older than the compression policy report `reltuples = 0` themselves. So the
+// parent answers 0 rows / ~32 kB for a table holding tens of millions of rows.
+// Measured on findata 2026-09-09: `news.articles` read 0 rows / 90 kB against a
+// real 20.8 M rows / 71 GB, and `market.ohlc_1min` 0 against 6.28 BILLION rows.
+// 50 of the 62 zero-row tables on that warehouse were this artifact, not empty
+// tables. Summing chunk `reltuples` does not fix it either — the compressed
+// chunks are exactly the ones that report 0.
+//
+// So use TimescaleDB's own accessors, which walk the chunk catalogue and add
+// `compression_chunk_size.numrows_post_compression`:
+//   • `approximate_row_count(c.oid)` — also correct for a plain table (it just
+//     reads reltuples), so it needs no CASE on is_hypertable.
+//   • `hypertable_size(c.oid)`       — NULL for a non-hypertable, hence the
+//     COALESCE onto `pg_total_relation_size`.
+// Both are safe on matviews. Cost over this warehouse (176 tables, 13 schemas):
+// approximate_row_count ~100 ms warm, hypertable_size ~530 ms warm. The size
+// walk is the expensive half and is the price of not printing 71 GB as 90 kB.
+//
+// Each query below keeps its `_plain` variant for a server without the
+// extension, selected by `is_missing_timescale` on the first error. Only the
+// `_ts` variant gains the functions — the `_plain` bodies below are byte
+// identical to the `_ts` ones before this change, so do not "deduplicate" them.
+
 /// Per-schema stats: table count, total estimated rows, size on disk.
 pub async fn list_schemas(pool: &Pool, effective: &[String]) -> ApiResult<Vec<Map<String, Value>>> {
-    let sql = "
+    let sql_ts = "
+    SELECT n.nspname AS schema,
+           count(*) FILTER (WHERE c.relkind = 'r')  AS tables,
+           count(*) FILTER (WHERE c.relkind = 'v')  AS views,
+           count(*) FILTER (WHERE c.relkind = 'm')  AS materialized_views,
+           coalesce(sum(approximate_row_count(c.oid)) FILTER (WHERE c.relkind = 'r'), 0)::bigint AS est_rows,
+           coalesce(sum(coalesce(hypertable_size(c.oid), pg_total_relation_size(c.oid)))
+                    FILTER (WHERE c.relkind IN ('r','m')), 0)::bigint AS size_bytes
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = ANY($1)
+     GROUP BY n.nspname
+     ORDER BY n.nspname";
+    let sql_plain = "
     SELECT n.nspname AS schema,
            count(*) FILTER (WHERE c.relkind = 'r')  AS tables,
            count(*) FILTER (WHERE c.relkind = 'v')  AS views,
@@ -108,7 +152,11 @@ pub async fn list_schemas(pool: &Pool, effective: &[String]) -> ApiResult<Vec<Ma
      ORDER BY n.nspname";
     let schemas: Vec<String> = effective.to_vec();
     let client = pool.get().await?;
-    let rows = client.query(sql, &[&schemas]).await?;
+    let rows = match client.query(sql_ts, &[&schemas]).await {
+        Ok(r) => r,
+        Err(ref e) if is_missing_timescale(e) => client.query(sql_plain, &[&schemas]).await?,
+        Err(e) => return Err(e.into()),
+    };
     Ok(rows_to_objects(&rows))
 }
 
@@ -116,8 +164,8 @@ pub async fn list_schemas(pool: &Pool, effective: &[String]) -> ApiResult<Vec<Ma
 pub async fn list_tables(pool: &Pool, schema: &str) -> ApiResult<Vec<Map<String, Value>>> {
     let sql_ts = "
     SELECT c.relname AS table,
-           c.reltuples::bigint AS est_rows,
-           pg_total_relation_size(c.oid)::bigint AS size_bytes,
+           approximate_row_count(c.oid)::bigint AS est_rows,
+           coalesce(hypertable_size(c.oid), pg_total_relation_size(c.oid))::bigint AS size_bytes,
            EXISTS (
                SELECT 1 FROM _timescaledb_catalog.hypertable h
                 WHERE h.schema_name = n.nspname AND h.table_name = c.relname
@@ -144,7 +192,7 @@ pub async fn list_tables(pool: &Pool, schema: &str) -> ApiResult<Vec<Map<String,
     let client = pool.get().await?;
     let rows = match client.query(sql_ts, &[&schema]).await {
         Ok(r) => r,
-        Err(ref e) if is_undefined_table(e) => client.query(sql_plain, &[&schema]).await?,
+        Err(ref e) if is_missing_timescale(e) => client.query(sql_plain, &[&schema]).await?,
         Err(e) => return Err(e.into()),
     };
     Ok(rows_to_objects(&rows))
@@ -360,8 +408,8 @@ pub async fn table_profile(
     // Table meta — also tells us whether the relation exists at all.
     // Two SQL variants: TimescaleDB-aware (with hypertable check) and plain fallback.
     let meta_ts = "
-    SELECT pg_total_relation_size(c.oid)::bigint AS size_bytes,
-           c.reltuples::bigint                   AS est_rows,
+    SELECT coalesce(hypertable_size(c.oid), pg_total_relation_size(c.oid))::bigint AS size_bytes,
+           approximate_row_count(c.oid)::bigint  AS est_rows,
            obj_description(c.oid, 'pg_class')    AS comment,
            EXISTS (
               SELECT 1 FROM _timescaledb_catalog.hypertable h
@@ -380,7 +428,7 @@ pub async fn table_profile(
      WHERE n.nspname = $1 AND c.relname = $2";
     let meta = match client.query_opt(meta_ts, &[&schema, &table]).await {
         Ok(r) => r,
-        Err(ref e) if is_undefined_table(e) => {
+        Err(ref e) if is_missing_timescale(e) => {
             client.query_opt(meta_plain, &[&schema, &table]).await?
         }
         Err(e) => return Err(e.into()),
