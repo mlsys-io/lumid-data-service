@@ -20,6 +20,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/chat/completions", post(handlers::llm::chat_completions))
         .route("/v1/completions", post(handlers::llm::completions))
         .route("/v1/embeddings", post(handlers::llm::embeddings))
+        .route("/v1/images/generations", post(handlers::llm::images_generations))
+        .route("/v1/audio/speech", post(handlers::llm::audio_speech))
         .route("/v1/messages", post(handlers::llm::messages))
         .route("/v1/messages/count_tokens", post(handlers::llm::count_tokens))
 }
@@ -89,6 +91,16 @@ pub fn openapi_paths() -> serde_json::Value {
             "description": "Requires an embedding model in the roster; 503 when none is configured.",
             "tags": ["llm"], "security": bearer,
             "responses": { "200": { "description": "Embedding vectors" }, "503": unavailable }
+        } },
+        "/v1/images/generations": { "post": {
+            "summary": "Image generation (OpenAI-compatible) - on-prem ComfyUI",
+            "tags": ["llm"], "security": bearer,
+            "responses": { "200": { "description": "{data:[{b64_json}]}" }, "503": unavailable }
+        } },
+        "/v1/audio/speech": { "post": {
+            "summary": "Text to speech (OpenAI-compatible) - on-prem CosyVoice2; returns BINARY audio",
+            "tags": ["llm"], "security": bearer,
+            "responses": { "200": { "description": "audio/mpeg or audio/wav bytes" }, "503": unavailable }
         } },
         "/v1/messages": { "post": {
             "summary": "Anthropic-compatible messages",

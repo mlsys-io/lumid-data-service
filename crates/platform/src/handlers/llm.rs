@@ -1090,6 +1090,92 @@ async fn dispatch_stream(
     }
 }
 
+/// Dispatch a `/v1/*` request whose RESPONSE IS BINARY (audio), not JSON.
+///
+/// `dispatch_json` cannot be reused here: `proxy_json` ends in
+/// `serde_json::from_slice::<Value>(&bytes)` and, when that fails, replaces the
+/// body with `{"error":"non-json upstream response","raw": <1 KiB lossy>}`.
+/// For `/v1/audio/speech` — which returns mp3/wav bytes — that would mangle
+/// every successful response into a truncated error object.
+///
+/// No OpenRouter arm: the two media models are on-prem only, and silently
+/// metering a binary endpoint is exactly the failure the allowlist exists to
+/// prevent. Unresolvable models still 503 through `resolve()`.
+async fn dispatch_bytes(
+    st: &AppState,
+    ident: Option<Extension<Identity>>,
+    path: &str,
+    body: &Value,
+) -> Response {
+    match resolve(st, model_of(body).as_deref(), &caller_label(&ident), &caller_role(&ident)) {
+        Err(e) => e.into_response(),
+        Ok(None) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "detail": "no local backend for this model; binary endpoints are never forwarded upstream" })),
+        )
+            .into_response(),
+        Ok(Some(backends)) => proxy_bytes(st, &backends, path, body).await,
+    }
+}
+
+/// Least-inflight proxy that passes the upstream body through UNTOUCHED and
+/// preserves its `content-type`. Mirrors `proxy_json`'s backend loop and
+/// circuit-breaker bookkeeping.
+async fn proxy_bytes(
+    st: &AppState,
+    backends: &[std::sync::Arc<crate::llm_pool::BackendHandle>],
+    path: &str,
+    body: &Value,
+) -> Response {
+    let mut last_err: Option<Response> = None;
+    for handle in backends {
+        let _guard = handle.acquire();
+        let url = format!("{}{path}", handle.url);
+        let req = add_auth(st, st.http.post(&url).json(body));
+        let upstream = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                handle.on_connect_err();
+                tracing::warn!("llm POST {path} → {} connect failed: {e}", handle.url);
+                last_err = Some((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "detail": "upstream media backend unreachable" })),
+                )
+                    .into_response());
+                continue;
+            }
+        };
+        handle.on_connect_ok();
+        let ax_status =
+            StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let ctype = upstream
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        return match upstream.bytes().await {
+            // axum IntoResponse tuple order is (status, headers, body).
+            Ok(b) => (ax_status, [(axum::http::header::CONTENT_TYPE, ctype)], b).into_response(),
+            Err(e) => {
+                tracing::warn!("llm reading bytes from {}: {e}", handle.url);
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "detail": "upstream media body truncated" })),
+                )
+                    .into_response()
+            }
+        };
+    }
+    last_err.unwrap_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "detail": "no media backend answered" })),
+        )
+            .into_response()
+    })
+}
+
 // ─────────────────────────────────────────── route handlers
 
 /// GET /v1/models — federated: forward to the peer verbatim. Local: aggregate
@@ -1276,6 +1362,42 @@ pub async fn embeddings(
         Err(e) => return e.into_response(),
     };
     dispatch_json(&st, ident, reqwest::Method::POST, "/v1/embeddings", &body).await
+}
+
+/// POST /v1/images/generations — model-routed to the ComfyUI shim (`qwen-image`).
+///
+/// JSON in, JSON out (`{data:[{b64_json}]}`), so the ordinary JSON path works.
+/// Restored 2026-09-15: this route never existed in the platform, so adding the
+/// backend to LUMID_LLM_BACKENDS alone produced a 404 — a ROUTE gap, the mirror
+/// image of the embeddings case, where the route was always mounted and only the
+/// backend was missing.
+pub async fn images_generations(
+    ident: Option<Extension<Identity>>,
+    State(st): State<AppState>,
+    body: Json<Value>,
+) -> Response {
+    let body = match require_object(body.0) {
+        Ok(b) => apply_default_model(&st, b),
+        Err(e) => return e.into_response(),
+    };
+    dispatch_json(&st, ident, reqwest::Method::POST, "/v1/images/generations", &body).await
+}
+
+/// POST /v1/audio/speech — model-routed to the CosyVoice2 shim (`qwen-tts`).
+///
+/// Uses `dispatch_bytes`, NOT `dispatch_json`: the response is mp3/wav, and the
+/// JSON path would turn every success into `{"error":"non-json upstream
+/// response"}`. See `dispatch_bytes`.
+pub async fn audio_speech(
+    ident: Option<Extension<Identity>>,
+    State(st): State<AppState>,
+    body: Json<Value>,
+) -> Response {
+    let body = match require_object(body.0) {
+        Ok(b) => apply_default_model(&st, b),
+        Err(e) => return e.into_response(),
+    };
+    dispatch_bytes(&st, ident, "/v1/audio/speech", &body).await
 }
 
 // -------------------------------------------------------------- Anthropic
