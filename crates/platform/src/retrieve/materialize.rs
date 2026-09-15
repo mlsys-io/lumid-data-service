@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use object_store::path::Path as ObjPath;
-use object_store::{Attribute, Attributes, ObjectStore, PutOptions};
+use object_store::{Attribute, Attributes, ObjectStore};
 
 use crate::error::{ApiError, ApiResult};
 
@@ -161,10 +161,11 @@ pub async fn write_to_store(
 ) -> ApiResult<(String, usize)> {
     let path = ObjPath::from(key);
     let size = bytes.len();
-    let payload = object_store::PutPayload::from(bytes::Bytes::from(bytes));
     let attrs = Attributes::from_iter([(Attribute::ContentType, content_type.to_string())]);
-    store
-        .put_opts(&path, payload, PutOptions::from(attrs))
+    // Attributes are best-effort; the write is not. A local store cannot keep
+    // them and answers NotImplemented, which used to fail EVERY /retrieve.
+    // See crate::objstore.
+    crate::objstore::put_with_optional_attrs(store, &path, bytes::Bytes::from(bytes), attrs)
         .await
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("object store write failed: {e}")))?;
     let uri = format!("/blobs/{key}");

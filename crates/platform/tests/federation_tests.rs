@@ -292,6 +292,8 @@ fn app_state_shadow(peer_base: Option<&str>) -> AppState {
 
     AppState {
         pool,
+        // No secondary xpio pool in tests — `xpio()` falls back to `pool`.
+        xpio_pool: None,
         settings,
         lumid,
         local_keys,

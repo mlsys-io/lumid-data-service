@@ -13,6 +13,11 @@ use crate::retrieve::card_store::CardStore;
 #[derive(Clone)]
 pub struct AppState {
     pub pool: Pool,
+    /// Optional secondary pool for the `xpio.*` / `mailbox.*` schema when it
+    /// lives in a different Postgres instance than `pool` (see
+    /// `db::build_xpio_pool`). `None` ⇒ that schema is in the main DB; callers
+    /// must go through `xpio()`, which falls back to `pool`.
+    pub xpio_pool: Option<Pool>,
     pub settings: Arc<Settings>,
     pub lumid: Arc<LumidClient>,
     pub local_keys: Arc<HashMap<String, String>>,
@@ -53,4 +58,14 @@ pub struct AppState {
     /// `federation::shadow_forward` middleware. Only consulted in shadow mode
     /// (`read_federate` set); a no-op otherwise. Cheap to clone (moka is Arc-y).
     pub shadow_cache: Arc<crate::federation::ShadowCache>,
+}
+
+impl AppState {
+    /// Pool for `xpio.*` / `mailbox.*` access: the dedicated secondary pool when
+    /// one is configured, otherwise the main pool. Every xpio/mailbox handler
+    /// must acquire its connection through this rather than `pool` directly, so
+    /// a deployment whose xpio schema lives in a separate DB works unchanged.
+    pub fn xpio(&self) -> &Pool {
+        self.xpio_pool.as_ref().unwrap_or(&self.pool)
+    }
 }

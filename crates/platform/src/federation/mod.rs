@@ -237,6 +237,29 @@ fn is_local_only(path: &str) -> bool {
     LOCAL_ONLY_PREFIX.iter().any(|pfx| path.starts_with(pfx))
 }
 
+/// True for `GET /blobs/<retrieval_prefix>/…` — an object this shadow
+/// materialized ITSELF and therefore holds only in its own blob store.
+///
+/// A retrieval is a two-hop contract: `POST /retrieve` runs the SQL and
+/// materializes `<retrieval_prefix>/<run_id>/result.<ext>`, then the caller
+/// `GET`s the `materialized_uri` it was handed. On a shadow those hops split:
+/// the POST is not forwarded (writes stay local), so the blob is written HERE —
+/// but the GET is a read, so it went to the peer, which has never seen that
+/// run_id and correctly answers 404. Every retrieval a shadow produced was
+/// therefore unreadable, on a surface whose first hop returned a healthy 200.
+/// Verified on `/findata-cloud/` 2026-09-09: the file sat on the shadow's own
+/// disk while the shadow's own `GET` 404'd.
+///
+/// Scoped to the retrieval prefix on purpose — ordinary CAS blobs under
+/// `/blobs/` do live on the primary and must keep federating.
+fn is_local_retrieval_blob(path: &str, retrieval_prefix: &str) -> bool {
+    let pfx = retrieval_prefix.trim_matches('/');
+    if pfx.is_empty() {
+        return false;
+    }
+    path.starts_with(&format!("/blobs/{pfx}/"))
+}
+
 /// A memoized peer response for a forwarded `GET`: the parts needed to rebuild a
 /// `Response` on a cache hit. Only 200 responses are stored.
 #[derive(Clone)]
@@ -327,7 +350,7 @@ pub async fn shadow_forward(State(st): State<AppState>, req: Request, next: Next
     }
 
     let path = req.uri().path().to_string();
-    if is_local_only(&path) {
+    if is_local_only(&path) || is_local_retrieval_blob(&path, &st.settings.retrieval_prefix) {
         return next.run(req).await;
     }
     let query = req.uri().query().map(str::to_string);
@@ -437,6 +460,23 @@ mod tests {
         // A route that merely *contains* v1 but isn't the /v1 plane is forwarded.
         assert!(!is_local_only("/v1beta/whatever"));
         assert!(!is_local_only("/healthz"));
+    }
+
+    #[test]
+    fn shadow_serves_its_own_retrieval_blobs_locally() {
+        // The shadow materialized these itself (POST is never forwarded), so
+        // forwarding the GET asks a peer that has never seen the run_id.
+        assert!(is_local_retrieval_blob(
+            "/blobs/retrievals/078aaaef-d5fc-496a-9f4f-daa270ed4214/result.jsonl",
+            "retrievals"
+        ));
+        assert!(is_local_retrieval_blob("/blobs/custom-pfx/abc/result.csv", "custom-pfx"));
+        // Ordinary CAS blobs DO live on the primary — these must keep federating.
+        assert!(!is_local_retrieval_blob("/blobs/images/sha256=deadbeef", "retrievals"));
+        assert!(!is_local_retrieval_blob("/blobs/retrievalsX/a/result.jsonl", "retrievals"));
+        assert!(!is_local_retrieval_blob("/blobs/retrievals", "retrievals"));
+        // An unset prefix must not turn the whole blob plane local.
+        assert!(!is_local_retrieval_blob("/blobs/anything/x", ""));
     }
 
     #[tokio::test]

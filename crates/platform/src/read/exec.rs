@@ -63,7 +63,32 @@ async fn run_spec(
     for (k, v) in &raw_path {
         path.insert(k.to_string(), v.to_string());
     }
-    let query = parse_query(raw_q.0.as_deref());
+    let mut query = parse_query(raw_q.0.as_deref());
+
+    // Self-tenant scoping. The `tenant` bind is SERVER-SUPPLIED: we overwrite
+    // whatever the client sent with the authenticated caller's `sub`, so a
+    // crafted `?tenant=<someone-else>` cannot widen the read. Done BEFORE
+    // `bind::resolve` so the bind resolves normally from there on.
+    //
+    // An admin elevating via `admin_cross_tenant` is exempt: that path reads
+    // under the cross-tenant role deliberately, and forcing its own sub into
+    // the predicate would defeat the oversight it exists to provide.
+    if spec.self_tenant {
+        let sub = ident.as_ref().map(|Extension(i)| i.sub.as_str()).unwrap_or("");
+        let role = ident.as_ref().map(|Extension(i)| i.role.as_str()).unwrap_or("");
+        let elevating = admin_read_elevation(spec, &st.settings.admin_read_role, role).is_some();
+        if !elevating {
+            if sub.is_empty() {
+                // Previously this fell through and died on the unresolved bind
+                // as a 500. A caller with no subject cannot be scoped, so say so.
+                return ApiError::Forbidden(
+                    "this endpoint is self-tenant scoped and the caller has no subject".into(),
+                )
+                .into_response();
+            }
+            query.insert("tenant".to_string(), sub.to_string());
+        }
+    }
 
     let bound = match bind::resolve(spec, &path, &query) {
         Ok(b) => b,
@@ -313,6 +338,15 @@ pub async fn execute_to_value(
     path: HashMap<String, String>,
     query: HashMap<String, String>,
 ) -> ApiResult<Value> {
+    // No HTTP identity on the MCP tool path, so a self-tenant endpoint has no
+    // subject to scope by. Refuse explicitly instead of dying on the unresolved
+    // `:tenant` bind with an opaque 500.
+    if spec.self_tenant {
+        return Err(ApiError::Forbidden(
+            "self-tenant endpoints require an authenticated caller; not available on this path"
+                .into(),
+        ));
+    }
     let bound = bind::resolve(spec, &path, &query)?;
     let id_kv = id_echo(&path);
     // MCP tool path: no HTTP identity here, so never elevate — empty role runs

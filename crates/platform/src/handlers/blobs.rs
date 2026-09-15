@@ -28,7 +28,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use futures_util::TryStreamExt;
 use object_store::{
-    path::Path as ObjPath, Attribute, Attributes, Error as ObjError, PutOptions, PutPayload,
+    path::Path as ObjPath, Attribute, Attributes, Error as ObjError, PutPayload,
 };
 use serde::{Deserialize, Serialize};
 
@@ -403,15 +403,18 @@ pub async fn put_blob(
         .and_then(valid_content_type);
 
     let obj_path = ObjPath::from(key.as_str());
-    let payload = PutPayload::from(body);
+    let raw_body = bytes::Bytes::from(body);
+    let payload = PutPayload::from(raw_body.clone());
     let put_res = match declared_ct {
         Some(ct) => {
+            // NotImplemented-tolerant: a local store cannot hold attributes and
+            // would otherwise reject the upload entirely. See crate::objstore.
             let attrs = Attributes::from_iter([(Attribute::ContentType, ct)]);
-            st.blob_store
-                .put_opts(&obj_path, payload, PutOptions::from(attrs))
+            crate::objstore::put_with_optional_attrs(&st.blob_store, &obj_path, raw_body, attrs)
                 .await
+                .map(|_| ())
         }
-        None => st.blob_store.put(&obj_path, payload).await,
+        None => st.blob_store.put(&obj_path, payload).await.map(|_| ()),
     };
     put_res.map_err(|e| ApiError::Internal(anyhow::anyhow!("blob put: {e}")))?;
     Ok(Json(PutBlobResponse { key, size }))

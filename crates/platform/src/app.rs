@@ -52,7 +52,7 @@ pub fn build_router(
         .route("/catalog/lineage/row", get(handlers::catalog::get_lineage_row))
         .route("/catalog/sources", get(handlers::catalog::get_sources))
         .route("/catalog/submitters", get(handlers::catalog::get_submitters))
-        .route("/catalog/tables/:schema/:table/schema.json", get(handlers::ingest::get_table_schema_json))
+        .route("/catalog/tables/:schema/:table/schema.json", get(handlers::catalog::get_table_schema_json))
 
         // Ingress write plane is merged below with a bounded body limit.
 

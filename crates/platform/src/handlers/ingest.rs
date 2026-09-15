@@ -22,7 +22,7 @@ use crate::ingest::{acl, blob, webhook};
 use crate::ingest::lumilake::{self, LumilakeInfo};
 use crate::parsers::{self, Kind};
 use crate::state::AppState;
-use crate::validation::{self, Rejected};
+use crate::validation::Rejected;
 use crate::write::{introspect, run};
 
 /// Source-endpoint provenance constant pattern lives in core; the header/body
@@ -547,21 +547,6 @@ pub async fn post_webhook(
 
     webhook::stamp_used(st.pool.clone(), wh.webhook_id);
     Ok(Json(result.to_json()))
-}
-
-// ---------------------------------------------------------------------------
-// GET /catalog/tables/{schema}/{table}/schema.json
-// ---------------------------------------------------------------------------
-pub async fn get_table_schema_json(
-    State(st): State<AppState>,
-    Extension(_identity): Extension<Identity>,
-    Path((schema, table)): Path<(String, String)>,
-) -> ApiResult<Json<Value>> {
-    let client = st.pool.get().await?;
-    let meta = introspect::table_meta(&client, &schema, &table)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("unknown table: {schema}.{table}")))?;
-    Ok(Json(validation::schema_json_for(&schema, &table, &meta)))
 }
 
 // ---------------------------------------------------------------------------
