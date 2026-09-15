@@ -1,3 +1,15 @@
+//! NOTE ON SHIPPING CHANGES TO THIS FILE: the `lumid-llm` gateway is NOT built
+//! from this repo's `lqt-ingest-server` binary. That one uses
+//! `ServeParts::default()`, where `enable_llm` is FALSE, so the routes below are
+//! never mounted and every `/v1/*` path 404s while the backend pool still logs
+//! as healthy. The gateway is a thin app crate
+//! (`deploy_infra/k8s-lift/lumid-llm/app/`) that calls
+//! `serve(ServeParts { enable_llm: true, enable_agent: true, ..default })` with
+//! this platform as a PATH dependency, so the docker context must hold
+//! `lumid-data-service/` and `lumid-llm-app/` as siblings. Procedure:
+//! `deploy_infra/k8s-lift/lumid-llm/BUILD.md`. Building the wrong binary took
+//! the gateway down for ~3 minutes on 2026-09-15; the tell is the ABSENT log
+//! line `llm proxy enabled (/v1/*)`.
 //! LLM reverse-proxy **plugin**. Optional: an app opts in by merging `routes()`
 //! into its router (e.g. `my_ext::routes().merge(lumid_platform::llm::routes())`).
 //! Apps that don't serve an LLM (e.g. mint) simply omit it — no `/v1/*` surface.
