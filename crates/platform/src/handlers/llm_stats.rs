@@ -65,6 +65,15 @@ fn label_for(url: &str) -> String {
         "http://100.117.154.126:4001" => "s0-CPU-0".to_string(),
         "http://100.117.154.126:4003" => "s0-CPU-1".to_string(),
         "http://100.73.23.96:8080" => "luyao1".to_string(),
+        // Home-segment AMD Ryzen AI MAX+ 395 boxes (gfx1151), added as
+        // qwen3.8-27b tier=1 on 2026-09-15. They were ALREADY appearing on
+        // the panel before this - STATS_MODELS already carried qwen3.8-27b
+        // and the flat_map enumerates every backend registered for it - but
+        // fell through to the bare host:port fallback below, which is the
+        // self-describing degrade this map was designed to have. This only
+        // gives them operator-facing names.
+        "http://100.112.35.35:8080" => "gmk".to_string(),
+        "http://100.115.66.10:8080" => "n5-max".to_string(),
         other => other
             .rsplit_once("//")
             .map(|(_, host)| host.to_string())
@@ -163,6 +172,8 @@ mod tests {
         assert_eq!(label_for("http://100.117.154.126:4001"), "s0-CPU-0");
         assert_eq!(label_for("http://100.117.154.126:4003"), "s0-CPU-1");
         assert_eq!(label_for("http://100.73.23.96:8080"), "luyao1");
+        assert_eq!(label_for("http://100.112.35.35:8080"), "gmk");
+        assert_eq!(label_for("http://100.115.66.10:8080"), "n5-max");
     }
 
     #[test]
