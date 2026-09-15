@@ -22,6 +22,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/embeddings", post(handlers::llm::embeddings))
         .route("/v1/images/generations", post(handlers::llm::images_generations))
         .route("/v1/audio/speech", post(handlers::llm::audio_speech))
+        .route("/v1/audio/transcriptions", post(handlers::llm::audio_transcriptions))
         .route("/v1/messages", post(handlers::llm::messages))
         .route("/v1/messages/count_tokens", post(handlers::llm::count_tokens))
 }
@@ -98,9 +99,21 @@ pub fn openapi_paths() -> serde_json::Value {
             "responses": { "200": { "description": "{data:[{b64_json}]}" }, "503": unavailable }
         } },
         "/v1/audio/speech": { "post": {
-            "summary": "Text to speech (OpenAI-compatible) - on-prem CosyVoice2; returns BINARY audio",
+            "summary": "Text to speech (OpenAI-compatible); returns BINARY audio",
+            "description": "Route is mounted, but NO backend is configured as of 2026-09-15 — the \
+                            on-prem CosyVoice2 was retired when the fleet moved to input-only \
+                            modalities. Expect 503 until a qwen-tts backend returns.",
             "tags": ["llm"], "security": bearer,
             "responses": { "200": { "description": "audio/mpeg or audio/wav bytes" }, "503": unavailable }
+        } },
+        "/v1/audio/transcriptions": { "post": {
+            "summary": "Speech to text (OpenAI-compatible) - on-prem whisper.cpp; multipart upload",
+            "description": "The only multipart/form-data route here: send `file` (the audio) and \
+                            `model` (a configured ASR backend, e.g. qwen-asr). Body is forwarded \
+                            verbatim and is bounded by LLM_MAX_BODY_BYTES (8 MiB default, roughly \
+                            four minutes of 16 kHz mono WAV). Never forwarded to OpenRouter.",
+            "tags": ["llm"], "security": bearer,
+            "responses": { "200": { "description": "{\"text\": \"...\"}" }, "503": unavailable }
         } },
         "/v1/messages": { "post": {
             "summary": "Anthropic-compatible messages",

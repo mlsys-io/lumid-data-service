@@ -1400,6 +1400,151 @@ pub async fn audio_speech(
     dispatch_bytes(&st, ident, "/v1/audio/speech", &body).await
 }
 
+/// Pull the `model` form field out of a multipart body WITHOUT a full parse.
+///
+/// `/v1/audio/transcriptions` is the only multipart route on this proxy, and the
+/// one thing routing needs from the body is the model id — the body is then
+/// forwarded byte-for-byte, so a real multipart parse would be wasted work and a
+/// new dependency. OpenAI requires `model` on this endpoint, so a body without
+/// one is a client error, not something to guess at.
+fn multipart_model(body: &[u8]) -> Option<String> {
+    let needle = b"name=\"model\"";
+    let pos = body.windows(needle.len()).position(|w| w == needle)?;
+    let rest = &body[pos + needle.len()..];
+    // Part headers end at the first CRLFCRLF; the value runs to the next CRLF.
+    let start = rest.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let tail = &rest[start..];
+    let end = tail.windows(2).position(|w| w == b"\r\n")?;
+    std::str::from_utf8(&tail[..end])
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// Forward a multipart body verbatim, preserving its Content-Type.
+///
+/// Distinct from `proxy_bytes`, which serialises a `Value` as JSON on the way
+/// out. Here the request is already encoded and the boundary token lives in the
+/// Content-Type header, so re-encoding the form would mean round-tripping the
+/// audio through memory for no gain — and would break the moment a client used
+/// a part header we did not model.
+async fn proxy_multipart(
+    st: &AppState,
+    backends: &[std::sync::Arc<crate::llm_pool::BackendHandle>],
+    path: &str,
+    body: &axum::body::Bytes,
+    ctype: &str,
+) -> Response {
+    let mut last_err: Option<Response> = None;
+    for handle in backends {
+        let _guard = handle.acquire();
+        let url = format!("{}{path}", handle.url);
+        let req = add_auth(
+            st,
+            st.http
+                .post(&url)
+                .header(reqwest::header::CONTENT_TYPE, ctype)
+                .body(body.clone()),
+        );
+        let upstream = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                handle.on_connect_err();
+                tracing::warn!("llm POST {path} → {} connect failed: {e}", handle.url);
+                last_err = Some((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "detail": "upstream transcription backend unreachable" })),
+                )
+                    .into_response());
+                continue;
+            }
+        };
+        handle.on_connect_ok();
+        let ax_status =
+            StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let resp_ctype = upstream
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json")
+            .to_string();
+        return match upstream.bytes().await {
+            // axum IntoResponse tuple order is (status, headers, body).
+            Ok(b) => (
+                ax_status,
+                [(axum::http::header::CONTENT_TYPE, resp_ctype)],
+                b,
+            )
+                .into_response(),
+            Err(e) => {
+                tracing::warn!("llm reading transcription from {}: {e}", handle.url);
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "detail": "upstream transcription body truncated" })),
+                )
+                    .into_response()
+            }
+        };
+    }
+    last_err.unwrap_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "detail": "no transcription backend answered" })),
+        )
+            .into_response()
+    })
+}
+
+/// POST /v1/audio/transcriptions — speech-to-text. Voice INPUT.
+///
+/// The only multipart route on this proxy; every other endpoint is JSON, which
+/// is why this needs its own dispatch rather than reusing `dispatch_bytes`.
+///
+/// Body size is bounded by `LLM_MAX_BODY_BYTES` (8 MiB default) — roughly four
+/// minutes of 16 kHz mono WAV, considerably more of compressed audio. Longer
+/// clips need that raised, and it multiplies against backend concurrency.
+///
+/// Like the other binary route there is deliberately NO OpenRouter arm: a
+/// transcription with no local backend fails loudly rather than being silently
+/// metered upstream.
+pub async fn audio_transcriptions(
+    ident: Option<Extension<Identity>>,
+    State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let ctype = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !ctype.starts_with("multipart/form-data") {
+        return ApiError::BadRequest(
+            "/v1/audio/transcriptions expects multipart/form-data with `file` and `model`".into(),
+        )
+        .into_response();
+    }
+    let Some(model) = multipart_model(&body) else {
+        return ApiError::BadRequest(
+            "multipart body must carry a `model` field naming a configured backend".into(),
+        )
+        .into_response();
+    };
+    match resolve(&st, Some(&model), &caller_label(&ident), &caller_role(&ident)) {
+        Err(e) => e.into_response(),
+        Ok(None) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "detail": "no local backend for this model; binary endpoints are never forwarded upstream"
+            })),
+        )
+            .into_response(),
+        Ok(Some(backends)) => {
+            proxy_multipart(&st, &backends, "/v1/audio/transcriptions", &body, &ctype).await
+        }
+    }
+}
+
 // -------------------------------------------------------------- Anthropic
 
 /// POST /v1/messages
