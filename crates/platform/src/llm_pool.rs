@@ -15,12 +15,22 @@
 //! via `GET /health`; on a <500 response the circuit closes and the backend
 //! re-enters normal rotation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering::Relaxed};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const CIRCUIT_OPEN_AFTER: u32 = 3;
 const PROBE_INTERVAL_S: u64 = 10;
+/// How often to scrape each healthy backend's /metrics for its engine queue
+/// depth. Must be short relative to how long a queued request waits (observed
+/// 300-570s) but long enough to cost nothing: one cheap GET per backend.
+const QUEUE_SCRAPE_INTERVAL_S: u64 = 5;
+/// Rolling window for the tok/s + QPS throughput figures reported by
+/// `/admin/llm-backend-stats`. Sampled on the SAME tick as the queue-depth
+/// scrape (`QUEUE_SCRAPE_INTERVAL_S`) so no second HTTP round-trip is added
+/// per backend. 5 minutes at 5s resolution = 60 samples/backend, negligible.
+pub const THROUGHPUT_WINDOW_S: u64 = 300;
 
 // ──────────────────────────────────────────── BackendHandle
 
@@ -29,16 +39,158 @@ pub struct BackendHandle {
     inflight: AtomicI32,
     healthy: AtomicBool,
     failures: AtomicU32,
+    /// Concurrency roof: when in-flight reaches this, the backend is "full" and
+    /// is treated as unavailable by the resolver (overflow to OpenRouter when
+    /// every local backend is full). 0 disables the roof.
+    max_concurrency: u32,
+    /// Engine queue depth last read from the backend's `/metrics`
+    /// (`vllm:num_requests_waiting`). -1 means "unknown" — never gated.
+    queue_depth: AtomicI32,
+    /// Queue roof: treat the backend as full once `queue_depth` reaches this.
+    /// 0 disables. See `Settings::llm_backend_queue_roof` for why this exists.
+    queue_roof: u32,
+    /// Routing tier. LOWER is preferred: a tier-1 backend receives traffic only
+    /// once every tier-0 backend is at its roof (or unhealthy). Parsed from an
+    /// optional `#tier=N` suffix on the backend URL; absent => 0, so every
+    /// existing single-tier roster behaves exactly as before.
+    ///
+    /// This exists because the roof is a single GLOBAL value while backends are
+    /// NOT interchangeable. Sorting by in-flight alone sends the SECOND
+    /// concurrent request to whichever backend happens to be idle — which for a
+    /// GPU+CPU roster means a 3.7x slower box while the GPU sits at 1/32.
+    /// Tier makes "spill", not "balance", the semantics.
+    pub tier: u32,
+    /// Rolling window of throughput samples for `/admin/llm-backend-stats`.
+    /// Populated by `start_queue_scraper` on the same tick as the queue-depth
+    /// scrape (see `THROUGHPUT_WINDOW_S`). A `Mutex<VecDeque<_>>` rather than
+    /// atomics: tok/s and QPS both need the OLDEST sample still in the window
+    /// compared against the NEWEST, which is a multi-field read that must not
+    /// tear — an `Arc<AtomicU64>` per counter could still race a push against a
+    /// read (e.g. read a stale generation_tokens paired with a just-pushed
+    /// requests_success). One lock, one struct, no partial reads.
+    throughput_samples: Mutex<VecDeque<ThroughputSample>>,
+}
+
+#[derive(Clone, Copy)]
+struct ThroughputSample {
+    at: Instant,
+    generation_tokens: u64,
+    /// `None` when the backend's exposition has no request-completion
+    /// counter at all — true for llama.cpp, which exposes `requests_processing`
+    /// / `requests_deferred` as point-in-time GAUGES but never a cumulative
+    /// "requests finished" counter. vLLM's `request_success_total` fills this.
+    requests_success: Option<u64>,
+    /// This PROCESS's own in-flight count at sample time (`inflight()`, not
+    /// scraped from the backend) — added alongside qps because qps answers
+    /// "how many requests FINISHED per second", which reads as contradictory
+    /// next to a healthy tok/s when requests are individually slow (few
+    /// completions, but each one streaming tokens the whole time it runs).
+    /// inflight answers the question operators actually asked when they saw
+    /// that: "how many are running AT ONCE, and was there a burst" — and
+    /// unlike qps, it's measurable for every backend dialect (gateway-side
+    /// counter, not a backend-exposed metric), including llama.cpp.
+    inflight: i32,
 }
 
 impl BackendHandle {
-    fn new(url: String) -> Self {
+    fn new(url: String, max_concurrency: u32, queue_roof: u32, tier: u32) -> Self {
         Self {
             url,
             inflight: AtomicI32::new(0),
             healthy: AtomicBool::new(true),
             failures: AtomicU32::new(0),
+            max_concurrency,
+            tier,
+            // -1 = not yet observed. Until metrics are actually read, the queue
+            // roof must never gate a backend: an unreachable /metrics endpoint
+            // (non-vLLM backend, scrape blocked) would otherwise silently push
+            // all traffic to OpenRouter.
+            queue_depth: AtomicI32::new(-1),
+            queue_roof,
+            throughput_samples: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// Record a throughput sample (raw cumulative counters from `/metrics`) and
+    /// evict anything older than `THROUGHPUT_WINDOW_S`. Cheap: at most ~60
+    /// entries, called once per scrape tick.
+    fn push_throughput_sample(&self, generation_tokens: u64, requests_success: Option<u64>) {
+        let Ok(mut buf) = self.throughput_samples.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        buf.push_back(ThroughputSample {
+            at: now,
+            generation_tokens,
+            requests_success,
+            inflight: self.inflight(),
+        });
+        let window = std::time::Duration::from_secs(THROUGHPUT_WINDOW_S);
+        while buf.len() > 1 && now.duration_since(buf.front().unwrap().at) > window {
+            buf.pop_front();
+        }
+    }
+
+    /// Highest in-flight count observed across the same rolling window
+    /// `throughput_rates()` reads — "was there a burst in the last 5 minutes",
+    /// distinct from `inflight()`'s instantaneous right-now snapshot, which a
+    /// ~12-15s dashboard poll cadence can easily land between two short spikes
+    /// and miss entirely. `None` when no samples exist yet (mirrors
+    /// `throughput_rates`'s own "warming up" convention).
+    pub fn peak_inflight_in_window(&self) -> Option<i32> {
+        let buf = self.throughput_samples.lock().ok()?;
+        buf.iter().map(|s| s.inflight).max()
+    }
+
+    /// Compute (tok/s, qps) from the oldest vs newest sample still in the
+    /// window. The OUTER `Option` is `None` when fewer than 2 samples have
+    /// been collected (backend just started, or /metrics has never been
+    /// reachable) — the caller renders that as "warming up", not zero, which
+    /// would misreport a genuinely busy backend as idle during its first
+    /// ~10s. The INNER `Option<f64>` on qps is separately `None` when this
+    /// backend's exposition has no request-completion counter at all
+    /// (llama.cpp) — distinct from "0 requests", which is a real measurement
+    /// the vLLM backends can make and llama.cpp backends cannot.
+    ///
+    /// Counters can legitimately go backwards (process restart resets them to
+    /// 0) — a negative delta is clamped to `None` for that metric on that
+    /// tick rather than reported as a negative rate.
+    pub fn throughput_rates(&self) -> Option<(f64, Option<f64>)> {
+        let buf = self.throughput_samples.lock().ok()?;
+        let oldest = buf.front()?;
+        let newest = buf.back()?;
+        let elapsed = newest.at.duration_since(oldest.at).as_secs_f64();
+        if elapsed <= 0.0 {
+            return None;
+        }
+        let tok_delta = newest
+            .generation_tokens
+            .checked_sub(oldest.generation_tokens)?;
+        let qps = match (oldest.requests_success, newest.requests_success) {
+            (Some(o), Some(n)) => n.checked_sub(o).map(|d| d as f64 / elapsed),
+            _ => None,
+        };
+        Some((tok_delta as f64 / elapsed, qps))
+    }
+
+    /// Engine queue depth last observed, or -1 when unknown.
+    pub fn queue_depth(&self) -> i32 {
+        self.queue_depth.load(Relaxed)
+    }
+
+    /// Record a queue depth scraped from the backend's /metrics.
+    pub fn set_queue_depth(&self, n: i32) {
+        self.queue_depth.store(n, Relaxed);
+    }
+
+    /// Whether the backend's own engine queue is at/over the queue roof.
+    /// Unknown depth (-1) never saturates — see `new`.
+    pub fn at_queue_roof(&self) -> bool {
+        if self.queue_roof == 0 {
+            return false;
+        }
+        let q = self.queue_depth();
+        q >= 0 && q >= self.queue_roof as i32
     }
 
     pub fn is_healthy(&self) -> bool {
@@ -47,6 +199,27 @@ impl BackendHandle {
 
     pub fn inflight(&self) -> i32 {
         self.inflight.load(Relaxed)
+    }
+
+    /// Whether this backend is saturated, by EITHER signal:
+    ///
+    ///   - in-flight roof: requests THIS process has issued, or
+    ///   - queue roof: the backend engine's own pending queue, scraped from
+    ///     /metrics — which is the only signal that sees other clients sharing
+    ///     the same GPU.
+    ///
+    /// The in-flight roof alone was insufficient: it read "room available" while
+    /// vLLM held ten queued requests, so turns were admitted into a queue and
+    /// waited minutes. A roof must not trip on the circuit being open — it is a
+    /// load gate, orthogonal to health.
+    pub fn at_roof(&self) -> bool {
+        if self.at_queue_roof() {
+            return true;
+        }
+        if self.max_concurrency == 0 {
+            return false;
+        }
+        self.inflight() >= self.max_concurrency as i32
     }
 
     /// Acquire an in-flight slot. The returned guard decrements on drop.
@@ -90,6 +263,44 @@ impl Drop for InFlightGuard {
 
 // ──────────────────────────────────────────── BackendPool
 
+/// Split an optional `#tier=N` suffix off a backend URL.
+///
+/// The suffix is ROUTING metadata and must never be dialed — a URL fragment is
+/// not sent on the wire by most clients, but relying on that would leave the
+/// fragment in `h.url`, which is what health probes, `/metrics` scrapes and
+/// every log line use. So it is stripped here, once, at parse time.
+///
+/// Anything unparseable degrades to tier 0 rather than erroring: a typo must
+/// not take a backend out of the roster, it should just lose its promotion.
+/// Parses a backend URL's optional `#key=value&key=value...` suffix.
+///
+/// Recognized keys: `tier` (routing tier, absent => 0 — see `BackendHandle::tier`)
+/// and `max_concurrency` (per-backend override of the global
+/// `LUMID_LLM_BACKEND_MAX_CONCURRENCY`, absent => `None`, falls back to the
+/// global value). This exists because the global roof is tuned to match the
+/// SLOWEST backend behind a model id (e.g. an 8-slot GPU or CPU box); a much
+/// more capable backend sharing that id — same tier or a different one — would
+/// otherwise sit far under its real capacity with no way to say so per-URL.
+fn parse_suffix(url: &str) -> (&str, u32, Option<u32>) {
+    match url.split_once('#') {
+        Some((base, suffix)) => {
+            let mut tier = 0u32;
+            let mut max_concurrency = None;
+            for kv in suffix.split('&') {
+                if let Some((k, v)) = kv.split_once('=') {
+                    match k.trim() {
+                        "tier" => tier = v.trim().parse::<u32>().unwrap_or(0),
+                        "max_concurrency" => max_concurrency = v.trim().parse::<u32>().ok(),
+                        _ => {}
+                    }
+                }
+            }
+            (base, tier, max_concurrency)
+        }
+        None => (url, 0, None),
+    }
+}
+
 pub struct BackendPool {
     /// Model name → ordered backend list (config order; routing sorts at call time).
     pub by_model: HashMap<String, Vec<Arc<BackendHandle>>>,
@@ -103,49 +314,122 @@ pub struct BackendPool {
 
 impl BackendPool {
     pub fn from_settings(s: &crate::config::Settings) -> Self {
+        Self::intern_backends(
+            &s.llm_backend_url,
+            &s.llm_backends,
+            s.llm_backend_max_concurrency,
+            s.llm_backend_queue_roof,
+            s.llm_openrouter_url.clone(),
+        )
+    }
+
+    /// The actual interning logic behind `from_settings`, pulled out so it is
+    /// testable without constructing a full `Settings` (which has no
+    /// `Default` and dozens of unrelated fields).
+    ///
+    /// `primary_url` is `LUMID_LLM_BACKEND_URL` — the legacy single-backend
+    /// fallback, interned FIRST and unconditionally at whatever tier/suffix
+    /// IT carries (usually none, i.e. tier 0). `backends` is
+    /// `LUMID_LLM_BACKENDS`, interned second.
+    ///
+    /// BUG FIXED HERE (found live 2026-08-31 via the on-prem GPU stats
+    /// panel): the SAME url can legitimately appear in both — an operator
+    /// pointed `LUMID_LLM_BACKEND_URL` at one of the roster's own backends
+    /// (GX10) as a fallback default, not realizing `LUMID_LLM_BACKENDS` also
+    /// lists that URL with `#tier=1`. The old code interned by URL with
+    /// `HashMap::entry().or_insert_with()`: first writer wins, so the
+    /// primary's bare (tier-0) entry silently WON over the later `#tier=1`
+    /// suffix for the identical host:port. GX10 then routed as an EQUAL peer
+    /// to h100 (both tier 0) instead of the documented "h100 first, GX10 only
+    /// on spillover" — confirmed live: GX10 was carrying real steady-state
+    /// traffic (43 tok/s) alongside h100, not spillover-shaped usage.
+    ///
+    /// Fix: intern `LUMID_LLM_BACKENDS` FIRST (it carries the operator's
+    /// explicit, per-backend routing intent — tier and max_concurrency
+    /// suffixes), then `LUMID_LLM_BACKEND_URL` second via the SAME
+    /// first-writer-wins map — so a roster entry for a URL always wins over
+    /// the bare fallback for that same URL, while a `LUMID_LLM_BACKEND_URL`
+    /// naming a genuinely new host (not in any roster) still gets its own
+    /// handle exactly as before. No existing behavior for the common case
+    /// (primary is a URL absent from every roster) changes.
+    fn intern_backends(
+        primary_url: &str,
+        backends: &[(String, Vec<String>)],
+        default_max_concurrency: u32,
+        queue_roof: u32,
+        openrouter_url: String,
+    ) -> Self {
         let mut all: Vec<Arc<BackendHandle>> = Vec::new();
         let mut seen: HashMap<String, Arc<BackendHandle>> = HashMap::new();
 
         let mut intern = |url: &str| -> Arc<BackendHandle> {
-            let key = url.trim_end_matches('/').to_string();
+            let (base, tier, max_concurrency_override) = parse_suffix(url);
+            let max_concurrency = max_concurrency_override.unwrap_or(default_max_concurrency);
+            let key = base.trim_end_matches('/').to_string();
             seen.entry(key.clone())
                 .or_insert_with(|| {
-                    let h = Arc::new(BackendHandle::new(key));
+                    let h = Arc::new(BackendHandle::new(key, max_concurrency, queue_roof, tier));
                     all.push(h.clone());
                     h
                 })
                 .clone()
         };
 
-        let primary = if !s.llm_backend_url.is_empty() {
-            Some(intern(&s.llm_backend_url))
-        } else {
-            None
-        };
-
+        // Roster FIRST: an explicit #tier=/#max_concurrency= suffix here must
+        // win over a bare LUMID_LLM_BACKEND_URL entry for the same host.
         let mut by_model: HashMap<String, Vec<Arc<BackendHandle>>> = HashMap::new();
-        for (model, urls) in &s.llm_backends {
+        for (model, urls) in backends {
             let handles: Vec<_> = urls.iter().map(|u| intern(u)).collect();
             if !handles.is_empty() {
                 by_model.insert(model.clone(), handles);
             }
         }
 
+        let primary = if !primary_url.is_empty() {
+            Some(intern(primary_url))
+        } else {
+            None
+        };
+
         Self {
             by_model,
             primary,
             all,
-            openrouter_url: s.llm_openrouter_url.clone(),
+            openrouter_url,
         }
     }
 
     /// Backends to try for `model`, sorted: healthy-least-loaded first, then
     /// unhealthy (fallback of last resort). Returns empty when nothing is configured.
     pub fn backends_for(&self, model: Option<&str>) -> Vec<Arc<BackendHandle>> {
+        // The primary is a fallback for a request that names NO model, or for a
+        // deployment with no OpenRouter catch-all to fall through to.
+        //
+        // It must NOT swallow an explicitly-named unknown model while a catch-all
+        // exists. It did: an unknown id missed `by_model`, fell back to the
+        // primary, and `resolve()` then took its `!backends.is_empty()` branch --
+        // making the "unknown explicit model -> OpenRouter catch-all" arm
+        // unreachable whenever LUMID_LLM_BACKEND_URL is set, which is always.
+        // Measured: `z-ai/glm-5.2` and `deepseek/deepseek-v4-flash-0731` both came
+        // back as vLLM `NotFoundError` 404s from the LOCAL backend instead of
+        // routing to OpenRouter.
+        // Gate on having an explicit roster, NOT on OpenRouter being configured:
+        // an unknown id must resolve to no backend so resolve() can refuse it
+        // outright. A deployment with no roster at all (only LUMID_LLM_BACKEND_URL)
+        // still sends every named model to the primary, as it always did.
+        let named_unknown = model.is_some()
+            && !self.by_model.is_empty()
+            && model.map_or(false, |m| !self.by_model.contains_key(m));
         let handles = model
             .and_then(|m| self.by_model.get(m))
             .map(|v| v.as_slice())
-            .or_else(|| self.primary.as_ref().map(std::slice::from_ref));
+            .or_else(|| {
+                if named_unknown {
+                    None
+                } else {
+                    self.primary.as_ref().map(std::slice::from_ref)
+                }
+            });
 
         let Some(handles) = handles else {
             return vec![];
@@ -153,9 +437,16 @@ impl BackendPool {
 
         let mut sorted: Vec<Arc<BackendHandle>> = handles.iter().cloned().collect();
         sorted.sort_by_key(|h| {
-            // Unhealthy backends sort far last; within healthy, prefer fewer inflight.
-            let tier = if h.is_healthy() { 0i32 } else { 1_000_000 };
-            tier + h.inflight()
+            // Sort order: healthy < unhealthy; then not-at-roof < at-roof; then
+            // LOWER tier first; then fewer in-flight. A saturated backend is tried
+            // last (still a retry candidate), never silently dropped.
+            //
+            // A tuple, not the previous weighted sum (`health + roof + inflight`).
+            // That encoding assumed in-flight stays far below its 100_000 bucket —
+            // an assumption this service has already violated once, in the in-flight
+            // SLOT LEAK fixed by c1900a6. Tuple ordering cannot be corrupted by a
+            // runaway counter, and it makes the tier rung explicit.
+            (!h.is_healthy(), h.at_roof(), h.tier, h.inflight())
         });
         sorted
     }
@@ -195,5 +486,838 @@ async fn probe_one(http: &reqwest::Client, h: &BackendHandle) {
             tracing::warn!("llm probe {}: {e}", h.url);
             h.on_connect_err();
         }
+    }
+}
+
+// ──────────────────────────────────────────── engine-queue scraping
+
+impl BackendPool {
+    /// Spawn a background task that scrapes each backend's `/metrics` for its
+    /// engine queue depth (`vllm:num_requests_waiting`).
+    ///
+    /// This is the only signal that sees load from OTHER clients on the same
+    /// GPU. `inflight` counts what this process issued; the GB10 is also driven
+    /// directly by xpio loops and other apps, so a backend can be ten deep while
+    /// this process believes it has room. Scraping the engine closes that gap and
+    /// lets the resolver spill to OpenRouter BEFORE queueing, rather than after a
+    /// timeout.
+    ///
+    /// Failure is silent and non-gating: a backend whose /metrics cannot be read
+    /// keeps depth -1 and is never blocked by the queue roof.
+    pub fn start_queue_scraper(self: Arc<Self>, http: reqwest::Client) {
+        tokio::spawn(async move {
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_secs(QUEUE_SCRAPE_INTERVAL_S));
+            loop {
+                tick.tick().await;
+                for h in &self.all {
+                    if !h.is_healthy() {
+                        // We are not scraping this backend, so its last depth is STALE and
+                        // must not gate. `at_roof()` consults `at_queue_roof()` FIRST and is
+                        // deliberately orthogonal to health, so a value frozen at >= roof
+                        // would spill every request to OpenRouter for as long as the circuit
+                        // stayed open. Clear to -1 ("unknown, never gate") and let health
+                        // decide, which `resolve()` now does explicitly. NOTE: the circuit
+                        // does NOT depend on routed traffic to close -- `start_health_prober`
+                        // probes every unhealthy backend on its own interval and calls
+                        // `on_connect_ok()`, so recovery is automatic.
+                        h.set_queue_depth(-1);
+                        continue;
+                    }
+                    let prev = h.queue_depth();
+                    // One GET per backend per tick, shared by BOTH signals below
+                    // (queue depth AND throughput) — the throughput scraper was
+                    // added later and deliberately reuses this fetch rather than
+                    // issuing its own, per the same "cost nothing" rule the queue
+                    // scraper was built under.
+                    let body = fetch_metrics_body(&http, &h.url).await;
+                    match body.as_deref().and_then(parse_num_requests_waiting) {
+                        Some(n) => {
+                            h.set_queue_depth(n);
+                            // Log only on a saturation EDGE, so this is quiet in
+                            // steady state but visible when spill begins/ends.
+                            //
+                            // The edge must be the ROOF, not a hardcoded 1. With
+                            // queue_roof=4 this warned "treating as saturated, new
+                            // requests spill to OpenRouter" every time depth merely
+                            // reached 1 -- 15 times in 24h, none of which spilled
+                            // anything, because the actual gate (at_queue_roof) is
+                            // q >= queue_roof. The log was reporting a fallback that
+                            // never happened.
+                            let roof = h.queue_roof.max(1) as i32;
+                            let was = prev >= roof;
+                            let now = n >= roof;
+                            if now != was {
+                                if now {
+                                    tracing::warn!(
+                                        "llm backend {} engine queue depth {} — treating as saturated, new requests spill to OpenRouter",
+                                        h.url, n
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "llm backend {} engine queue drained — resuming local routing",
+                                        h.url
+                                    );
+                                }
+                            }
+                        }
+                        // Unreachable/unparseable: forget the stale value rather
+                        // than gate on it forever.
+                        None => h.set_queue_depth(-1),
+                    }
+                    if let Some(counters) = body.as_deref().and_then(parse_throughput_counters) {
+                        h.push_throughput_sample(
+                            counters.generation_tokens,
+                            counters.requests_success,
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// GET `<url>/metrics` as plain text. `None` on any connect/read failure —
+/// callers treat a missing body as "unreachable this tick", not an error.
+async fn fetch_metrics_body(http: &reqwest::Client, base: &str) -> Option<String> {
+    let url = format!("{}/metrics", base);
+    http.get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()
+}
+
+/// Parse the backend's engine queue depth out of its Prometheus exposition.
+///
+/// Prefers `vllm:num_requests_waiting_by_reason{reason="capacity"}` and falls
+/// back to the aggregate `vllm:num_requests_waiting`.
+///
+/// The distinction is load-bearing at a low roof. The aggregate counts BOTH
+/// requests blocked on capacity and requests merely `deferred` by the scheduler
+/// -- and this backend runs `--enable-chunked-prefill` with
+/// `--long-prefill-token-threshold 1024`, which defers long prefills BY DESIGN.
+/// So a single large-context turn can show waiting=1..2 with no congestion at
+/// all. Gating on the aggregate would then spill paying traffic to the metered
+/// OpenRouter path for a scheduling artifact rather than for real contention.
+/// "Capacity" is what the roof is actually meant to mean: someone is blocked
+/// because the engine is full.
+///
+/// Both forms are summed across engines/models so a multi-engine backend
+/// reports total pressure. The fallback keeps older vLLM builds (which do not
+/// export the by_reason breakdown) working exactly as before.
+fn parse_num_requests_waiting(body: &str) -> Option<i32> {
+    let mut capacity: f64 = 0.0;
+    let mut capacity_seen = false;
+    let mut aggregate: f64 = 0.0;
+    let mut aggregate_seen = false;
+
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || !line.starts_with("vllm:num_requests_waiting") {
+            continue;
+        }
+        let Some(v) = line.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok()) else {
+            continue;
+        };
+        if line.starts_with("vllm:num_requests_waiting_by_reason") {
+            // Only the capacity reason counts as congestion.
+            if line.contains(r#"reason="capacity""#) {
+                capacity += v;
+                capacity_seen = true;
+            }
+            continue;
+        }
+        aggregate += v;
+        aggregate_seen = true;
+    }
+
+    if capacity_seen {
+        Some(capacity.round() as i32)
+    } else if aggregate_seen {
+        Some(aggregate.round() as i32)
+    } else {
+        None
+    }
+}
+
+/// Raw cumulative counters read from one `/metrics` scrape, feeding the
+/// throughput rolling window (`BackendHandle::push_throughput_sample`).
+/// `generation_tokens` (tok/s) is universal across both backend families this
+/// endpoint scrapes. `requests_success` (QPS) is `None` for a backend that
+/// exposes no request-completion COUNTER at all — see its doc on
+/// `ThroughputSample`.
+struct ThroughputCounters {
+    generation_tokens: u64,
+    requests_success: Option<u64>,
+}
+
+/// Parses generation-token throughput and (where available) request-
+/// completion counters from BOTH exposition dialects this pool's backends
+/// use:
+///
+/// - **vLLM**: `vllm:generation_tokens_total`, `vllm:request_success_total`
+///   (summed across every `finished_reason` / `engine` label — a
+///   multi-engine backend reports total throughput, mirroring how
+///   `parse_num_requests_waiting` sums across labels).
+/// - **llama.cpp** (`--metrics`): `llamacpp:tokens_predicted_total` is the
+///   generation-token counter. llama.cpp has NO cumulative request-completion
+///   counter — `requests_processing`/`requests_deferred` are point-in-time
+///   GAUGES, not counters, so they cannot feed a rate-over-window the way
+///   `request_success_total` can. QPS is therefore left `None` for every
+///   llama.cpp backend; do not wire those gauges in here, they would produce
+///   a number shaped like a rate that isn't one.
+///
+/// `None` when NEITHER family's generation-token metric appears at all
+/// (backend unreachable, or exposes neither dialect) — a genuinely idle
+/// backend still emits the metric at value 0, so this only returns `None` on
+/// absence, not on zero.
+fn parse_throughput_counters(body: &str) -> Option<ThroughputCounters> {
+    let mut generation_tokens = 0.0f64;
+    let mut generation_seen = false;
+    let mut requests_success = 0.0f64;
+    let mut requests_seen = false;
+
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(v) = line.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok()) else {
+            continue;
+        };
+        if line.starts_with("vllm:generation_tokens_total")
+            || line.starts_with("llamacpp:tokens_predicted_total")
+        {
+            generation_tokens += v;
+            generation_seen = true;
+        } else if line.starts_with("vllm:request_success_total") {
+            // llama.cpp has no equivalent counter — deliberately not matched
+            // here. See the function doc.
+            requests_success += v;
+            requests_seen = true;
+        }
+    }
+
+    if !generation_seen {
+        return None;
+    }
+    Some(ThroughputCounters {
+        generation_tokens: generation_tokens.round() as u64,
+        requests_success: requests_seen.then_some(requests_success.round() as u64),
+    })
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"
+# HELP vllm:num_requests_running Number of requests running.
+vllm:num_requests_running{engine="0",model_name="deepseek-v4-flash"} 5.0
+vllm:num_requests_waiting{engine="0",model_name="deepseek-v4-flash"} 5.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4-flash",reason="capacity"} 3.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4-flash",reason="deferred"} 2.0
+"#;
+
+    #[test]
+    fn prefers_capacity_over_the_aggregate() {
+        // CONTRACT CHANGE (2026-08-23). This used to assert Some(5) -- the
+        // aggregate -- on the reasoning that the _by_reason lines merely break
+        // down the same requests. True, but the breakdown is the point: of
+        // those 5, only 3 are blocked on capacity and 2 are `deferred` by
+        // chunked prefill, which is normal scheduling and not congestion.
+        // Gating on 5 would spill paying traffic to metered OpenRouter for a
+        // scheduling artifact. Never 10: the two forms are not added together.
+        assert_eq!(parse_num_requests_waiting(SAMPLE), Some(3));
+    }
+
+    #[test]
+    fn absent_metric_is_none() {
+        assert_eq!(parse_num_requests_waiting("# nothing here\n"), None);
+    }
+
+    #[test]
+    fn unknown_depth_never_saturates() {
+        let h = BackendHandle::new("http://x".into(), 8, 1, 0);
+        assert_eq!(h.queue_depth(), -1);
+        assert!(!h.at_queue_roof(), "unknown depth must not gate");
+        assert!(!h.at_roof(), "unknown depth must not saturate the backend");
+    }
+
+    #[test]
+    fn queue_roof_saturates_even_with_idle_inflight() {
+        // The whole point: zero in-flight HERE, but the engine is queued because
+        // other clients share the GPU.
+        let h = BackendHandle::new("http://x".into(), 8, 1, 0);
+        h.set_queue_depth(5);
+        assert_eq!(h.inflight(), 0);
+        assert!(h.at_roof(), "engine queue must saturate regardless of inflight");
+    }
+
+    #[test]
+    fn queue_roof_zero_disables() {
+        let h = BackendHandle::new("http://x".into(), 8, 0, 0);
+        h.set_queue_depth(99);
+        assert!(!h.at_queue_roof());
+        assert!(!h.at_roof());
+    }
+}
+
+#[cfg(test)]
+mod queue_roof_edge_tests {
+    use super::*;
+
+    // The saturation warning must fire on the ROOF, not on any queue at all.
+    // With queue_roof=4 the old edge (hardcoded 1) warned "new requests spill to
+    // OpenRouter" whenever depth reached 1 — 15 times in 24h of production, none
+    // of which spilled anything, because at_queue_roof gates on q >= queue_roof.
+    #[test]
+    fn saturation_edge_follows_the_roof() {
+        let h = BackendHandle::new("http://x".into(), 8, 4, 0);
+        for (depth, want) in [(0, false), (1, false), (3, false), (4, true), (9, true)] {
+            h.set_queue_depth(depth);
+            assert_eq!(
+                h.at_queue_roof(),
+                want,
+                "queue depth {depth} with roof 4 should saturate={want}"
+            );
+        }
+    }
+
+    // An InFlightGuard MUST decrement on drop. This is the counter that, when
+    // leaked, pins `at_roof()` true forever and sends every request to metered
+    // OpenRouter while the local GPU is idle (2026-08-24, ~$40/day). The leak was
+    // not here -- the guard is correct -- but in the stream task that HOLDS it;
+    // this pins the invariant the fix depends on.
+    #[test]
+    fn inflight_guard_releases_on_drop() {
+        let h = std::sync::Arc::new(BackendHandle::new("http://x".into(), 2, 0, 0));
+        assert_eq!(h.inflight(), 0);
+        {
+            let _a = h.acquire();
+            let _b = h.acquire();
+            assert_eq!(h.inflight(), 2);
+            assert!(h.at_roof(), "two in-flight against max_concurrency 2 is the roof");
+        }
+        assert_eq!(h.inflight(), 0, "guards must decrement on drop");
+        assert!(!h.at_roof(), "a drained backend must leave the roof");
+    }
+
+    // A stale queue depth must never outlive the scrape that produced it. When the
+    // circuit opens the scraper stops sampling, and a depth frozen at >= roof would
+    // keep `at_queue_roof()` true even after the health prober has closed the
+    // circuit and the engine has drained.
+    #[test]
+    fn cleared_depth_releases_the_queue_gate() {
+        let h = BackendHandle::new("http://x".into(), 8, 3, 0);
+        h.set_queue_depth(5);
+        assert!(h.at_queue_roof(), "depth 5 against roof 3 saturates");
+        h.set_queue_depth(-1); // what the scraper now does for an unhealthy backend
+        assert!(!h.at_queue_roof(), "unknown depth must not gate");
+        assert!(!h.at_roof(), "with inflight 0 and depth unknown, not at roof");
+    }
+
+    // roof=0 disables the queue signal entirely; only in-flight applies.
+    #[test]
+    fn zero_roof_disables_queue_gate() {
+        let h = BackendHandle::new("http://x".into(), 8, 0, 0);
+        h.set_queue_depth(50);
+        assert!(!h.at_queue_roof(), "roof 0 must disable the queue gate");
+        assert!(!h.at_roof(), "in-flight is 0, so the backend is not at roof");
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+
+    fn h(url: &str, roof: u32, tier: u32) -> Arc<BackendHandle> {
+        Arc::new(BackendHandle::new(url.into(), roof, 0, tier))
+    }
+    fn pool_of(hs: &[Arc<BackendHandle>]) -> BackendPool {
+        let mut by_model: HashMap<String, Vec<Arc<BackendHandle>>> = HashMap::new();
+        by_model.insert("m".to_string(), hs.to_vec());
+        BackendPool {
+            by_model,
+            primary: None,
+            all: hs.to_vec(),
+            openrouter_url: String::new(),
+        }
+    }
+
+    // The `#tier=`/`#max_concurrency=` suffix must not survive into the dialed
+    // URL: health probes, /metrics scrapes and every log line read `h.url`
+    // directly.
+    #[test]
+    fn tier_suffix_is_parsed_and_stripped() {
+        assert_eq!(
+            parse_suffix("http://s0:4001#tier=1"),
+            ("http://s0:4001", 1, None)
+        );
+        assert_eq!(
+            parse_suffix("http://gb10:8090"),
+            ("http://gb10:8090", 0, None)
+        );
+        // A typo must cost the promotion, never the backend.
+        assert_eq!(
+            parse_suffix("http://x:1#tier=abc"),
+            ("http://x:1", 0, None)
+        );
+    }
+
+    // THE POINT OF THIS SUFFIX: the global roof is tuned to the slowest backend
+    // behind an id (see `parse_suffix`'s doc comment) -- a per-URL override lets
+    // one capable backend use more of its real capacity without touching that
+    // global value, which every other backend (same id or not) still depends on.
+    #[test]
+    fn max_concurrency_suffix_is_parsed_and_stripped() {
+        assert_eq!(
+            parse_suffix("http://h100:4011#tier=0&max_concurrency=64"),
+            ("http://h100:4011", 0, Some(64))
+        );
+        // Order must not matter.
+        assert_eq!(
+            parse_suffix("http://h100:4011#max_concurrency=64&tier=0"),
+            ("http://h100:4011", 0, Some(64))
+        );
+        // No override present => None, caller falls back to the global default.
+        assert_eq!(
+            parse_suffix("http://gb10:8090#tier=1"),
+            ("http://gb10:8090", 1, None)
+        );
+        // A typo must cost the override, never the backend (same policy as tier).
+        assert_eq!(
+            parse_suffix("http://x:1#max_concurrency=abc"),
+            ("http://x:1", 0, None)
+        );
+    }
+
+    // THE POINT OF THE FEATURE. Sorting on in-flight alone sends the SECOND
+    // concurrent request to whichever backend is idle -- for a GPU+CPU roster
+    // that is a 3.7x slower box while the GPU sits at 1/32.
+    #[test]
+    fn lower_tier_wins_even_when_busier() {
+        let gpu = h("http://gb10:8090", 16, 0);
+        let cpu = h("http://s0:4001", 16, 1);
+        let p = pool_of(&[gpu.clone(), cpu.clone()]);
+        let _g = gpu.acquire(); // gpu: 1 in-flight, cpu: 0
+        assert_eq!(
+            p.backends_for(Some("m"))[0].url,
+            gpu.url,
+            "tier-0 must keep traffic while it still has room"
+        );
+    }
+
+    // ...but a saturated tier-0 MUST yield, or the ladder never spills.
+    #[test]
+    fn tier_zero_at_roof_yields_to_tier_one() {
+        let gpu = h("http://gb10:8090", 1, 0);
+        let cpu = h("http://s0:4001", 16, 1);
+        let p = pool_of(&[gpu.clone(), cpu.clone()]);
+        let _g = gpu.acquire();
+        assert!(gpu.at_roof(), "precondition: gpu is at its roof");
+        assert_eq!(
+            p.backends_for(Some("m"))[0].url,
+            cpu.url,
+            "a tier-0 at its roof must spill to tier-1"
+        );
+    }
+
+    // Health still outranks tier -- an open circuit yields regardless.
+    #[test]
+    fn unhealthy_tier_zero_yields() {
+        let gpu = h("http://gb10:8090", 16, 0);
+        let cpu = h("http://s0:4001", 16, 1);
+        for _ in 0..CIRCUIT_OPEN_AFTER {
+            gpu.on_connect_err();
+        }
+        assert!(!gpu.is_healthy());
+        let p = pool_of(&[gpu.clone(), cpu.clone()]);
+        assert_eq!(p.backends_for(Some("m"))[0].url, cpu.url);
+    }
+
+    // No `#tier=` anywhere => all tier 0 => the previous pure least-in-flight
+    // behaviour is preserved for every existing roster (e.g. qwen-image, which
+    // depends on it).
+    #[test]
+    fn absent_tier_preserves_least_inflight() {
+        let a = h("http://a", 16, 0);
+        let b = h("http://b", 16, 0);
+        let p = pool_of(&[a.clone(), b.clone()]);
+        let _g = a.acquire();
+        assert_eq!(
+            p.backends_for(Some("m"))[0].url,
+            b.url,
+            "equal tiers must fall back to least-in-flight"
+        );
+    }
+}
+
+#[cfg(test)]
+mod intern_backends_tests {
+    use super::*;
+
+    // Regression for the bug found live 2026-08-31 via the on-prem GPU stats
+    // panel: LUMID_LLM_BACKEND_URL pointed at GX10's bare URL (no #tier=),
+    // and LUMID_LLM_BACKENDS ALSO listed that same URL with #tier=1. The old
+    // interning order (primary first) let the bare tier-0 entry win, so GX10
+    // silently ran as an equal peer to h100 instead of a tier-1 fallback.
+    #[test]
+    fn roster_tier_suffix_wins_over_a_colliding_primary_url() {
+        let backends = vec![(
+            "deepseek-v4-flash".to_string(),
+            vec![
+                "http://h100:4011#tier=0".to_string(),
+                "http://gx10:8090#tier=1".to_string(),
+            ],
+        )];
+        // The exact collision: LUMID_LLM_BACKEND_URL names the SAME host as a
+        // #tier=1 roster entry, with no suffix of its own.
+        let pool = BackendPool::intern_backends("http://gx10:8090", &backends, 16, 4, String::new());
+
+        let gx10 = pool
+            .all
+            .iter()
+            .find(|h| h.url == "http://gx10:8090")
+            .expect("gx10 should be interned");
+        assert_eq!(gx10.tier, 1, "the roster's #tier=1 must win over the bare primary URL");
+
+        // Exactly one handle for gx10, not two — the collision must still
+        // dedupe by URL, just with the right tier winning.
+        assert_eq!(
+            pool.all.iter().filter(|h| h.url == "http://gx10:8090").count(),
+            1,
+            "a colliding primary URL must not create a second handle"
+        );
+
+        // primary still resolves to that same (correctly tiered) handle.
+        assert!(
+            Arc::ptr_eq(pool.primary.as_ref().unwrap(), gx10),
+            "primary must point at the same interned handle, not a shadow copy"
+        );
+    }
+
+    // The common, non-colliding case must be completely unaffected: a
+    // primary URL that names a host absent from every roster still gets its
+    // own handle, own tier (0, since it carries no suffix), and still
+    // resolves via `primary`.
+    #[test]
+    fn non_colliding_primary_url_is_unaffected() {
+        let backends = vec![(
+            "deepseek-v4-flash".to_string(),
+            vec!["http://h100:4011#tier=0".to_string()],
+        )];
+        let pool = BackendPool::intern_backends("http://standalone:9999", &backends, 16, 4, String::new());
+
+        assert_eq!(pool.all.len(), 2, "two distinct hosts, two handles");
+        let standalone = pool
+            .all
+            .iter()
+            .find(|h| h.url == "http://standalone:9999")
+            .expect("standalone primary should be interned");
+        assert_eq!(standalone.tier, 0);
+        assert!(Arc::ptr_eq(pool.primary.as_ref().unwrap(), standalone));
+    }
+}
+
+#[cfg(test)]
+mod catchall_tests {
+    use super::*;
+
+    /// Build a pool the way from_settings would, without needing a Settings.
+    fn pool(known: &[&str], with_primary: bool, openrouter: &str) -> BackendPool {
+        let h = Arc::new(BackendHandle::new("http://gb10:8090".into(), 8, 4, 0));
+        let mut by_model: HashMap<String, Vec<Arc<BackendHandle>>> = HashMap::new();
+        for m in known {
+            by_model.insert((*m).to_string(), vec![h.clone()]);
+        }
+        BackendPool {
+            by_model,
+            primary: if with_primary { Some(h.clone()) } else { None },
+            all: vec![h],
+            openrouter_url: openrouter.to_string(),
+        }
+    }
+
+    // An explicitly-named UNKNOWN model must resolve to NO backend, so resolve()
+    // can REFUSE it. It must never reach OpenRouter: an e2e test once caught a
+    // nonexistent model id being forwarded to real OpenRouter and billed, so a
+    // typo became money (llm-0d342a8 closed that; 70fc036 reopened it by
+    // accident; this pins it shut).
+    #[test]
+    fn named_unknown_model_resolves_to_no_backend() {
+        let p = pool(&["deepseek-v4-flash"], true, "https://openrouter.ai/api");
+        assert!(
+            p.backends_for(Some("z-ai/glm-5.2")).is_empty(),
+            "unknown model must resolve to NO local backend so resolve() refuses it"
+        );
+    }
+
+    // The refusal must not depend on OpenRouter being configured -- otherwise
+    // turning the URL off silently changes an unknown id from "refused" to
+    // "served by the primary", which is how the roster stops meaning anything.
+    #[test]
+    fn named_unknown_is_refused_with_or_without_openrouter() {
+        for or in ["https://openrouter.ai/api", ""] {
+            let p = pool(&["deepseek-v4-flash"], true, or);
+            assert!(
+                p.backends_for(Some("z-ai/glm-5.2")).is_empty(),
+                "unknown model must resolve to no backend (openrouter={or:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn known_model_still_resolves_locally() {
+        let p = pool(&["deepseek-v4-flash"], true, "https://openrouter.ai/api");
+        assert_eq!(p.backends_for(Some("deepseek-v4-flash")).len(), 1);
+    }
+
+    // With NO catch-all configured the primary fallback must still apply,
+    // otherwise a legacy single-backend deployment (only LUMID_LLM_BACKEND_URL
+    // set, clients naming a model) would start failing.
+    #[test]
+    fn primary_fallback_survives_without_a_catchall() {
+        let p = pool(&[], true, "");
+        assert_eq!(
+            p.backends_for(Some("anything-at-all")).len(),
+            1,
+            "without OpenRouter the primary must still absorb a named model"
+        );
+    }
+
+    #[test]
+    fn unnamed_request_uses_primary() {
+        let p = pool(&["deepseek-v4-flash"], true, "https://openrouter.ai/api");
+        assert_eq!(p.backends_for(None).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod queue_reason_tests {
+    use super::*;
+
+    // The real shape emitted by the GB10 backend (captured 2026-08-23).
+    const DEFERRED_ONLY: &str = r#"
+vllm:num_requests_running{engine="0",model_name="deepseek-v4-flash"} 3.0
+vllm:num_requests_waiting{engine="0",model_name="deepseek-v4-flash"} 2.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4-flash",reason="capacity"} 0.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4-flash",reason="deferred"} 2.0
+"#;
+
+    const REAL_CONGESTION: &str = r#"
+vllm:num_requests_running{engine="0",model_name="deepseek-v4-flash"} 16.0
+vllm:num_requests_waiting{engine="0",model_name="deepseek-v4-flash"} 5.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4-flash",reason="capacity"} 3.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="deepseek-v4-flash",reason="deferred"} 2.0
+"#;
+
+    // Chunked prefill DEFERS long prefills by design. Those must not count as
+    // congestion: at roof=2 the aggregate (2.0) would spill paying traffic to
+    // the metered OpenRouter path while the engine is not full at all.
+    #[test]
+    fn deferred_requests_are_not_congestion() {
+        assert_eq!(parse_num_requests_waiting(DEFERRED_ONLY), Some(0));
+    }
+
+    // Genuine capacity blocking is reported, and the deferred requests riding
+    // alongside it are excluded rather than inflating the depth.
+    #[test]
+    fn capacity_blocked_requests_are_congestion() {
+        assert_eq!(parse_num_requests_waiting(REAL_CONGESTION), Some(3));
+    }
+
+    // Older vLLM builds export no by_reason breakdown — fall back to the
+    // aggregate so they behave exactly as before.
+    #[test]
+    fn falls_back_to_aggregate_without_by_reason() {
+        let legacy = r#"
+vllm:num_requests_running{engine="0"} 4.0
+vllm:num_requests_waiting{engine="0"} 7.0
+"#;
+        assert_eq!(parse_num_requests_waiting(legacy), Some(7));
+    }
+
+    // Multi-engine backends sum.
+    #[test]
+    fn sums_across_engines() {
+        let multi = r#"
+vllm:num_requests_waiting_by_reason{engine="0",reason="capacity"} 2.0
+vllm:num_requests_waiting_by_reason{engine="1",reason="capacity"} 3.0
+vllm:num_requests_waiting_by_reason{engine="0",reason="deferred"} 9.0
+"#;
+        assert_eq!(parse_num_requests_waiting(multi), Some(5));
+    }
+
+    // No metrics at all -> unknown, which never gates (queue_depth stays -1).
+    #[test]
+    fn absent_metric_is_unknown() {
+        assert_eq!(parse_num_requests_waiting("# nothing here\n"), None);
+    }
+}
+
+#[cfg(test)]
+mod throughput_tests {
+    use super::*;
+
+    #[test]
+    fn parses_generation_tokens_and_requests_success() {
+        let body = r#"
+vllm:prompt_tokens_total{engine="0"} 1000.0
+vllm:generation_tokens_total{engine="0"} 250.0
+vllm:request_success_total{engine="0",finished_reason="stop"} 4.0
+vllm:request_success_total{engine="0",finished_reason="length"} 1.0
+"#;
+        let c = parse_throughput_counters(body).expect("should parse");
+        assert_eq!(c.generation_tokens, 250);
+        // Summed across finished_reason, same convention as num_requests_waiting.
+        assert_eq!(c.requests_success, Some(5));
+    }
+
+    #[test]
+    fn sums_across_engines() {
+        let body = r#"
+vllm:generation_tokens_total{engine="0"} 100.0
+vllm:generation_tokens_total{engine="1"} 50.0
+vllm:request_success_total{engine="0",finished_reason="stop"} 2.0
+vllm:request_success_total{engine="1",finished_reason="stop"} 3.0
+"#;
+        let c = parse_throughput_counters(body).expect("should parse");
+        assert_eq!(c.generation_tokens, 150);
+        assert_eq!(c.requests_success, Some(5));
+    }
+
+    #[test]
+    fn absent_metrics_is_none() {
+        assert!(parse_throughput_counters("# nothing here\n").is_none());
+    }
+
+    #[test]
+    fn idle_backend_at_zero_is_some_not_none() {
+        // A genuinely idle vLLM backend still emits the families at 0 -- must
+        // not be confused with "unreachable" (None), which the caller renders
+        // differently (no data yet vs. zero traffic).
+        let body = r#"
+vllm:generation_tokens_total{engine="0"} 0.0
+vllm:request_success_total{engine="0",finished_reason="stop"} 0.0
+"#;
+        let c = parse_throughput_counters(body).expect("zero is still Some");
+        assert_eq!(c.generation_tokens, 0);
+        assert_eq!(c.requests_success, Some(0));
+    }
+
+    #[test]
+    fn llamacpp_dialect_has_tokens_but_no_requests() {
+        // llama.cpp's --metrics exposition: tokens_predicted_total exists,
+        // there is no request-completion counter at all (only point-in-time
+        // gauges, which must not be wired in as if they were one).
+        let body = r#"
+llamacpp:prompt_tokens_total 500
+llamacpp:tokens_predicted_total 120
+llamacpp:requests_processing 2
+llamacpp:requests_deferred 0
+"#;
+        let c = parse_throughput_counters(body).expect("should parse the llama.cpp dialect");
+        assert_eq!(c.generation_tokens, 120);
+        assert_eq!(c.requests_success, None, "llama.cpp has no request-completion counter");
+    }
+
+    #[test]
+    fn rates_none_before_two_samples() {
+        let h = BackendHandle::new("http://x".into(), 8, 1, 0);
+        assert!(h.throughput_rates().is_none(), "single sample must not report a rate");
+        h.push_throughput_sample(100, Some(1));
+        assert!(
+            h.throughput_rates().is_none(),
+            "still only one sample after the first push"
+        );
+    }
+
+    #[test]
+    fn rates_computed_from_oldest_to_newest_sample() {
+        let h = BackendHandle::new("http://x".into(), 8, 1, 0);
+        // Directly exercise the window math without sleeping in a test: push
+        // synthetic samples straight into the buffer via push_throughput_sample,
+        // then assert the delta is what the counters imply. Real elapsed time
+        // between the two pushes is whatever the test takes (microseconds), so
+        // assert on the RATIO (tok_delta/req_delta) rather than an absolute
+        // tok/s figure, which would be flaky under load.
+        h.push_throughput_sample(1000, Some(10));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        h.push_throughput_sample(1500, Some(15));
+        let (tok_s, qps) = h.throughput_rates().expect("two samples should yield a rate");
+        let qps = qps.expect("both samples carried a request count, qps must be Some");
+        assert!(tok_s > 0.0, "generation delta is positive, rate must be positive");
+        assert!(qps > 0.0, "request delta is positive, rate must be positive");
+        // 500 tokens / 5 requests = 100 tokens per request, regardless of the
+        // actual elapsed wall time (which cancels out of the ratio).
+        assert!((tok_s / qps - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn qps_is_none_when_backend_never_reports_requests() {
+        // A llama.cpp backend: every sample carries generation_tokens but no
+        // requests_success. tok/s must still compute; qps must stay None
+        // rather than silently reading as 0 requests.
+        let h = BackendHandle::new("http://x".into(), 8, 1, 0);
+        h.push_throughput_sample(1000, None);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        h.push_throughput_sample(1500, None);
+        let (tok_s, qps) = h.throughput_rates().expect("two samples should yield a tok/s rate");
+        assert!(tok_s > 0.0);
+        assert!(qps.is_none(), "no backend ever reported a request count, qps must be None");
+    }
+
+    #[test]
+    fn counter_reset_yields_none_not_negative() {
+        // vLLM process restart resets its counters to 0. A naive delta would
+        // go negative and be misreported as a negative rate.
+        let h = BackendHandle::new("http://x".into(), 8, 1, 0);
+        h.push_throughput_sample(1000, Some(10));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        h.push_throughput_sample(50, Some(2)); // counters went backwards
+        assert!(
+            h.throughput_rates().is_none(),
+            "a backwards counter delta must not be reported as a negative rate"
+        );
+    }
+
+    #[test]
+    fn peak_inflight_is_none_before_any_sample() {
+        let h = BackendHandle::new("http://x".into(), 8, 1, 0);
+        assert!(
+            h.peak_inflight_in_window().is_none(),
+            "no samples yet — must read as warming up, not a 0 burst"
+        );
+    }
+
+    #[test]
+    fn peak_inflight_survives_after_the_burst_ends() {
+        // The regression this pins: a single current-inflight snapshot on a
+        // ~12-15s dashboard poll can land AFTER a short burst has already
+        // drained, and would then report 0 -- exactly the "how do I see a
+        // burst that already happened" gap an operator hit. peak_inflight
+        // must remember the high-water mark for the rest of the window even
+        // once inflight has dropped back down.
+        let h = Arc::new(BackendHandle::new("http://x".into(), 8, 1, 0));
+        let g1 = h.acquire();
+        let g2 = h.acquire();
+        let g3 = h.acquire();
+        assert_eq!(h.inflight(), 3);
+        h.push_throughput_sample(100, Some(1)); // samples inflight=3 at push time
+        drop(g1);
+        drop(g2);
+        drop(g3);
+        assert_eq!(h.inflight(), 0, "burst has drained");
+        h.push_throughput_sample(150, Some(2)); // samples inflight=0
+        assert_eq!(
+            h.peak_inflight_in_window(),
+            Some(3),
+            "the 3-deep burst must still be visible as the window's peak"
+        );
     }
 }

@@ -211,6 +211,10 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     let llm_pool = {
         let pool = Arc::new(crate::llm_pool::BackendPool::from_settings(&settings));
         pool.clone().start_health_prober(http.clone());
+        // Scrape each backend's engine queue depth so the resolver can spill to
+        // OpenRouter BEFORE queueing. The in-flight roof only counts requests
+        // this process issued and is blind to other clients on the same GPU.
+        pool.clone().start_queue_scraper(http.clone());
         tracing::info!(
             "llm pool: {} unique backend(s)",
             pool.all.len()
@@ -337,8 +341,19 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     tracing::info!("mcp: {} tools (POST /mcp)", mcp_registry.len());
     let mut ext_router = parts.ext_routes.merge(mcp::build_router(mcp_registry));
     if parts.enable_llm {
-        ext_router = ext_router.merge(crate::llm::routes());
-        tracing::info!("llm proxy enabled (/v1/*)");
+        // A large-context turn exceeds axum's 2 MiB default and comes back 413
+        // ("Failed to buffer the request body: length limit exceeded"). Measured
+        // on this path: p99 2.08 MB and max 2.16 MB, so the default was
+        // rejecting the top ~1% of real requests outright. Same treatment the
+        // sync plane already gets below.
+        ext_router = ext_router.merge(
+            crate::llm::routes()
+                .layer(axum::extract::DefaultBodyLimit::max(state.settings.llm_max_body_bytes as usize)),
+        );
+        tracing::info!(
+            "llm proxy enabled (/v1/*), max body {} MiB",
+            state.settings.llm_max_body_bytes / (1024 * 1024)
+        );
     }
     if parts.enable_agent {
         ext_router = ext_router.merge(crate::agent::routes());
@@ -355,7 +370,24 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     }
 
     let read_router = read::exec::build_router(&specs);
-    let openapi_router = crate::openapi::build_router(&specs, &parts.openapi_paths);
+    // Document the /v1 surface whenever the LLM plane is on. openapi.rs builds
+    // its doc from the DECLARATIVE read specs, so a compiled route like
+    // /v1/chat/completions is invisible to it -- which is how lum.id/llm ended
+    // up serving an /openapi.json of 18 paths, none of them LLM. The app can
+    // still contribute its own paths; those WIN on a key collision, since an
+    // app overriding a platform route's docs is deliberate.
+    let mut openapi_paths = parts.openapi_paths.clone();
+    if parts.enable_llm {
+        if let (Some(dst), Some(src)) = (
+            openapi_paths.as_object_mut(),
+            crate::llm::openapi_paths().as_object(),
+        ) {
+            for (k, v) in src {
+                dst.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+    let openapi_router = crate::openapi::build_router(&specs, &openapi_paths);
     let router = app::build_router(
         state,
         read_router,

@@ -162,11 +162,77 @@ pub struct Settings {
     /// round-robin across the URL list; everything else goes to the primary.
     /// `/v1/models` aggregates all backends.
     pub llm_backends: Vec<(String, Vec<String>)>,
+    /// Per-backend concurrency roof for the local LLM pool (`LUMID_LLM_BACKEND_MAX_CONCURRENCY`).
+    /// When EVERY resolved local backend for a model is at this in-flight roof (healthy
+    /// but saturated), the request overflows to the OpenRouter catch-all instead of
+    /// piling onto the saturated backend. Protects the on-prem GB10 deepseek from the
+    /// saturation-tipping-into-prefill-stall regime. 0 disables the roof (never overflow).
+    pub llm_backend_max_concurrency: u32,
+    /// Engine-queue roof for the local LLM pool (`LUMID_LLM_BACKEND_QUEUE_ROOF`).
+    ///
+    /// `llm_backend_max_concurrency` counts only requests THIS process issued, so
+    /// it is structurally blind to every other client sharing the same GPU (xpio
+    /// loops, mbb-ai, direct callers). Measured 2026-08-23: vLLM reported
+    /// `num_requests_running=5, num_requests_waiting=5` — ten queued — while the
+    /// in-flight roof still read "room available", so requests were admitted
+    /// straight into a ten-deep engine queue and waited 5-9 minutes.
+    ///
+    /// This roof reads the backend's REAL queue depth from its `/metrics`
+    /// (`vllm:num_requests_waiting`) and treats the backend as full once the
+    /// queue reaches this value, spilling to OpenRouter immediately instead of
+    /// after a timeout. Measured contrast: pre-flight overflow answered in
+    /// 4.1-7.8s where locally-queued requests took 5-9 minutes.
+    ///
+    /// 0 disables the queue roof (in-flight roof still applies). Backends whose
+    /// metrics are unreachable or unparseable are never gated by this.
+    pub llm_backend_queue_roof: u32,
+
+    /// Seconds to wait for the FIRST DATA CHUNK from the local backend before
+    /// ALSO issuing the same request to OpenRouter and forwarding whichever
+    /// answers first (`LLM_HEDGE_AFTER_S`). 0 = disabled.
+    ///
+    /// This is a HEDGE, not a switch. The local request is left running, so if
+    /// OpenRouter is slow, unreachable, or misconfigured the local answer still
+    /// lands -- a slow turn can never become a failed one. That distinction is
+    /// the whole point: the previous switch-style guard fired at 45s, returned
+    /// an empty stream, and poisoned session transcripts.
+    ///
+    /// Must be well above a normal cold prefill (~75s at the ~124k mean context,
+    /// ~1.65k tok/s) so healthy turns are never hedged. Measured tail: 150-180s.
+    pub llm_hedge_after_s: u64,
+
+    /// Max request body accepted on the LLM proxy routes (`LLM_MAX_BODY_BYTES`).
+    ///
+    /// axum's DefaultBodyLimit is 2 MiB and the LLM routes were never given an
+    /// override, so large-context Claude Code turns were rejected with HTTP 413
+    /// ("Failed to buffer the request body: length limit exceeded") — a hard
+    /// user-facing failure, not a stall. Measured request sizes on this path:
+    /// p50 622 KB, p90 1.58 MB, p99 2.08 MB, max 2.16 MB, i.e. the 2 MiB
+    /// default was cutting off the top ~1% of real traffic.
+    ///
+    /// Sized at 8 MiB: ~4x the observed maximum, while staying bounded. The
+    /// body is buffered AND parsed into a serde_json::Value, which costs
+    /// several times the raw size, so this multiplies against
+    /// LUMID_LLM_BACKEND_MAX_CONCURRENCY — do not raise it without raising the
+    /// pod memory limit to match.
+    pub llm_max_body_bytes: u64,
     /// Catch-all backend URL for any explicitly-specified model that isn't the
     /// primary and isn't in `llm_backends`. When set (e.g. `https://openrouter.ai/api`),
     /// unknown model IDs are forwarded there rather than rejected or sent to local.
     /// Empty (default) = fall through to primary.
     pub llm_openrouter_url: String,
+    /// Optional bearer for the OpenRouter catch-all path (`LLM_OPENROUTER_KEY`).
+    /// When set, injected instead of `llm_api_key` on calls to `llm_openrouter_url`.
+    /// Lets kimi-k3 (direct Moonshot, `llm_api_key`) and GLM-5.2 (OpenRouter,
+    /// `llm_openrouter_key`) share the same lumid-llm instance without a key conflict.
+    pub llm_openrouter_key: String,
+    /// Model-id rewrites applied ONLY on the OpenRouter overflow/catch-all path
+    /// (`LUMID_LLM_OPENROUTER_MODEL_MAP`, format `local_id=openrouter_id;…`).
+    /// The local pool serves models under our own short names (e.g.
+    /// `deepseek-v4-flash`), which are not valid OpenRouter ids — forwarding
+    /// them verbatim 400s at OpenRouter. Local-backend requests never consult
+    /// this map; it only rewrites the id in the two `proxy_*_openrouter` calls.
+    pub llm_openrouter_model_map: std::collections::HashMap<String, String>,
     /// Optional bearer for upstream LLM calls made by the agent loop. When
     /// non-empty, the platform injects `Authorization: Bearer <key>` on the
     /// requests it originates from the agent loop. The `/v1/*` proxy does NOT
@@ -336,9 +402,20 @@ impl Settings {
                 })
                 .filter(|(m, urls)| !m.is_empty() && !urls.is_empty())
                 .collect(),
+            llm_backend_max_concurrency: env_u32("LLM_BACKEND_MAX_CONCURRENCY", 16),
+            llm_backend_queue_roof: env_u32("LLM_BACKEND_QUEUE_ROOF", 1),
+            llm_hedge_after_s: env_u32("LLM_HEDGE_AFTER_S", 0) as u64,
+            llm_max_body_bytes: env_u32("LLM_MAX_BODY_BYTES", 8 * 1024 * 1024) as u64,
             llm_openrouter_url: env_str("LLM_OPENROUTER_URL", "")
                 .trim_end_matches('/')
                 .to_string(),
+            llm_openrouter_key: env_str("LLM_OPENROUTER_KEY", ""),
+            llm_openrouter_model_map: env_str("LLM_OPENROUTER_MODEL_MAP", "")
+                .split(';')
+                .filter_map(|e| e.trim().split_once('='))
+                .map(|(local, or)| (local.trim().to_string(), or.trim().to_string()))
+                .filter(|(local, or)| !local.is_empty() && !or.is_empty())
+                .collect(),
             llm_api_key: env_str("LLM_API_KEY", ""),
             user_schemas: env_str("USER_SCHEMAS", "")
                 .split(',')
@@ -436,5 +513,38 @@ mod tests {
     #[test]
     fn parse_peers_empty_input() {
         assert!(parse_peers("", &|_| None).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod llm_body_limit_tests {
+    use super::*;
+
+    // The LLM proxy must accept more than axum's 2 MiB default. Large-context
+    // Claude Code turns measured p99 2.08 MB / max 2.16 MB on this path and were
+    // being rejected with HTTP 413.
+    #[test]
+    fn default_llm_body_limit_clears_observed_traffic() {
+        const AXUM_DEFAULT: u64 = 2 * 1024 * 1024;
+        const OBSERVED_MAX: u64 = 2_156_555;
+        let s = Settings::from_env();
+        assert!(
+            s.llm_max_body_bytes > AXUM_DEFAULT,
+            "must exceed axum's 2 MiB default, got {}",
+            s.llm_max_body_bytes
+        );
+        assert!(
+            s.llm_max_body_bytes > OBSERVED_MAX * 2,
+            "want real headroom over the observed max {OBSERVED_MAX}, got {}",
+            s.llm_max_body_bytes
+        );
+        // Bounded: the body is parsed into a serde_json::Value (several times the
+        // raw size) and multiplies by backend concurrency, so an unbounded value
+        // trades a 413 for an OOM.
+        assert!(
+            s.llm_max_body_bytes <= 32 * 1024 * 1024,
+            "limit is unbounded enough to risk OOM: {}",
+            s.llm_max_body_bytes
+        );
     }
 }

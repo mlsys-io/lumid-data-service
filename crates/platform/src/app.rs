@@ -77,6 +77,10 @@ pub fn build_router(
         .route("/admin/ingress/acl", post(handlers::ingest::grant_acl).delete(handlers::ingest::revoke_acl))
         .route("/admin/ingress/refresh-schemas", post(handlers::ingest::refresh_schemas))
         .route("/admin/ingress/refresh-acl", post(handlers::ingest::refresh_acl))
+        // On-prem GPU backend throughput (tok/s, QPS) over a rolling window —
+        // see handlers/llm_stats.rs. Admin-gated the same way as the routes
+        // above it; reads lumid-llm's own in-process scrape, no new upstream call.
+        .route("/admin/llm-backend-stats", get(handlers::llm_stats::llm_backend_stats))
 
         // LLM reverse proxy is now an opt-in plugin — apps merge
         // `lumid_platform::llm::routes()` (src/llm.rs). Not mounted by the platform.
