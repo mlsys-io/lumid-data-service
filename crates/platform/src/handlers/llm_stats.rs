@@ -7,7 +7,18 @@
 //! the SAME scrape's parsed counters rather than triggering a new one, so a
 //! page hitting this endpoint on a fast poll costs nothing extra upstream).
 //!
-//! Scoped to `STATS_MODELS` (`deepseek-v4-flash`, `qwen3.8-27b`) only. The
+//! Scoped to `STATS_MODELS` (`deepseek-v4-flash`, `qwen3.8-27b`, `qwen3-vl-8b`)
+//! only.
+//!
+//! `qwen-omni` is deliberately NOT here, for two independent reasons. It has no
+//! `/metrics` (it is a FastAPI preprocessor, not llama.cpp), so its tok/s would
+//! be `None` forever — indistinguishable from "not warmed up yet", which is the
+//! one thing this endpoint's None/0 split exists to disambiguate. And it
+//! generates no tokens of its own: it transcribes audio then proxies the turn to
+//! `qwen3.8-27b`, which is already on this panel, so its throughput would double
+//! count the same GPU work and overstate on-prem capacity. An orchestrator in
+//! front of a listed backend does not belong on a per-backend throughput panel.
+//! The
 //! pool also carries two llama.cpp EMBEDDING backends (qwen3-emb-0.6b/4b on
 //! s0), which are excluded here — "tok/s of generated text" + "QPS of chat
 //! turns" aren't the right measure for an embedding endpoint, and they're
@@ -50,7 +61,7 @@ use super::ingest::require_admin;
 /// The model ids this endpoint reports on. See the module doc for why the
 /// embedding backends (registered under `qwen3-emb-*`) are excluded rather
 /// than shown with a metric that can never populate. Order is display order.
-const STATS_MODELS: &[&str] = &["deepseek-v4-flash", "qwen3.8-27b"];
+const STATS_MODELS: &[&str] = &["deepseek-v4-flash", "qwen3.8-27b", "qwen3-vl-8b"];
 
 /// Static url→human-label map. Nothing in config carries operator-facing
 /// backend names today (only bare URLs + a numeric `#tier=`) — this is
@@ -74,6 +85,10 @@ fn label_for(url: &str) -> String {
         // gives them operator-facing names.
         "http://100.112.35.35:8080" => "gmk".to_string(),
         "http://100.115.66.10:8080" => "n5-max".to_string(),
+        // Qwen3-VL-8B on gmk (2026-09-15) — a SECOND vision path, faster and
+        // weaker than qwen3.8-27b's native mmproj (2.05 s vs 4.43 s on the same
+        // image, identical answers). Distinct port, so it needs its own label.
+        "http://100.112.35.35:8088" => "gmk-vl".to_string(),
         other => other
             .rsplit_once("//")
             .map(|(_, host)| host.to_string())
@@ -174,6 +189,7 @@ mod tests {
         assert_eq!(label_for("http://100.73.23.96:8080"), "luyao1");
         assert_eq!(label_for("http://100.112.35.35:8080"), "gmk");
         assert_eq!(label_for("http://100.115.66.10:8080"), "n5-max");
+        assert_eq!(label_for("http://100.112.35.35:8088"), "gmk-vl");
     }
 
     #[test]
@@ -190,6 +206,28 @@ mod tests {
         // list only ever named one model.
         assert!(STATS_MODELS.contains(&"deepseek-v4-flash"));
         assert!(STATS_MODELS.contains(&"qwen3.8-27b"));
-        assert_eq!(STATS_MODELS.len(), 2, "a third model added here should extend this assertion too");
+        // qwen3-vl-8b added 2026-09-15 — a real chat/vision backend on gmk with
+        // `--metrics`, so tok/s is measurable and meaningful for it.
+        assert!(STATS_MODELS.contains(&"qwen3-vl-8b"));
+        assert_eq!(STATS_MODELS.len(), 3, "a fourth model added here should extend this assertion too");
+    }
+
+    #[test]
+    fn stats_models_excludes_orchestrators_and_non_metrics_backends() {
+        // qwen-omni must NOT be here, and the exclusion is deliberate enough to
+        // pin. Two independent reasons:
+        //  1. It serves no /metrics (FastAPI preprocessor, not llama.cpp), so
+        //     tok_s would be None forever — indistinguishable from "not warmed
+        //     up", which is the exact ambiguity the None/0.0 split exists to
+        //     remove.
+        //  2. It generates no tokens of its own. It transcribes audio and
+        //     proxies the turn to qwen3.8-27b, which is already listed, so its
+        //     throughput would DOUBLE COUNT the same GPU work.
+        assert!(!STATS_MODELS.contains(&"qwen-omni"));
+        // Embedding + ASR ids are excluded for the original reason: "tok/s of
+        // generated text" and "QPS of chat turns" are not the right measures.
+        for id in ["qwen3-emb-0.6b", "qwen3-emb-8b", "qwen-asr"] {
+            assert!(!STATS_MODELS.contains(&id), "{id} is not a chat-throughput backend");
+        }
     }
 }
