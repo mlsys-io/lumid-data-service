@@ -43,6 +43,7 @@ pub const USER_SCHEMAS: &[&str] = &[
     "regulatory",
     "macro",
     "prediction_markets",
+    "options",
     "raw",
     "provenance",
     "obs",
