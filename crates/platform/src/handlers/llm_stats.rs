@@ -75,7 +75,11 @@ fn label_for(url: &str) -> String {
         "http://100.93.49.42:8090" => "GX10".to_string(),
         "http://100.117.154.126:4001" => "s0-CPU-0".to_string(),
         "http://100.117.154.126:4003" => "s0-CPU-1".to_string(),
-        "http://100.73.23.96:8080" => "luyao1".to_string(),
+        // luyao1 carries TWO RTX 5090s, one vLLM per card (2026-09-25). A bare
+        // "luyao1" was fine with one; with two, the second fell through to
+        // "100.73.23.96:8081" on the /code panel. Name the card, not just the box.
+        "http://100.73.23.96:8080" => "luyao1-gpu0".to_string(),
+        "http://100.73.23.96:8081" => "luyao1-gpu1".to_string(),
         // Home-segment AMD Ryzen AI MAX+ 395 boxes (gfx1151), added as
         // qwen3.8-27b tier=1 on 2026-09-15. They were ALREADY appearing on
         // the panel before this - STATS_MODELS already carried qwen3.8-27b
@@ -99,6 +103,10 @@ fn label_for(url: &str) -> String {
 #[derive(Serialize)]
 struct BackendStats {
     label: String,
+    /// The model id this backend is registered under in the pool. The panel
+    /// lists every STATS_MODELS backend in one flat row, so without this a
+    /// reader could not tell a deepseek box from a qwen box by name alone.
+    model: String,
     url: String,
     tier: u32,
     healthy: bool,
@@ -134,13 +142,14 @@ struct BackendStats {
     queue_depth: i32,
 }
 
-fn stats_for(h: &BackendHandle) -> BackendStats {
+fn stats_for(model: &str, h: &BackendHandle) -> BackendStats {
     let (tok_s, qps) = match h.throughput_rates() {
         Some((t, q)) => (Some(round2(t)), q.map(round2)),
         None => (None, None),
     };
     BackendStats {
         label: label_for(&h.url),
+        model: model.to_string(),
         url: h.url.clone(),
         tier: h.tier,
         healthy: h.is_healthy(),
@@ -167,8 +176,8 @@ pub async fn llm_backend_stats(
     // degrade-shape the single-model lookup already had.
     let backends: Vec<BackendStats> = STATS_MODELS
         .iter()
-        .filter_map(|m| st.llm_pool.by_model.get(*m))
-        .flat_map(|hs| hs.iter().map(|h| stats_for(h)))
+        .filter_map(|m| st.llm_pool.by_model.get(*m).map(|hs| (*m, hs)))
+        .flat_map(|(m, hs)| hs.iter().map(move |h| stats_for(m, h)))
         .collect();
     Ok(Json(json!({
         "window_seconds": crate::llm_pool::THROUGHPUT_WINDOW_S,
@@ -186,7 +195,8 @@ mod tests {
         assert_eq!(label_for("http://100.93.49.42:8090"), "GX10");
         assert_eq!(label_for("http://100.117.154.126:4001"), "s0-CPU-0");
         assert_eq!(label_for("http://100.117.154.126:4003"), "s0-CPU-1");
-        assert_eq!(label_for("http://100.73.23.96:8080"), "luyao1");
+        assert_eq!(label_for("http://100.73.23.96:8080"), "luyao1-gpu0");
+        assert_eq!(label_for("http://100.73.23.96:8081"), "luyao1-gpu1");
         assert_eq!(label_for("http://100.112.35.35:8080"), "gmk");
         assert_eq!(label_for("http://100.115.66.10:8080"), "n5-max");
         assert_eq!(label_for("http://100.112.35.35:8088"), "gmk-vl");
