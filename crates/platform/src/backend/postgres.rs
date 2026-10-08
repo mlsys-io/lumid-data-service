@@ -47,10 +47,10 @@ pub fn build_create_table_ddl(plan: &CreateTablePlan<'_>) -> ApiResult<(String, 
     let mut col_ddl = Vec::new();
     for (c, ty) in obj {
         let c_n = norm_ident(c).ok_or_else(|| ApiError::BadRequest(format!("bad column {c:?}")))?;
-        let ty_s = match ty.as_str().unwrap_or("text") {
-            "text" | "bigint" | "double precision" | "boolean" | "jsonb" => ty.as_str().unwrap(),
-            _ => "text",
-        };
+        // The approved type was already checked against ALLOWED_TYPES; a second,
+        // narrower list here once turned integer/timestamptz/date/... into text.
+        let ts = ty.as_str().unwrap_or("text");
+        let ty_s = if crate::ingest::schema_suggest::ALLOWED_TYPES.contains(&ts) { ts } else { "text" };
         col_ddl.push(format!("\"{c_n}\" {ty_s}"));
     }
     // PK = inferred key (+ source for multi-source safety) if all present; else a surrogate.
@@ -229,5 +229,28 @@ impl Backend for PostgresBackend {
         // READ ONLY txn — drop (implicit rollback) is fine, nothing to commit.
         drop(tx);
         Ok(rows_to_objects(&rows))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Map, Value};
+
+    #[test]
+    fn create_table_ddl_keeps_every_allowed_type() {
+        let mut inferred = Map::new();
+        for (i, ty) in crate::ingest::schema_suggest::ALLOWED_TYPES.iter().enumerate() {
+            inferred.insert(format!("c{i}"), json!(ty));
+        }
+        inferred.insert("odd".into(), json!("money"));
+        inferred.insert("nonstr".into(), Value::Null);
+        let plan = CreateTablePlan { schema: "s", table: "t", inferred: &inferred, key: &[] };
+        let (_, _, ddl) = build_create_table_ddl(&plan).unwrap();
+        for (i, ty) in crate::ingest::schema_suggest::ALLOWED_TYPES.iter().enumerate() {
+            assert!(ddl.contains(&format!("\"c{i}\" {ty}")), "{ty} lost in:\n{ddl}");
+        }
+        assert!(ddl.contains("\"odd\" text"), "{ddl}");
+        assert!(ddl.contains("\"nonstr\" text"), "{ddl}");
     }
 }
