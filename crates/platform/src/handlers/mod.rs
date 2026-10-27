@@ -2,13 +2,14 @@
 //! `my_ext` crate.
 
 pub mod blobs;
-pub mod export;
 pub mod catalog;
+pub mod export;
 pub mod freshness;
 pub mod health;
 pub mod ingest;
 pub mod landing;
 pub mod llm;
+pub mod me_blobs;
 pub mod profile;
 pub mod retrieve;
 pub mod sse_quotes;
