@@ -149,7 +149,8 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         &settings.rate_limit_anon,
         &settings.rate_limit_authed,
     ));
-    let concurrency = if settings.max_concurrency_per_key > 0 || settings.max_concurrency_per_ip > 0 {
+    let concurrency = if settings.max_concurrency_per_key > 0 || settings.max_concurrency_per_ip > 0
+    {
         let pk = settings.max_concurrency_per_key.max(1);
         let pi = settings.max_concurrency_per_ip.max(1);
         tracing::info!("concurrency limits: {pk}/key  {pi}/ip");
@@ -160,7 +161,11 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     tracing::info!(
         "auth: {} local key(s), lumid {}",
         local_keys.len(),
-        if settings.lumid_enabled { "enabled" } else { "disabled" }
+        if settings.lumid_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
 
     let (redis, redis_client) = if settings.redis_url.is_empty() {
@@ -186,8 +191,14 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
 
     let hub = match (&redis, &redis_client) {
         (Some(mux), Some(client)) => {
-            let h =
-                realtime::start(settings.clone(), client.clone(), mux.clone(), pool.clone(), parts.workers).await;
+            let h = realtime::start(
+                settings.clone(),
+                client.clone(),
+                mux.clone(),
+                pool.clone(),
+                parts.workers,
+            )
+            .await;
             // Warm a baseline subscription set so `/quotes` stays live without a
             // client stream (demand-gating otherwise leaves last:tick cold).
             h.warm(&settings.rt_warm_symbols).await;
@@ -215,10 +226,7 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         // OpenRouter BEFORE queueing. The in-flight roof only counts requests
         // this process issued and is blind to other clients on the same GPU.
         pool.clone().start_queue_scraper(http.clone());
-        tracing::info!(
-            "llm pool: {} unique backend(s)",
-            pool.all.len()
-        );
+        tracing::info!("llm pool: {} unique backend(s)", pool.all.len());
         pool
     };
 
@@ -227,7 +235,10 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     let spec_path = config::env_var("READ_CONFIG").unwrap_or_else(|| "read.toml".to_string());
     let specs = match read::load_specs(&spec_path) {
         Ok(s) => {
-            tracing::info!("read layer: {} declarative endpoints from {spec_path}", s.len());
+            tracing::info!(
+                "read layer: {} declarative endpoints from {spec_path}",
+                s.len()
+            );
             s
         }
         Err(e) => {
@@ -270,12 +281,21 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
             settings.ch_url,
             settings.ch_database
         );
-        Arc::new(crate::backend::Registry::new_with_clickhouse(pool.clone(), ch))
+        Arc::new(crate::backend::Registry::new_with_clickhouse(
+            pool.clone(),
+            ch,
+        ))
     };
 
     let feed_liveness = parts
         .feed_liveness
         .unwrap_or_else(|| Arc::new(realtime::DefaultFeedLiveness));
+
+    // Tenant-private blobs (`/me/blobs`): the owner-keyed index, when blob
+    // storage is configured at all.
+    if !settings.blob_root.is_empty() {
+        crate::handlers::me_blobs::migrate(&pool).await?;
+    }
 
     // Data-push plane: create the `sync` bookkeeping tables (idempotent) when
     // enabled. A target that can't migrate its inbox shouldn't start.
@@ -319,9 +339,9 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     // Shadow catch-all forward cache — only consulted when `read_federate` is set
     // (shadow mode). Built unconditionally (cheap); the middleware short-circuits
     // to a passthrough when not shadowing.
-    let shadow_cache = crate::federation::ShadowCache::new(
-        std::time::Duration::from_secs(settings.shadow_cache_ttl_s.max(1)),
-    );
+    let shadow_cache = crate::federation::ShadowCache::new(std::time::Duration::from_secs(
+        settings.shadow_cache_ttl_s.max(1),
+    ));
     if settings.read_federate.is_some() {
         tracing::info!(
             "shadow catch-all forward active (read_federate={:?}, cache_ttl={}s)",
@@ -331,9 +351,26 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     }
 
     let state = state::AppState {
-        pool, xpio_pool, settings, lumid, local_keys, rate, concurrency, redis, redis_client, hub, http,
-        http_stream, llm_pool, read_cache, blob_store, backends, feed_liveness, card_store,
-        federation, shadow_cache,
+        pool,
+        xpio_pool,
+        settings,
+        lumid,
+        local_keys,
+        rate,
+        concurrency,
+        redis,
+        redis_client,
+        hub,
+        http,
+        http_stream,
+        llm_pool,
+        read_cache,
+        blob_store,
+        backends,
+        feed_liveness,
+        card_store,
+        federation,
+        shadow_cache,
     };
 
     // Auto-MCP: one tool per declarative read endpoint, merged into ext routes.
@@ -346,10 +383,9 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         // on this path: p99 2.08 MB and max 2.16 MB, so the default was
         // rejecting the top ~1% of real requests outright. Same treatment the
         // sync plane already gets below.
-        ext_router = ext_router.merge(
-            crate::llm::routes()
-                .layer(axum::extract::DefaultBodyLimit::max(state.settings.llm_max_body_bytes as usize)),
-        );
+        ext_router = ext_router.merge(crate::llm::routes().layer(
+            axum::extract::DefaultBodyLimit::max(state.settings.llm_max_body_bytes as usize),
+        ));
         tracing::info!(
             "llm proxy enabled (/v1/*), max body {} MiB",
             state.settings.llm_max_body_bytes / (1024 * 1024)
@@ -362,10 +398,9 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     if parts.enable_sync {
         // Inbox batches can exceed axum's 2 MB default; bound to the same limit
         // as the ingest write plane.
-        ext_router = ext_router.merge(
-            crate::sync::routes()
-                .layer(axum::extract::DefaultBodyLimit::max(state.settings.ingest_max_bytes as usize)),
-        );
+        ext_router = ext_router.merge(crate::sync::routes().layer(
+            axum::extract::DefaultBodyLimit::max(state.settings.ingest_max_bytes as usize),
+        ));
         tracing::info!("sync plane enabled (POST /sync/apply, /admin/sync/*)");
     }
 

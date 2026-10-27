@@ -27,9 +27,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use futures_util::TryStreamExt;
-use object_store::{
-    path::Path as ObjPath, Attribute, Attributes, Error as ObjError, PutPayload,
-};
+use object_store::{path::Path as ObjPath, Attribute, Attributes, Error as ObjError, PutPayload};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::Identity;
@@ -194,7 +192,12 @@ pub fn resolve_content_type(stored: Option<&str>, db: Option<&str>, key: &str) -
 /// Options: nosniff` prevents MIME-sniffing but does not suppress a server
 /// that correctly declares its own JS content-type.
 pub fn is_active_content_type(ct: &str) -> bool {
-    let base = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let base = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     matches!(
         base.as_str(),
         "text/html"
@@ -209,14 +212,24 @@ pub fn is_active_content_type(ct: &str) -> bool {
 
 pub async fn list_blobs(
     State(st): State<AppState>,
+    identity: Option<Extension<Identity>>,
     Query(params): Query<ListParams>,
 ) -> ApiResult<Json<ListBlobsResponse>> {
+    // Tenant-private objects never appear in the shared listing (admins and
+    // local keys excepted); a user lists their own through GET /me/blobs.
+    let show_tenants = identity.as_ref().is_some_and(|Extension(id)| {
+        id.role == "local" || matches!(id.role.as_str(), "admin" | "super_admin")
+    });
+    let tp = crate::handlers::me_blobs::TENANT_PREFIX;
+    let hidden_key =
+        |k: &str, rp: &str| is_hidden_key(k, rp) || (!show_tenants && is_hidden_key(k, tp));
+    let hidden_prefix =
+        |p: &str, rp: &str| is_hidden_prefix(p, rp) || (!show_tenants && is_hidden_prefix(p, tp));
     if st.settings.blob_root.is_empty() {
         return Err(ApiError::Unavailable("blob storage not configured".into()));
     }
 
-    let prefix_path =
-        sanitize_prefix(params.prefix.as_deref().unwrap_or(""))?;
+    let prefix_path = sanitize_prefix(params.prefix.as_deref().unwrap_or(""))?;
     let limit = clamp_limit(params.limit);
     let use_delimiter = params.delimiter.as_deref().is_some_and(|d| !d.is_empty());
 
@@ -233,7 +246,7 @@ pub async fn list_blobs(
         let visible_objects: Vec<BlobItem> = result
             .objects
             .into_iter()
-            .filter(|m| !is_hidden_key(&m.location.to_string(), rp))
+            .filter(|m| !hidden_key(&m.location.to_string(), rp))
             .map(|m| BlobItem {
                 key: m.location.to_string(),
                 size: m.size,
@@ -244,7 +257,7 @@ pub async fn list_blobs(
             .common_prefixes
             .into_iter()
             .map(|p| p.to_string())
-            .filter(|p| !is_hidden_prefix(p, rp))
+            .filter(|p| !hidden_prefix(p, rp))
             .collect();
 
         let truncated = visible_objects.len() > limit || visible_prefixes.len() > limit;
@@ -269,7 +282,7 @@ pub async fn list_blobs(
         {
             let key = meta.location.to_string();
             // Security: hide retrieval-output prefix from enumeration.
-            if is_hidden_key(&key, rp) {
+            if hidden_key(&key, rp) {
                 continue;
             }
             objects.push(BlobItem {
@@ -295,12 +308,23 @@ pub async fn list_blobs(
 
 pub async fn serve_blob(
     State(st): State<AppState>,
+    identity: Option<Extension<Identity>>,
     Path(key): Path<String>,
 ) -> ApiResult<Response> {
     if st.settings.blob_root.is_empty() {
         return Err(ApiError::Unavailable("blob storage not configured".into()));
     }
     let key = sanitize_key(&key).ok_or_else(|| ApiError::BadRequest("invalid key".into()))?;
+    // Tenant-private objects (`tenants/<sub>/…`, see me_blobs): owner or admin
+    // only. 404 rather than 403, so a probe cannot confirm someone else's key.
+    if let Some(owner) = crate::handlers::me_blobs::tenant_owner_of(&key) {
+        let allowed = identity
+            .as_ref()
+            .is_some_and(|Extension(id)| crate::handlers::me_blobs::may_read_tenant(id, owner));
+        if !allowed {
+            return Err(ApiError::NotFound("blob not found".into()));
+        }
+    }
 
     // Fetch from the object store (localfs default, or S3/MinIO).
     let got = match st.blob_store.get(&ObjPath::from(key.as_str())).await {
@@ -317,7 +341,10 @@ pub async fn serve_blob(
     //     extensionless `sha256=...` keys can never be extension-guessed;
     //  3) an extension guess;
     //  4) `application/octet-stream`.
-    let stored_raw = got.attributes.get(&Attribute::ContentType).map(|v| v.to_string());
+    let stored_raw = got
+        .attributes
+        .get(&Attribute::ContentType)
+        .map(|v| v.to_string());
 
     // Skip the DB round-trip entirely when the object's own metadata already
     // gives a valid type.
@@ -333,7 +360,10 @@ pub async fn serve_blob(
 
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, ct_header)
-        .header(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+        .header(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        );
 
     if is_active_content_type(&ct) {
         builder = builder.header(
@@ -356,8 +386,16 @@ const ADMIN_SCOPES: &[&str] = &["*", "lumilake:*", "lumilake:admin"];
 /// Require the `lumilake:write` scope (or an admin scope / local API key).
 /// Exposed `pub` so tests can exercise the guard directly.
 pub fn require_blob_write(identity: &Identity) -> ApiResult<()> {
-    if identity.role == "local" { return Ok(()); }
-    if identity.scopes.iter().any(|s| s == "lumilake:write" || ADMIN_SCOPES.contains(&s.as_str())) { return Ok(()); }
+    if identity.role == "local" {
+        return Ok(());
+    }
+    if identity
+        .scopes
+        .iter()
+        .any(|s| s == "lumilake:write" || ADMIN_SCOPES.contains(&s.as_str()))
+    {
+        return Ok(());
+    }
     Err(ApiError::Forbidden("lumilake:write scope required".into()))
 }
 
@@ -447,9 +485,5 @@ pub async fn delete_blob(
 /// Back-compat alias → 302 redirect to `/blobs/{path}`.
 pub async fn legacy_storage_alias(Path(path): Path<String>) -> Response {
     let location = format!("/blobs/{path}");
-    (
-        StatusCode::FOUND,
-        [(header::LOCATION, location)],
-    )
-        .into_response()
+    (StatusCode::FOUND, [(header::LOCATION, location)]).into_response()
 }
