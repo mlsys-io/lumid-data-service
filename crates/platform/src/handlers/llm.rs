@@ -1250,25 +1250,41 @@ pub async fn list_models(
         .map(|(local, or)| (or.as_str(), local.as_str()))
         .collect();
 
-    let mut data: Vec<Value> = Vec::new();
-    let mut seen = std::collections::HashSet::<String>::new();
-    for base in &bases {
-        let is_or = !or_base.is_empty() && base.as_str() == or_base.as_str();
+    // CONCURRENT, each leg bounded. This used to walk the backends one by one on
+    // `st.http`, whose timeout is sized for long LLM generations -- so ONE backend
+    // that accepts the TCP connection and never answers (a hung box behind a
+    // tailnet relay: measured 2026-10-27, gmk offline -> six legs) stalled the whole
+    // catalog for minutes while chat itself was fine. A leg that misses the budget
+    // is dropped from the listing (and logged), exactly like an unreachable one.
+    const LEG_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+    let legs = bases.iter().map(|base| {
         let mut req = st.http.get(format!("{base}/v1/models"));
         if !st.settings.llm_api_key.is_empty() {
             req = req.header("Authorization", format!("Bearer {}", st.settings.llm_api_key));
         }
-        let r = match req.send().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("list_models: {base} unreachable: {e}");
-                continue;
+        async move {
+            match tokio::time::timeout(LEG_BUDGET, async {
+                let r = req.send().await.map_err(|e| format!("unreachable: {e}"))?;
+                r.json::<Value>().await.map_err(|e| format!("json error: {e}"))
+            })
+            .await
+            {
+                Ok(res) => res,
+                Err(_) => Err(format!("no answer within {}s", LEG_BUDGET.as_secs())),
             }
-        };
-        let v: Value = match r.json().await {
+        }
+    });
+    // join_all keeps input order, so the primary-first precedence of `seen` holds.
+    let results = futures_util::future::join_all(legs).await;
+
+    let mut data: Vec<Value> = Vec::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    for (base, res) in bases.iter().zip(results) {
+        let is_or = !or_base.is_empty() && base.as_str() == or_base.as_str();
+        let v: Value = match res {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("list_models: {base} json error: {e}");
+                tracing::warn!("list_models: {base} {e}");
                 continue;
             }
         };
