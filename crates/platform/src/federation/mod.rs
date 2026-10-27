@@ -63,17 +63,17 @@ pub struct Federation {
 impl Federation {
     /// Build from settings-derived peers + a reused reqwest client (share the
     /// platform's `http` client so connection pools/timeouts are consistent).
-    pub fn new(
-        peers: &[Peer],
-        http: reqwest::Client,
-        instance_id: String,
-        app_id: String,
-    ) -> Self {
+    pub fn new(peers: &[Peer], http: reqwest::Client, instance_id: String, app_id: String) -> Self {
         let peers = peers
             .iter()
             .map(|p| (p.id.clone(), p.clone()))
             .collect::<HashMap<_, _>>();
-        Self { peers, http, instance_id, app_id }
+        Self {
+            peers,
+            http,
+            instance_id,
+            app_id,
+        }
     }
 
     /// Look up a peer by id.
@@ -104,7 +104,10 @@ impl Federation {
         body: Vec<u8>,
         origin: &OriginIdentity,
     ) -> Response {
-        match self.forward_parts(peer, method, path, query, body, origin).await {
+        match self
+            .forward_parts(peer, method, path, query, body, origin)
+            .await
+        {
             Ok((status, headers, bytes)) => {
                 let mut response = Response::builder().status(status);
                 if let Some(h) = response.headers_mut() {
@@ -163,8 +166,8 @@ impl Federation {
             }
         };
 
-        let status = StatusCode::from_u16(resp.status().as_u16())
-            .unwrap_or(StatusCode::BAD_GATEWAY);
+        let status =
+            StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         // Preserve the relay-relevant response headers before consuming the body.
         let mut out_headers = HeaderMap::new();
         for name in [header::CONTENT_TYPE, header::ETAG, header::CACHE_CONTROL] {
@@ -195,11 +198,7 @@ fn bad_gateway() -> Response {
 /// Strip control chars that would make a header value invalid; empty → a single
 /// space so `HeaderValue::from_str` never fails on a legitimate-but-empty field.
 fn sanitize_header(s: &str) -> HeaderValue {
-    let cleaned: String = s
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(1024)
-        .collect();
+    let cleaned: String = s.chars().filter(|c| !c.is_control()).take(1024).collect();
     HeaderValue::from_str(&cleaned).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
@@ -227,6 +226,11 @@ const LOCAL_ONLY_EXACT: &[&str] = &["/health", "/metrics", "/openapi.json"];
 const LOCAL_ONLY_PREFIX: &[&str] = &[
     "/health/", // /health/db, /health/ready
     "/v1/",     // LLM reverse proxy (its own federation switch)
+    // Tenant-private blobs (handlers::me_blobs): the bytes live where they
+    // were uploaded, and the forward cache is keyed by path — not caller — so
+    // forwarding a per-caller read could serve one tenant's answer to another.
+    "/me/blobs",
+    "/blobs/tenants/",
 ];
 
 /// True when `path` must be served locally (not forwarded) even in shadow mode.
@@ -359,7 +363,10 @@ pub async fn shadow_forward(State(st): State<AppState>, req: Request, next: Next
     let origin = req
         .extensions()
         .get::<Identity>()
-        .map(|i| OriginIdentity { sub: i.sub.clone(), role: i.role.clone() })
+        .map(|i| OriginIdentity {
+            sub: i.sub.clone(),
+            role: i.role.clone(),
+        })
         .unwrap_or_default();
 
     // Cache: serve a warm GET 200 without a peer round-trip. HEAD is never
@@ -374,7 +381,14 @@ pub async fn shadow_forward(State(st): State<AppState>, req: Request, next: Next
     // Forward to the peer's identical endpoint (GET/HEAD → no request body).
     let (status, headers, body) = match st
         .federation
-        .forward_parts(&peer, method.clone(), &path, query.as_deref(), Vec::new(), &origin)
+        .forward_parts(
+            &peer,
+            method.clone(),
+            &path,
+            query.as_deref(),
+            Vec::new(),
+            &origin,
+        )
         .await
     {
         Ok(parts) => parts,
@@ -404,13 +418,11 @@ mod tests {
 
     fn fed() -> Federation {
         Federation::new(
-            &[
-                Peer {
-                    id: "primary".into(),
-                    base_url: "http://primary:8088".into(),
-                    token: "t".into(),
-                },
-            ],
+            &[Peer {
+                id: "primary".into(),
+                base_url: "http://primary:8088".into(),
+                token: "t".into(),
+            }],
             reqwest::Client::new(),
             "shadow".into(),
             "findata".into(),
@@ -470,10 +482,19 @@ mod tests {
             "/blobs/retrievals/078aaaef-d5fc-496a-9f4f-daa270ed4214/result.jsonl",
             "retrievals"
         ));
-        assert!(is_local_retrieval_blob("/blobs/custom-pfx/abc/result.csv", "custom-pfx"));
+        assert!(is_local_retrieval_blob(
+            "/blobs/custom-pfx/abc/result.csv",
+            "custom-pfx"
+        ));
         // Ordinary CAS blobs DO live on the primary — these must keep federating.
-        assert!(!is_local_retrieval_blob("/blobs/images/sha256=deadbeef", "retrievals"));
-        assert!(!is_local_retrieval_blob("/blobs/retrievalsX/a/result.jsonl", "retrievals"));
+        assert!(!is_local_retrieval_blob(
+            "/blobs/images/sha256=deadbeef",
+            "retrievals"
+        ));
+        assert!(!is_local_retrieval_blob(
+            "/blobs/retrievalsX/a/result.jsonl",
+            "retrievals"
+        ));
         assert!(!is_local_retrieval_blob("/blobs/retrievals", "retrievals"));
         // An unset prefix must not turn the whole blob plane local.
         assert!(!is_local_retrieval_blob("/blobs/anything/x", ""));

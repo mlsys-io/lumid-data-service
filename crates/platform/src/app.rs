@@ -37,82 +37,142 @@ pub fn build_router(
         .route("/usage", get(handlers::usage::usage))
         // Webhook ingress: HMAC-authenticated, mounted OUTSIDE the gate.
         .route("/webhook/:webhook_id", post(handlers::ingest::post_webhook));
-        // Realtime WebSocket routes (self-authenticating, outside the gate) are
-        // app-contributed via `ServeParts.public_routes` — the platform exposes
-        // the generic `ws::{quotes,news}` transport handlers but names no path.
+    // Realtime WebSocket routes (self-authenticating, outside the gate) are
+    // app-contributed via `ServeParts.public_routes` — the platform exposes
+    // the generic `ws::{quotes,news}` transport handlers but names no path.
 
     let gated = Router::new()
         // Catalog read plane (provenance-exposing) — port of api/routes/catalog.py.
         .route("/catalog/schemas", get(handlers::catalog::get_schemas))
-        .route("/catalog/schemas/:schema/tables", get(handlers::catalog::get_schema_tables))
-        .route("/catalog/tables/:schema/:table", get(handlers::catalog::get_table_profile))
-        .route("/catalog/ingress/writable", get(handlers::catalog::get_writable))
-        .route("/catalog/lineage/run/:run_id", get(handlers::catalog::get_lineage_run))
-        .route("/catalog/lineage/runs", get(handlers::catalog::get_lineage_runs))
-        .route("/catalog/lineage/row", get(handlers::catalog::get_lineage_row))
+        .route(
+            "/catalog/schemas/:schema/tables",
+            get(handlers::catalog::get_schema_tables),
+        )
+        .route(
+            "/catalog/tables/:schema/:table",
+            get(handlers::catalog::get_table_profile),
+        )
+        .route(
+            "/catalog/ingress/writable",
+            get(handlers::catalog::get_writable),
+        )
+        .route(
+            "/catalog/lineage/run/:run_id",
+            get(handlers::catalog::get_lineage_run),
+        )
+        .route(
+            "/catalog/lineage/runs",
+            get(handlers::catalog::get_lineage_runs),
+        )
+        .route(
+            "/catalog/lineage/row",
+            get(handlers::catalog::get_lineage_row),
+        )
         .route("/catalog/sources", get(handlers::catalog::get_sources))
-        .route("/catalog/submitters", get(handlers::catalog::get_submitters))
-        .route("/catalog/tables/:schema/:table/schema.json", get(handlers::catalog::get_table_schema_json))
-
+        .route(
+            "/catalog/submitters",
+            get(handlers::catalog::get_submitters),
+        )
+        .route(
+            "/catalog/tables/:schema/:table/schema.json",
+            get(handlers::catalog::get_table_schema_json),
+        )
         // Ingress write plane is merged below with a bounded body limit.
-
         // Per-caller usage (requires identity).
         .route("/usage/me", get(handlers::usage::usage_me))
         // Freshness JSON — gated: exposes endpoint SLA health details.
         .route("/freshness", get(handlers::freshness::freshness))
         // Ingress proposals: write to an unknown table → infer schema + stage a
         // proposal; admin lists/approves (creates the table + grants ACL).
-        .route("/catalog/ingress/proposals", get(handlers::ingest::list_proposals))
-        .route("/catalog/ingress/proposals/:id", get(handlers::ingest::get_proposal))
+        .route(
+            "/catalog/ingress/proposals",
+            get(handlers::ingest::list_proposals),
+        )
+        .route(
+            "/catalog/ingress/proposals/:id",
+            get(handlers::ingest::get_proposal),
+        )
         // Builder-driven negotiation (proposer or admin): counter / approve / reject.
-        .route("/ingress/proposals/:id/counter", post(handlers::ingest::counter_proposal))
-        .route("/ingress/proposals/:id/approve", post(handlers::ingest::builder_approve_proposal))
-        .route("/ingress/proposals/:id/reject", post(handlers::ingest::builder_reject_proposal))
-        .route("/admin/ingress/proposals/:id/approve", post(handlers::ingest::approve_proposal))
-        .route("/admin/ingress/proposals/:id/reject", post(handlers::ingest::reject_proposal))
+        .route(
+            "/ingress/proposals/:id/counter",
+            post(handlers::ingest::counter_proposal),
+        )
+        .route(
+            "/ingress/proposals/:id/approve",
+            post(handlers::ingest::builder_approve_proposal),
+        )
+        .route(
+            "/ingress/proposals/:id/reject",
+            post(handlers::ingest::builder_reject_proposal),
+        )
+        .route(
+            "/admin/ingress/proposals/:id/approve",
+            post(handlers::ingest::approve_proposal),
+        )
+        .route(
+            "/admin/ingress/proposals/:id/reject",
+            post(handlers::ingest::reject_proposal),
+        )
         // Export: paginated NDJSON dump of any table, backend-agnostic.
         // Used for single-port cross-instance migration (see handlers/export.rs).
-        .route("/admin/export/:schema/:table", get(handlers::export::get_export))
+        .route(
+            "/admin/export/:schema/:table",
+            get(handlers::export::get_export),
+        )
         // Ingress admin (super_admin / local key) — port of injection/routes/ingest_admin.py.
-        .route("/admin/ingress/acl", post(handlers::ingest::grant_acl).delete(handlers::ingest::revoke_acl))
-        .route("/admin/ingress/refresh-schemas", post(handlers::ingest::refresh_schemas))
-        .route("/admin/ingress/refresh-acl", post(handlers::ingest::refresh_acl))
+        .route(
+            "/admin/ingress/acl",
+            post(handlers::ingest::grant_acl).delete(handlers::ingest::revoke_acl),
+        )
+        .route(
+            "/admin/ingress/refresh-schemas",
+            post(handlers::ingest::refresh_schemas),
+        )
+        .route(
+            "/admin/ingress/refresh-acl",
+            post(handlers::ingest::refresh_acl),
+        )
         // On-prem GPU backend throughput (tok/s, QPS) over a rolling window —
         // see handlers/llm_stats.rs. Admin-gated the same way as the routes
         // above it; reads lumid-llm's own in-process scrape, no new upstream call.
-        .route("/admin/llm-backend-stats", get(handlers::llm_stats::llm_backend_stats))
-
+        .route(
+            "/admin/llm-backend-stats",
+            get(handlers::llm_stats::llm_backend_stats),
+        )
         // LLM reverse proxy is now an opt-in plugin — apps merge
         // `lumid_platform::llm::routes()` (src/llm.rs). Not mounted by the platform.
-
         // Direct SQL/storage retrieval — no LLM; same safety boundary as replay_retrieval_plan.
         .route("/retrieve", post(handlers::retrieve::post_retrieve))
-
         // EXPLAIN-based query cost estimation — feeds the HALO cost model in lumilake.
         // Same safety boundary as /retrieve: SELECT-only parser, READ ONLY txn,
         // statement timeout, optional db role. EXPLAIN is plain (no ANALYZE).
         .route("/profile", post(handlers::profile::post_profile))
-
         // Blob serving (read side). The generic `/blobs/*key` is platform-owned;
         // any domain-named compatibility alias (e.g. a legacy `/storage/...` URL)
         // is app-contributed via `ServeParts.ext_routes` → `blobs::legacy_storage_alias`.
         // Exact `/blobs` (list) here; wildcard `/blobs/*key` (fetch/write/delete) is
         // merged below with a body limit — coexists with this exact route in axum.
         .route("/blobs", get(handlers::blobs::list_blobs))
-
         // Realtime SSE routes (gated) are app-contributed via `ServeParts.ext_routes`
         // — the platform exposes the generic `sse_quotes::quotes_stream` handler
         // but names no path.
-
         // Ingress write plane — bounded body limit (batch NDJSON/file/blob need
         // more than axum's 2 MB default, but not unbounded → OOM/DoS guard).
         .merge(
             Router::new()
                 .route("/ingest/:schema/:table", post(handlers::ingest::post_typed))
-                .route("/ingest/:schema/:table/stream", post(handlers::ingest::post_stream))
-                .route("/ingest/:schema/:table/file", post(handlers::ingest::post_file))
+                .route(
+                    "/ingest/:schema/:table/stream",
+                    post(handlers::ingest::post_stream),
+                )
+                .route(
+                    "/ingest/:schema/:table/file",
+                    post(handlers::ingest::post_file),
+                )
                 .route("/ingest/blob", post(handlers::ingest::post_blob))
-                .layer(axum::extract::DefaultBodyLimit::max(state.settings.ingest_max_bytes as usize)),
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    state.settings.ingest_max_bytes as usize,
+                )),
         )
         // Blob fetch/write/delete by key — bounded body limit (PUT bodies need
         // more than axum's 2 MB default; capped at blob_max_bytes). PUT/DELETE are
@@ -125,7 +185,15 @@ pub fn build_router(
                         .put(handlers::blobs::put_blob)
                         .delete(handlers::blobs::delete_blob),
                 )
-                .layer(axum::extract::DefaultBodyLimit::max(state.settings.blob_max_bytes as usize)),
+                // Tenant-private uploads (see handlers::me_blobs).
+                .route(
+                    "/me/blobs",
+                    get(handlers::me_blobs::list).post(handlers::me_blobs::upload),
+                )
+                .route("/me/blobs/:sha256", get(handlers::me_blobs::fetch))
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    state.settings.blob_max_bytes as usize,
+                )),
         )
         .merge(read_router)
         .merge(ext_router)
@@ -135,7 +203,10 @@ pub fn build_router(
         // so it runs AFTER gate) so the `Identity` extension is available for the
         // `X-Lumid-Origin-*` attribution headers. Pure passthrough when not
         // shadowing — non-shadow instances are byte-identical to today.
-        .layer(from_fn_with_state(state.clone(), crate::federation::shadow_forward))
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::federation::shadow_forward,
+        ))
         .layer(from_fn_with_state(state.clone(), crate::auth::gate));
 
     public
