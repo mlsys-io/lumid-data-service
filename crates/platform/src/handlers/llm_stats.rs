@@ -61,7 +61,9 @@ use super::ingest::require_admin;
 /// The model ids this endpoint reports on. See the module doc for why the
 /// embedding backends (registered under `qwen3-emb-*`) are excluded rather
 /// than shown with a metric that can never populate. Order is display order.
-const STATS_MODELS: &[&str] = &["deepseek-v4-flash", "qwen3.8-27b", "qwen3-vl-8b"];
+// deepseek-v4-flash RETIRED 2026-10-27 -> deepseek-v4.1-flash (NUS s0, 4x H200,
+// vLLM with --metrics on by default, so tok/s populates).
+const STATS_MODELS: &[&str] = &["deepseek-v4.1-flash", "qwen3.8-27b", "qwen3-vl-8b"];
 
 /// Static url→human-label map. Nothing in config carries operator-facing
 /// backend names today (only bare URLs + a numeric `#tier=`) — this is
@@ -93,6 +95,9 @@ fn label_for(url: &str) -> String {
         // weaker than qwen3.8-27b's native mmproj (2.05 s vs 4.43 s on the same
         // image, identical answers). Distinct port, so it needs its own label.
         "http://100.112.35.35:8088" => "gmk-vl".to_string(),
+        // DeepSeek-V4.1-Flash on NUS s0 (vLLM TP4, 4x H200 NVL), 2026-10-27,
+        // reached through s0's own tailscale-lumid container.
+        "http://100.109.20.41:4005" => "s0-h200".to_string(),
         other => other
             .rsplit_once("//")
             .map(|(_, host)| host.to_string())
@@ -214,7 +219,7 @@ mod tests {
         // The regression this whole change fixes: qwen3.8-27b was live and
         // serving real traffic but invisible on the dashboard because this
         // list only ever named one model.
-        assert!(STATS_MODELS.contains(&"deepseek-v4-flash"));
+        assert!(STATS_MODELS.contains(&"deepseek-v4.1-flash"));
         assert!(STATS_MODELS.contains(&"qwen3.8-27b"));
         // qwen3-vl-8b added 2026-09-15 — a real chat/vision backend on gmk with
         // `--metrics`, so tok/s is measurable and meaningful for it.
