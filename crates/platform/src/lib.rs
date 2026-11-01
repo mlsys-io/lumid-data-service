@@ -23,6 +23,7 @@ pub mod mcp;
 pub mod objstore;
 pub mod openapi;
 pub mod parsers;
+pub mod platform_tables;
 pub mod queries;
 pub mod read;
 pub mod realtime;

@@ -291,6 +291,10 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         .feed_liveness
         .unwrap_or_else(|| Arc::new(realtime::DefaultFeedLiveness));
 
+    // Ingestion, catalog, proposal, and blob routes all read platform-owned
+    // bookkeeping, including on a fresh deployment with no migration history.
+    crate::platform_tables::migrate(&pool).await?;
+
     // Tenant-private blobs (`/me/blobs`): the owner-keyed index, when blob
     // storage is configured at all.
     if !settings.blob_root.is_empty() {
