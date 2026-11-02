@@ -98,6 +98,10 @@ fn label_for(url: &str) -> String {
         // DeepSeek-V4.1-Flash on NUS s0 (vLLM TP4, 4x H200 NVL), 2026-10-27,
         // reached through s0's own tailscale-lumid container.
         "http://100.109.20.41:4005" => "s0-h200".to_string(),
+        // DeepSeek-V4.1-Flash-1017 on the office GB10 pair (gx10-db5e rank 0 + gx10-548e rank 1),
+        // TensorFold TP2 over RoCE, 2026-11-02: tier-1 behind s0, reached at db5e's tailnet address.
+        // Not the retired "GX10" entry above (100.93.49.42:8090, vLLM V4-Flash, gone 2026-10-27).
+        "http://100.120.137.90:8000" => "gx10-tp2".to_string(),
         other => other
             .rsplit_once("//")
             .map(|(_, host)| host.to_string())
@@ -205,6 +209,8 @@ mod tests {
         assert_eq!(label_for("http://100.112.35.35:8080"), "gmk");
         assert_eq!(label_for("http://100.115.66.10:8080"), "n5-max");
         assert_eq!(label_for("http://100.112.35.35:8088"), "gmk-vl");
+        assert_eq!(label_for("http://100.109.20.41:4005"), "s0-h200");
+        assert_eq!(label_for("http://100.120.137.90:8000"), "gx10-tp2");
     }
 
     #[test]
