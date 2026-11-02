@@ -671,7 +671,15 @@ struct ThroughputCounters {
 ///   llama.cpp backend; do not wire those gauges in here, they would produce
 ///   a number shaped like a rate that isn't one.
 ///
-/// `None` when NEITHER family's generation-token metric appears at all
+/// - **TensorFold** (the GX10 TP2 lane serving deepseek-v4.1-flash): the
+///   vLLM names under a `tensorfold:` prefix. Only the generation-token
+///   counter is matched; it exports no `request_success_total`, so its QPS
+///   stays `None` exactly like llama.cpp. Without this, the backend was
+///   healthy yet never produced a sample, and the /code GPU panel showed it as
+///   "warming up…" forever. (`parse_num_requests_waiting` is deliberately NOT
+///   widened here: it gates the queue roof and therefore routing.)
+///
+/// `None` when NO family's generation-token metric appears at all
 /// (backend unreachable, or exposes neither dialect) — a genuinely idle
 /// backend still emits the metric at value 0, so this only returns `None` on
 /// absence, not on zero.
@@ -690,6 +698,7 @@ fn parse_throughput_counters(body: &str) -> Option<ThroughputCounters> {
             continue;
         };
         if line.starts_with("vllm:generation_tokens_total")
+            || line.starts_with("tensorfold:generation_tokens_total")
             || line.starts_with("llamacpp:tokens_predicted_total")
         {
             generation_tokens += v;
@@ -1208,6 +1217,21 @@ vllm:request_success_total{engine="0",finished_reason="stop"} 0.0
         let c = parse_throughput_counters(body).expect("zero is still Some");
         assert_eq!(c.generation_tokens, 0);
         assert_eq!(c.requests_success, Some(0));
+    }
+
+    #[test]
+    fn tensorfold_generation_tokens_feed_throughput_without_qps() {
+        // GX10 TP2 lane, 2026-11-02: healthy, serving, but tok_s stuck at
+        // None because only vllm:/llamacpp: names were matched.
+        let body = r#"
+# HELP tensorfold:generation_tokens_total Number of generation tokens processed.
+tensorfold:generation_tokens_total 1825
+tensorfold:num_requests_running 0
+tensorfold:num_requests_waiting 0
+"#;
+        let c = parse_throughput_counters(body).expect("tensorfold counter is recognised");
+        assert_eq!(c.generation_tokens, 1825);
+        assert_eq!(c.requests_success, None, "no completion counter -> no QPS");
     }
 
     #[test]
