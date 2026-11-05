@@ -1,7 +1,7 @@
 //! Backend registry — resolves which storage backend owns a given `schema.table`.
 //!
 //! Source of truth is the `provenance.table_backend(target_schema, target_table,
-//! backend, created_at)` table (created in `lqt-data/ddl/00_provenance.sql`).
+//! backend, created_at)` table (created at boot by `platform_tables::migrate`).
 //! When no row exists the table defaults to **Postgres** — so every pre-existing
 //! table (which has no `table_backend` row) resolves to PG and the legacy path is
 //! byte-identical. The resolve result is moka-cached (like
