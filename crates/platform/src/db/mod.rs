@@ -21,10 +21,19 @@ pub fn build_pool(s: &Settings) -> anyhow::Result<Pool> {
     cfg.password = Some(s.db_password.clone());
     cfg.dbname = Some(s.db_name.clone());
     // Session setup applied to every backend connection.
-    cfg.options = Some(format!(
+    let mut options = format!(
         "-c statement_timeout={} -c application_name=lumid-data-service",
         s.statement_timeout_ms
-    ));
+    );
+    // Single-tenant pin (field boxes): start every connection with the tenant
+    // GUC set so a NOSUPERUSER/NOBYPASSRLS role still sees this tenant's rows via
+    // RLS (`current_setting('app.tenant_id', true)`). `app.tenant_id` is a
+    // placeholder GUC — settable at startup with no extension. The value is a
+    // UUID (hex + hyphens), so it needs no escaping in the options string.
+    if !s.db_tenant_id.is_empty() {
+        options.push_str(&format!(" -c app.tenant_id={}", s.db_tenant_id));
+    }
+    cfg.options = Some(options);
     cfg.manager = Some(ManagerConfig {
         recycling_method: RecyclingMethod::Fast,
     });
