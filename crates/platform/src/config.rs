@@ -187,6 +187,16 @@ pub struct Settings {
     /// metrics are unreachable or unparseable are never gated by this.
     pub llm_backend_queue_roof: u32,
 
+    /// Prompt-size threshold, in ESTIMATED tokens, below which a chat/completion
+    /// request counts as SHORT for routing (`LLM_SHORT_PROMPT_TOKENS`). Short
+    /// requests let backends carrying `#short_tier=T&short_roof=N` compete at
+    /// tier T while under N in flight (see `llm_pool::BackendHandle::short_tier`).
+    /// The estimate is the request body's serialized length / 4 — cheap, and
+    /// deliberately conservative for base64 attachments (they read as long and
+    /// keep the long-request order). 0 disables: every request is routed as
+    /// before, regardless of any `short_*` backend keys.
+    pub llm_short_prompt_tokens: u32,
+
     /// Seconds to wait for the FIRST DATA CHUNK from the local backend before
     /// ALSO issuing the same request to OpenRouter and forwarding whichever
     /// answers first (`LLM_HEDGE_AFTER_S`). 0 = disabled.
@@ -404,6 +414,7 @@ impl Settings {
                 .collect(),
             llm_backend_max_concurrency: env_u32("LLM_BACKEND_MAX_CONCURRENCY", 16),
             llm_backend_queue_roof: env_u32("LLM_BACKEND_QUEUE_ROOF", 1),
+            llm_short_prompt_tokens: env_u32("LLM_SHORT_PROMPT_TOKENS", 0),
             llm_hedge_after_s: env_u32("LLM_HEDGE_AFTER_S", 0) as u64,
             llm_max_body_bytes: env_u32("LLM_MAX_BODY_BYTES", 8 * 1024 * 1024) as u64,
             llm_openrouter_url: env_str("LLM_OPENROUTER_URL", "")

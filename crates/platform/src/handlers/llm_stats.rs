@@ -102,6 +102,9 @@ fn label_for(url: &str) -> String {
         // TensorFold TP2 over RoCE, 2026-11-02: tier-1 behind s0, reached at db5e's tailnet address.
         // Not the retired "GX10" entry above (100.93.49.42:8090, vLLM V4-Flash, gone 2026-10-27).
         "http://100.120.137.90:8000" => "gx10-tp2".to_string(),
+        // The SECOND office GB10 pair (gx10-be0f rank 0 + gx10-548e rank 1), 2026-11-05: same
+        // engine and weights, reached at be0f's tailnet address. Pair A keeps the bare name.
+        "http://100.66.111.117:8000" => "gx10-tp2-b".to_string(),
         other => other
             .rsplit_once("//")
             .map(|(_, host)| host.to_string())
@@ -211,6 +214,7 @@ mod tests {
         assert_eq!(label_for("http://100.112.35.35:8088"), "gmk-vl");
         assert_eq!(label_for("http://100.109.20.41:4005"), "s0-h200");
         assert_eq!(label_for("http://100.120.137.90:8000"), "gx10-tp2");
+        assert_eq!(label_for("http://100.66.111.117:8000"), "gx10-tp2-b");
     }
 
     #[test]

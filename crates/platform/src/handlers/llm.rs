@@ -438,11 +438,23 @@ fn role_may_use_metered_openrouter_model(role: &str) -> bool {
     role == "admin" || role == "super_admin" || role == "local"
 }
 
+/// Whether a request's prompt is SHORT for routing: serialized body length / 4
+/// (a rough chars-per-token estimate) under `llm_short_prompt_tokens`.
+/// Always false when the threshold is 0 (feature off).
+fn is_short_prompt(threshold_tokens: u32, body: &Value) -> bool {
+    if threshold_tokens == 0 {
+        return false;
+    }
+    let bytes = serde_json::to_vec(body).map(|v| v.len()).unwrap_or(usize::MAX);
+    (bytes / 4) < threshold_tokens as usize
+}
+
 fn resolve(
     st: &AppState,
     model: Option<&str>,
     caller: &str,
     caller_role: &str,
+    short: bool,
 ) -> Result<Option<Vec<std::sync::Arc<crate::llm_pool::BackendHandle>>>, ApiError> {
     // CLAUDE NEVER GOES TO OPENROUTER. Claude models (claude-sonnet-*, claude-haiku-*,
     // claude-opus-*, claude-fable-*) are proprietary pooled-account models served by
@@ -460,7 +472,7 @@ fn resolve(
         ));
     }
 
-    let backends = st.llm_pool.backends_for(model);
+    let backends = st.llm_pool.backends_for_class(model, short);
     if !backends.is_empty() {
         // Overflow to OpenRouter when EVERY local backend for this model is at its
         // concurrency roof (healthy but saturated) AND OpenRouter is configured.
@@ -1057,7 +1069,13 @@ async fn dispatch_json(
         Ok(Some(peer)) => {
             proxy_json_peer(st, &peer, method, path, Some(body), &origin_of(ident)).await
         }
-        Ok(None) => match resolve(st, model_of(body).as_deref(), &caller_label(&ident), &caller_role(&ident)) {
+        Ok(None) => match resolve(
+            st,
+            model_of(body).as_deref(),
+            &caller_label(&ident),
+            &caller_role(&ident),
+            is_short_prompt(st.settings.llm_short_prompt_tokens, body),
+        ) {
             Err(e) => e.into_response(),
             Ok(None) => {
                 let body = rewrite_model_for_openrouter(st, body);
@@ -1079,7 +1097,13 @@ async fn dispatch_stream(
     match federation_peer(st) {
         Err(e) => e.into_response(),
         Ok(Some(peer)) => proxy_stream_peer(st, &peer, path, body, &origin_of(ident)).await,
-        Ok(None) => match resolve(st, model_of(body).as_deref(), &caller_label(&ident), &caller_role(&ident)) {
+        Ok(None) => match resolve(
+            st,
+            model_of(body).as_deref(),
+            &caller_label(&ident),
+            &caller_role(&ident),
+            is_short_prompt(st.settings.llm_short_prompt_tokens, body),
+        ) {
             Err(e) => e.into_response(),
             Ok(None) => {
                 let body = rewrite_model_for_openrouter(st, body);
@@ -1107,7 +1131,13 @@ async fn dispatch_bytes(
     path: &str,
     body: &Value,
 ) -> Response {
-    match resolve(st, model_of(body).as_deref(), &caller_label(&ident), &caller_role(&ident)) {
+    match resolve(
+        st,
+        model_of(body).as_deref(),
+        &caller_label(&ident),
+        &caller_role(&ident),
+        false,
+    ) {
         Err(e) => e.into_response(),
         Ok(None) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1546,7 +1576,7 @@ pub async fn audio_transcriptions(
         )
         .into_response();
     };
-    match resolve(&st, Some(&model), &caller_label(&ident), &caller_role(&ident)) {
+    match resolve(&st, Some(&model), &caller_label(&ident), &caller_role(&ident), false) {
         Err(e) => e.into_response(),
         Ok(None) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1817,5 +1847,27 @@ mod thinking_control_tests {
             let out = apply_thinking_control(bad);
             assert!(out.get("chat_template_kwargs").is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod short_prompt_class_tests {
+    use super::is_short_prompt;
+    use serde_json::json;
+
+    #[test]
+    fn threshold_zero_disables() {
+        assert!(!is_short_prompt(
+            0,
+            &json!({"messages":[{"role":"user","content":"hi"}]})
+        ));
+    }
+
+    #[test]
+    fn classifies_by_estimated_tokens() {
+        let small = json!({"model":"m","messages":[{"role":"user","content":"x".repeat(4_000)}]});
+        let big = json!({"model":"m","messages":[{"role":"user","content":"x".repeat(40_000)}]});
+        assert!(is_short_prompt(8_000, &small), "~1k tokens is short at 8k");
+        assert!(!is_short_prompt(8_000, &big), "~10k tokens is long at 8k");
     }
 }
