@@ -60,6 +60,20 @@ pub struct BackendHandle {
     /// GPU+CPU roster means a 3.7x slower box while the GPU sits at 1/32.
     /// Tier makes "spill", not "balance", the semantics.
     pub tier: u32,
+    /// SHORT-PROMPT PREFERENCE (`#short_tier=T&short_roof=N`). For a request the
+    /// handler classifies as short (see `Settings::llm_short_prompt_tokens`),
+    /// this backend competes at `short_tier` instead of `tier` while THIS
+    /// process has fewer than `short_roof` requests in flight to it; past that it
+    /// falls back to its ordinary `tier`. Long requests always use `tier`.
+    ///
+    /// Why: backends behind one model id differ in WHERE they are fast. s0 (H200)
+    /// prefills ~5x faster and holds an 87%-hit prefix cache for the long
+    /// multi-turn sessions, but its prefill queue makes a 2k-token request wait
+    /// 3-8 s behind them; an idle GX10 pair answers that same request in 0.13 s.
+    /// So short requests take a couple of GX10 slots first, long ones go to s0.
+    /// `None` (absent) = no preference: exactly the pre-existing behaviour.
+    pub short_tier: Option<u32>,
+    pub short_roof: u32,
     /// Rolling window of throughput samples for `/admin/llm-backend-stats`.
     /// Populated by `start_queue_scraper` on the same tick as the queue-depth
     /// scrape (see `THROUGHPUT_WINDOW_S`). A `Mutex<VecDeque<_>>` rather than
@@ -107,7 +121,18 @@ impl BackendHandle {
             // all traffic to OpenRouter.
             queue_depth: AtomicI32::new(-1),
             queue_roof,
+            short_tier: None,
+            short_roof: 0,
             throughput_samples: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// The tier this backend competes at for one request: `short_tier` while a
+    /// SHORT request finds it under `short_roof` in-flight, else `tier`.
+    pub fn effective_tier(&self, short: bool) -> u32 {
+        match self.short_tier {
+            Some(t) if short && self.inflight() < self.short_roof as i32 => t,
+            _ => self.tier,
         }
     }
 
@@ -301,6 +326,30 @@ fn parse_suffix(url: &str) -> (&str, u32, Option<u32>) {
     }
 }
 
+/// Parse the optional short-prompt keys off a backend URL suffix:
+/// `short_tier=T` and `short_roof=N`. Returns `(None, 0)` unless BOTH are
+/// present and valid and `short_roof > 0` — a half-configured or mistyped
+/// preference must degrade to "no preference", never to a surprise promotion.
+fn parse_short_suffix(url: &str) -> (Option<u32>, u32) {
+    let Some((_, suffix)) = url.split_once('#') else {
+        return (None, 0);
+    };
+    let (mut t, mut r) = (None, None);
+    for kv in suffix.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            match k.trim() {
+                "short_tier" => t = v.trim().parse::<u32>().ok(),
+                "short_roof" => r = v.trim().parse::<u32>().ok(),
+                _ => {}
+            }
+        }
+    }
+    match (t, r) {
+        (Some(t), Some(r)) if r > 0 => (Some(t), r),
+        _ => (None, 0),
+    }
+}
+
 pub struct BackendPool {
     /// Model name → ordered backend list (config order; routing sorts at call time).
     pub by_model: HashMap<String, Vec<Arc<BackendHandle>>>,
@@ -368,7 +417,9 @@ impl BackendPool {
             let key = base.trim_end_matches('/').to_string();
             seen.entry(key.clone())
                 .or_insert_with(|| {
-                    let h = Arc::new(BackendHandle::new(key, max_concurrency, queue_roof, tier));
+                    let mut b = BackendHandle::new(key, max_concurrency, queue_roof, tier);
+                    (b.short_tier, b.short_roof) = parse_short_suffix(url);
+                    let h = Arc::new(b);
                     all.push(h.clone());
                     h
                 })
@@ -402,6 +453,13 @@ impl BackendPool {
     /// Backends to try for `model`, sorted: healthy-least-loaded first, then
     /// unhealthy (fallback of last resort). Returns empty when nothing is configured.
     pub fn backends_for(&self, model: Option<&str>) -> Vec<Arc<BackendHandle>> {
+        self.backends_for_class(model, false)
+    }
+
+    /// `backends_for`, for a request of a known size class: `short = true` lets
+    /// backends with a `short_tier` preference compete at that tier (see
+    /// `BackendHandle::short_tier`). `short = false` is exactly `backends_for`.
+    pub fn backends_for_class(&self, model: Option<&str>, short: bool) -> Vec<Arc<BackendHandle>> {
         // The primary is a fallback for a request that names NO model, or for a
         // deployment with no OpenRouter catch-all to fall through to.
         //
@@ -446,7 +504,12 @@ impl BackendPool {
             // an assumption this service has already violated once, in the in-flight
             // SLOT LEAK fixed by c1900a6. Tuple ordering cannot be corrupted by a
             // runaway counter, and it makes the tier rung explicit.
-            (!h.is_healthy(), h.at_roof(), h.tier, h.inflight())
+            (
+                !h.is_healthy(),
+                h.at_roof(),
+                h.effective_tier(short),
+                h.inflight(),
+            )
         });
         sorted
     }
@@ -1343,5 +1406,140 @@ llamacpp:requests_deferred 0
             Some(3),
             "the 3-deep burst must still be visible as the window's peak"
         );
+    }
+}
+
+#[cfg(test)]
+mod short_prompt_tests {
+    use super::*;
+
+    /// s0 tier 1; two GX10 pairs tier 2 with a short preference at tier 0 up to 1 in flight.
+    fn pool() -> BackendPool {
+        BackendPool::intern_backends(
+            "",
+            &[(
+                "m".to_string(),
+                vec![
+                    "http://s0:4005#tier=1&max_concurrency=8".to_string(),
+                    "http://gxa:8000#tier=2&max_concurrency=3&short_tier=0&short_roof=1"
+                        .to_string(),
+                    "http://gxb:8000#tier=2&max_concurrency=3&short_tier=0&short_roof=1"
+                        .to_string(),
+                ],
+            )],
+            16,
+            0,
+            String::new(),
+        )
+    }
+
+    #[test]
+    fn parse_short_suffix_needs_both_keys() {
+        assert_eq!(
+            parse_short_suffix("http://x#tier=2&short_tier=0&short_roof=1"),
+            (Some(0), 1)
+        );
+        assert_eq!(
+            parse_short_suffix("http://x#short_roof=1&short_tier=0"),
+            (Some(0), 1)
+        );
+        assert_eq!(
+            parse_short_suffix("http://x#tier=2&short_tier=0"),
+            (None, 0)
+        );
+        assert_eq!(
+            parse_short_suffix("http://x#short_tier=0&short_roof=0"),
+            (None, 0)
+        );
+        assert_eq!(
+            parse_short_suffix("http://x#short_tier=a&short_roof=1"),
+            (None, 0)
+        );
+        assert_eq!(parse_short_suffix("http://x"), (None, 0));
+        // the routing keys are stripped from the dialed URL as before
+        assert_eq!(
+            parse_suffix("http://x:1#tier=2&short_tier=0&short_roof=1").0,
+            "http://x:1"
+        );
+    }
+
+    #[test]
+    fn long_requests_ignore_the_short_preference() {
+        let p = pool();
+        assert_eq!(
+            p.backends_for_class(Some("m"), false)[0].url,
+            "http://s0:4005"
+        );
+        assert_eq!(p.backends_for(Some("m"))[0].url, "http://s0:4005");
+    }
+
+    #[test]
+    fn short_requests_fill_short_slots_then_s0_then_gx() {
+        let p = pool();
+        // 1st and 2nd short request: the two GX10 pairs (tier 0 for short, under short_roof)
+        let a = p.backends_for_class(Some("m"), true)[0].clone();
+        assert!(a.url.starts_with("http://gx"));
+        let _ga = a.acquire();
+        let b = p.backends_for_class(Some("m"), true)[0].clone();
+        assert!(
+            b.url.starts_with("http://gx") && b.url != a.url,
+            "second short goes to the other pair"
+        );
+        let _gb = b.acquire();
+        // both pairs now at short_roof: short traffic falls back to the ordinary order -> s0
+        assert_eq!(
+            p.backends_for_class(Some("m"), true)[0].url,
+            "http://s0:4005"
+        );
+        // and long traffic is unaffected throughout
+        assert_eq!(
+            p.backends_for_class(Some("m"), false)[0].url,
+            "http://s0:4005"
+        );
+    }
+
+    #[test]
+    fn short_preference_never_beats_health_or_roof() {
+        let p = pool();
+        let gx: Vec<_> = p
+            .all
+            .iter()
+            .filter(|h| h.url.starts_with("http://gx"))
+            .cloned()
+            .collect();
+        for h in &gx {
+            for _ in 0..CIRCUIT_OPEN_AFTER {
+                h.on_connect_err();
+            }
+        }
+        assert_eq!(
+            p.backends_for_class(Some("m"), true)[0].url,
+            "http://s0:4005"
+        );
+    }
+
+    #[test]
+    fn no_short_keys_means_identical_order() {
+        let p = BackendPool::intern_backends(
+            "",
+            &[(
+                "m".to_string(),
+                vec!["http://a#tier=1".to_string(), "http://b#tier=0".to_string()],
+            )],
+            4,
+            0,
+            String::new(),
+        );
+        let s: Vec<_> = p
+            .backends_for_class(Some("m"), true)
+            .iter()
+            .map(|h| h.url.clone())
+            .collect();
+        let l: Vec<_> = p
+            .backends_for_class(Some("m"), false)
+            .iter()
+            .map(|h| h.url.clone())
+            .collect();
+        assert_eq!(s, l);
     }
 }
