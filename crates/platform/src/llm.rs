@@ -32,6 +32,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/chat/completions", post(handlers::llm::chat_completions))
         .route("/v1/completions", post(handlers::llm::completions))
         .route("/v1/embeddings", post(handlers::llm::embeddings))
+        .route("/v1/rerank", post(handlers::llm::rerank))
         .route("/v1/images/generations", post(handlers::llm::images_generations))
         .route("/v1/audio/speech", post(handlers::llm::audio_speech))
         .route("/v1/audio/transcriptions", post(handlers::llm::audio_transcriptions))
@@ -104,6 +105,12 @@ pub fn openapi_paths() -> serde_json::Value {
             "description": "Requires an embedding model in the roster; 503 when none is configured.",
             "tags": ["llm"], "security": bearer,
             "responses": { "200": { "description": "Embedding vectors" }, "503": unavailable }
+        } },
+        "/v1/rerank": { "post": {
+            "summary": "Rerank documents against a query (Cohere/Jina-compatible, as served by vLLM)",
+            "description": "Body {model, query, documents, top_n?}; returns results[{index, relevance_score}]. Requires a reranker in the roster (e.g. qwen3-rerank-0.6b).",
+            "tags": ["llm"], "security": bearer,
+            "responses": { "200": { "description": "Ranked results" }, "503": unavailable }
         } },
         "/v1/images/generations": { "post": {
             "summary": "Image generation (OpenAI-compatible) - on-prem ComfyUI",

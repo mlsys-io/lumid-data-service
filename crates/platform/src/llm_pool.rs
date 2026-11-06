@@ -359,6 +359,12 @@ pub struct BackendPool {
     pub all: Vec<Arc<BackendHandle>>,
     /// OpenRouter catch-all URL — forwarded verbatim, not part of the pool.
     pub openrouter_url: String,
+    /// Rotating tie-break for `backends_for_class`. Without it, equally-ranked
+    /// backends kept CONFIG ORDER (stable sort), so the first-listed one won every
+    /// tie: measured 2026-11-06, GX10 pair B (`gx10-tp2-b`, listed after pair A)
+    /// got a request only when pair A already had one in flight, and its 5-min
+    /// tok/s on the /code panel read ~0 while A carried the spill.
+    pub rr: AtomicU32,
 }
 
 impl BackendPool {
@@ -447,6 +453,7 @@ impl BackendPool {
             primary,
             all,
             openrouter_url,
+            rr: AtomicU32::new(0),
         }
     }
 
@@ -493,8 +500,14 @@ impl BackendPool {
             return vec![];
         };
 
-        let mut sorted: Vec<Arc<BackendHandle>> = handles.iter().cloned().collect();
-        sorted.sort_by_key(|h| {
+        // Rotation offset for the LAST key: only consulted when health, roof, tier
+        // and in-flight all tie, so it never overrides a real preference — it just
+        // stops config order from deciding every tie (see `rr`).
+        let n = handles.len();
+        let r = if n > 1 { self.rr.fetch_add(1, Relaxed) as usize % n } else { 0 };
+        let mut sorted: Vec<(usize, Arc<BackendHandle>)> =
+            handles.iter().cloned().enumerate().collect();
+        sorted.sort_by_key(|(i, h)| {
             // Sort order: healthy < unhealthy; then not-at-roof < at-roof; then
             // LOWER tier first; then fewer in-flight. A saturated backend is tried
             // last (still a retry candidate), never silently dropped.
@@ -509,9 +522,10 @@ impl BackendPool {
                 h.at_roof(),
                 h.effective_tier(short),
                 h.inflight(),
+                (i + n - r) % n,
             )
         });
-        sorted
+        sorted.into_iter().map(|(_, h)| h).collect()
     }
 
     /// Spawn a background task that re-probes unhealthy backends every `PROBE_INTERVAL_S` s.
@@ -918,6 +932,26 @@ mod tier_tests {
             primary: None,
             all: hs.to_vec(),
             openrouter_url: String::new(),
+            rr: AtomicU32::new(0),
+        }
+    }
+
+    // Equal backends must SHARE ties, not hand every one to the first-listed.
+    // Regression: GX10 pair B (listed after pair A, same tier/roof) won only when
+    // pair A was already busy, so it sat near-idle on the /code panel.
+    #[test]
+    fn equal_backends_rotate_first_pick() {
+        let a = h("http://pair-a:8000", 3, 2);
+        let b = h("http://pair-b:8000", 3, 2);
+        let p = pool_of(&[a.clone(), b.clone()]);
+        let firsts: Vec<String> = (0..4).map(|_| p.backends_for(Some("m"))[0].url.clone()).collect();
+        assert_eq!(firsts.iter().filter(|u| **u == a.url).count(), 2, "{firsts:?}");
+        assert_eq!(firsts.iter().filter(|u| **u == b.url).count(), 2, "{firsts:?}");
+        // ...and the rotation never overrides a real preference: a busier backend
+        // still loses to an idle one, whatever the rotation offset.
+        let _g = a.acquire();
+        for _ in 0..4 {
+            assert_eq!(p.backends_for(Some("m"))[0].url, b.url, "idle backend must win");
         }
     }
 
@@ -1112,6 +1146,7 @@ mod catchall_tests {
             primary: if with_primary { Some(h.clone()) } else { None },
             all: vec![h],
             openrouter_url: openrouter.to_string(),
+            rr: AtomicU32::new(0),
         }
     }
 

@@ -22,6 +22,7 @@
 //! | POST /v1/chat/completions       | OpenAI      | SSE       |
 //! | POST /v1/completions            | OpenAI      | SSE       |
 //! | POST /v1/embeddings             | OpenAI      | —         |
+//! | POST /v1/rerank                 | Cohere/Jina | —         |
 //! | POST /v1/messages               | Anthropic   | SSE       |
 //! | POST /v1/messages/count_tokens  | Anthropic   | —         |
 //!
@@ -1408,6 +1409,22 @@ pub async fn embeddings(
         Err(e) => return e.into_response(),
     };
     dispatch_json(&st, ident, reqwest::Method::POST, "/v1/embeddings", &body).await
+}
+
+/// POST /v1/rerank (non-streaming) — model-routed like embeddings. Body is the
+/// Cohere/Jina shape vLLM serves (`{model, query, documents, top_n?}`), forwarded
+/// verbatim. Added 2026-11-06 for `qwen3-rerank-0.6b` (vLLM on n5-max): until then
+/// the backend could be registered but the path 404'd — a ROUTE gap, like images.
+pub async fn rerank(
+    ident: Option<Extension<Identity>>,
+    State(st): State<AppState>,
+    body: Json<Value>,
+) -> Response {
+    let body = match require_object(body.0) {
+        Ok(b) => apply_default_model(&st, b),
+        Err(e) => return e.into_response(),
+    };
+    dispatch_json(&st, ident, reqwest::Method::POST, "/v1/rerank", &body).await
 }
 
 /// POST /v1/images/generations — model-routed to the ComfyUI shim (`qwen-image`).
