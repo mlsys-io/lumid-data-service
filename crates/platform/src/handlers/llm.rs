@@ -54,6 +54,28 @@ use crate::state::AppState;
 const KEEPALIVE_FRAME: &[u8] = b": keep-alive\n\n";
 const KEEPALIVE_INTERVAL_S: u64 = 15;
 
+/// Per-request OpenRouter veto. claude-proxy sets `x-lumid-openrouter: deny`
+/// when the caller's Claude pool has `allow_openrouter` off (lum.id/code's
+/// "openrouter: off"). With it present, NOTHING in this module may hand the
+/// request to OpenRouter — not the roof/outage overflow, not the connect-fail
+/// spill, not the hedge, not a mapped OpenRouter-only id.
+///
+/// DENY-ONLY by construction: the header can remove a spend path, never add
+/// one, so a client that forges it can only hurt itself, and an absent header
+/// keeps today's behaviour for every other caller (chatbox, apps, local keys).
+/// Added 2026-11-14: the pool toggle gated only externally-billed model ids at
+/// claude-proxy, while self-hosted deepseek/qwen still overflowed here — ~370
+/// OpenRouter spills / 3 h with every pool set to "off".
+pub const OPENROUTER_POLICY_HEADER: &str = "x-lumid-openrouter";
+
+/// Whether this request may reach OpenRouter at all (`false` = vetoed).
+fn openrouter_permitted(headers: &axum::http::HeaderMap) -> bool {
+    !headers
+        .get(OPENROUTER_POLICY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |v| v.trim().eq_ignore_ascii_case("deny"))
+}
+
 // ─────────────────────────────────────────── helpers
 
 /// The model named in a (post-default) request body, if non-empty.
@@ -456,6 +478,7 @@ fn resolve(
     caller: &str,
     caller_role: &str,
     short: bool,
+    or_permitted: bool,
 ) -> Result<Option<Vec<std::sync::Arc<crate::llm_pool::BackendHandle>>>, ApiError> {
     // CLAUDE NEVER GOES TO OPENROUTER. Claude models (claude-sonnet-*, claude-haiku-*,
     // claude-opus-*, claude-fable-*) are proprietary pooled-account models served by
@@ -514,6 +537,17 @@ fn resolve(
             &st.llm_pool.openrouter_url,
             model,
         );
+        if (all_at_roof || all_down) && can_overflow && !or_permitted {
+            // Pool policy vetoes the spill: stay local. At the roof that means
+            // queueing on the saturated backend (slower, free); when every
+            // backend is down it means an honest 502 instead of a bill.
+            tracing::info!(
+                "llm resolve: model={:?} would overflow to OpenRouter but caller={caller} \
+                 vetoed it (pool openrouter off) — staying local",
+                model
+            );
+            return Ok(Some(backends));
+        }
         if (all_at_roof || all_down) && can_overflow {
             // Name the ACTUAL reason. "at concurrency roof" was printed for every
             // spill; a saturated pool and a dead pool are different incidents with
@@ -564,6 +598,15 @@ fn resolve(
                 );
                 return Err(ApiError::Forbidden(format!(
                     "model {m:?} requires admin access on this platform (metered, no local backend)"
+                )));
+            }
+            if !or_permitted {
+                tracing::warn!(
+                    "llm resolve: model={m} DENIED caller={caller} — OpenRouter-only model, \
+                     pool openrouter off"
+                );
+                return Err(ApiError::Forbidden(format!(
+                    "model {m:?} is served only by OpenRouter, which is disabled for your Claude pool"
                 )));
             }
             // THIS BRANCH SPENDS MONEY AND USED TO SAY NOTHING.
@@ -625,6 +668,7 @@ async fn proxy_json(
     method: reqwest::Method,
     path: &str,
     body: Option<&Value>,
+    or_permitted: bool,
 ) -> Response {
     let mut last_err: Option<Response> = None;
 
@@ -702,7 +746,7 @@ async fn proxy_json(
     // Gated on openrouter_serves(), NOT merely on the URL being set, so the
     // allowlist property holds: a typo or an id we do not carry is still
     // refused with our own error and never forwarded to a metered upstream.
-    if let Some(m) = body.and_then(model_of) {
+    if let Some(m) = body.and_then(model_of).filter(|_| or_permitted) {
         if openrouter_serves(
             &st.settings.llm_openrouter_model_map,
             &st.llm_pool.openrouter_url,
@@ -795,6 +839,7 @@ async fn proxy_stream(
     backends: &[std::sync::Arc<crate::llm_pool::BackendHandle>],
     path: &str,
     body: &Value,
+    or_permitted: bool,
 ) -> Response {
     let path_owned = path.to_string();
     for handle in backends {
@@ -847,7 +892,7 @@ async fn proxy_stream(
         // Only keepalive COMMENTS have reached the client at the hedge point, so
         // adopting either side is invisible to it.
         let hedge_after = st.settings.llm_hedge_after_s;
-        let hedge_plan = if hedge_after > 0 {
+        let hedge_plan = if hedge_after > 0 && or_permitted {
             let rewritten = rewrite_model_for_openrouter(st, body);
             let base = st.llm_pool.openrouter_url.clone();
             let key = if !st.settings.llm_openrouter_key.is_empty() {
@@ -993,11 +1038,13 @@ async fn proxy_stream(
     // `all_down` arm has not fired yet and we would otherwise emit a one-frame
     // error stream while a healthy offload sits unused. Allowlist-gated, so an
     // unknown id is still refused rather than billed.
-    if openrouter_serves(
-        &st.settings.llm_openrouter_model_map,
-        &st.llm_pool.openrouter_url,
-        &model_of(body).unwrap_or_default(),
-    ) {
+    if or_permitted
+        && openrouter_serves(
+            &st.settings.llm_openrouter_model_map,
+            &st.llm_pool.openrouter_url,
+            &model_of(body).unwrap_or_default(),
+        )
+    {
         tracing::warn!(
             "llm stream {path}: all {} local backends failed at connect — spilling to OpenRouter",
             backends.len()
@@ -1064,6 +1111,7 @@ async fn dispatch_json(
     method: reqwest::Method,
     path: &str,
     body: &Value,
+    or_permitted: bool,
 ) -> Response {
     match federation_peer(st) {
         Err(e) => e.into_response(),
@@ -1076,13 +1124,14 @@ async fn dispatch_json(
             &caller_label(&ident),
             &caller_role(&ident),
             is_short_prompt(st.settings.llm_short_prompt_tokens, body),
+            or_permitted,
         ) {
             Err(e) => e.into_response(),
             Ok(None) => {
                 let body = rewrite_model_for_openrouter(st, body);
                 proxy_json_openrouter(st, method, path, Some(&body)).await
             }
-            Ok(Some(backends)) => proxy_json(st, &backends, method, path, Some(body)).await,
+            Ok(Some(backends)) => proxy_json(st, &backends, method, path, Some(body), or_permitted).await,
         },
     }
 }
@@ -1094,6 +1143,7 @@ async fn dispatch_stream(
     ident: Option<Extension<Identity>>,
     path: &str,
     body: &Value,
+    or_permitted: bool,
 ) -> Response {
     match federation_peer(st) {
         Err(e) => e.into_response(),
@@ -1104,13 +1154,14 @@ async fn dispatch_stream(
             &caller_label(&ident),
             &caller_role(&ident),
             is_short_prompt(st.settings.llm_short_prompt_tokens, body),
+            or_permitted,
         ) {
             Err(e) => e.into_response(),
             Ok(None) => {
                 let body = rewrite_model_for_openrouter(st, body);
                 proxy_stream_openrouter(st, path, &body).await
             }
-            Ok(Some(backends)) => proxy_stream(st, &backends, path, body).await,
+            Ok(Some(backends)) => proxy_stream(st, &backends, path, body, or_permitted).await,
         },
     }
 }
@@ -1138,6 +1189,7 @@ async fn dispatch_bytes(
         &caller_label(&ident),
         &caller_role(&ident),
         false,
+        false, // binary routes are never forwarded upstream
     ) {
         Err(e) => e.into_response(),
         Ok(None) => (
@@ -1261,6 +1313,7 @@ pub async fn list_models(
             reqwest::Method::GET,
             "/v1/models",
             None,
+            false, // catalogue read: never spill
         )
         .await;
     }
@@ -1368,16 +1421,18 @@ pub async fn list_models(
 pub async fn chat_completions(
     ident: Option<Extension<Identity>>,
     State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
     body: Json<Value>,
 ) -> Response {
+    let or_ok = openrouter_permitted(&headers);
     let body = match require_object(body.0) {
         Ok(b) => apply_default_model(&st, b),
         Err(e) => return e.into_response(),
     };
     if wants_stream(&body) {
-        dispatch_stream(&st, ident, "/v1/chat/completions", &body).await
+        dispatch_stream(&st, ident, "/v1/chat/completions", &body, or_ok).await
     } else {
-        dispatch_json(&st, ident, reqwest::Method::POST, "/v1/chat/completions", &body).await
+        dispatch_json(&st, ident, reqwest::Method::POST, "/v1/chat/completions", &body, or_ok).await
     }
 }
 
@@ -1385,16 +1440,18 @@ pub async fn chat_completions(
 pub async fn completions(
     ident: Option<Extension<Identity>>,
     State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
     body: Json<Value>,
 ) -> Response {
+    let or_ok = openrouter_permitted(&headers);
     let body = match require_object(body.0) {
         Ok(b) => apply_default_model(&st, b),
         Err(e) => return e.into_response(),
     };
     if wants_stream(&body) {
-        dispatch_stream(&st, ident, "/v1/completions", &body).await
+        dispatch_stream(&st, ident, "/v1/completions", &body, or_ok).await
     } else {
-        dispatch_json(&st, ident, reqwest::Method::POST, "/v1/completions", &body).await
+        dispatch_json(&st, ident, reqwest::Method::POST, "/v1/completions", &body, or_ok).await
     }
 }
 
@@ -1402,13 +1459,15 @@ pub async fn completions(
 pub async fn embeddings(
     ident: Option<Extension<Identity>>,
     State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
     body: Json<Value>,
 ) -> Response {
+    let or_ok = openrouter_permitted(&headers);
     let body = match require_object(body.0) {
         Ok(b) => apply_default_model(&st, b),
         Err(e) => return e.into_response(),
     };
-    dispatch_json(&st, ident, reqwest::Method::POST, "/v1/embeddings", &body).await
+    dispatch_json(&st, ident, reqwest::Method::POST, "/v1/embeddings", &body, or_ok).await
 }
 
 /// POST /v1/rerank (non-streaming) — model-routed like embeddings. Body is the
@@ -1418,13 +1477,15 @@ pub async fn embeddings(
 pub async fn rerank(
     ident: Option<Extension<Identity>>,
     State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
     body: Json<Value>,
 ) -> Response {
+    let or_ok = openrouter_permitted(&headers);
     let body = match require_object(body.0) {
         Ok(b) => apply_default_model(&st, b),
         Err(e) => return e.into_response(),
     };
-    dispatch_json(&st, ident, reqwest::Method::POST, "/v1/rerank", &body).await
+    dispatch_json(&st, ident, reqwest::Method::POST, "/v1/rerank", &body, or_ok).await
 }
 
 /// POST /v1/images/generations — model-routed to the ComfyUI shim (`qwen-image`).
@@ -1437,13 +1498,15 @@ pub async fn rerank(
 pub async fn images_generations(
     ident: Option<Extension<Identity>>,
     State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
     body: Json<Value>,
 ) -> Response {
+    let or_ok = openrouter_permitted(&headers);
     let body = match require_object(body.0) {
         Ok(b) => apply_default_model(&st, b),
         Err(e) => return e.into_response(),
     };
-    dispatch_json(&st, ident, reqwest::Method::POST, "/v1/images/generations", &body).await
+    dispatch_json(&st, ident, reqwest::Method::POST, "/v1/images/generations", &body, or_ok).await
 }
 
 /// POST /v1/audio/speech — model-routed to the CosyVoice2 shim (`qwen-tts`).
@@ -1593,7 +1656,7 @@ pub async fn audio_transcriptions(
         )
         .into_response();
     };
-    match resolve(&st, Some(&model), &caller_label(&ident), &caller_role(&ident), false) {
+    match resolve(&st, Some(&model), &caller_label(&ident), &caller_role(&ident), false, false) {
         Err(e) => e.into_response(),
         Ok(None) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1614,16 +1677,18 @@ pub async fn audio_transcriptions(
 pub async fn messages(
     ident: Option<Extension<Identity>>,
     State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
     body: Json<Value>,
 ) -> Response {
+    let or_ok = openrouter_permitted(&headers);
     let body = match require_object(body.0) {
         Ok(b) => apply_thinking_control(apply_default_model(&st, b)),
         Err(e) => return e.into_response(),
     };
     if wants_stream(&body) {
-        dispatch_stream(&st, ident, "/v1/messages", &body).await
+        dispatch_stream(&st, ident, "/v1/messages", &body, or_ok).await
     } else {
-        dispatch_json(&st, ident, reqwest::Method::POST, "/v1/messages", &body).await
+        dispatch_json(&st, ident, reqwest::Method::POST, "/v1/messages", &body, or_ok).await
     }
 }
 
@@ -1631,13 +1696,15 @@ pub async fn messages(
 pub async fn count_tokens(
     ident: Option<Extension<Identity>>,
     State(st): State<AppState>,
+    headers: axum::http::HeaderMap,
     body: Json<Value>,
 ) -> Response {
+    let or_ok = openrouter_permitted(&headers);
     let body = match require_object(body.0) {
         Ok(b) => apply_default_model(&st, b),
         Err(e) => return e.into_response(),
     };
-    dispatch_json(&st, ident, reqwest::Method::POST, "/v1/messages/count_tokens", &body).await
+    dispatch_json(&st, ident, reqwest::Method::POST, "/v1/messages/count_tokens", &body, or_ok).await
 }
 
 #[cfg(test)]
@@ -1886,5 +1953,37 @@ mod short_prompt_class_tests {
         let big = json!({"model":"m","messages":[{"role":"user","content":"x".repeat(40_000)}]});
         assert!(is_short_prompt(8_000, &small), "~1k tokens is short at 8k");
         assert!(!is_short_prompt(8_000, &big), "~10k tokens is long at 8k");
+    }
+}
+
+#[cfg(test)]
+mod openrouter_policy_header_tests {
+    use super::{openrouter_permitted, OPENROUTER_POLICY_HEADER};
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn with(v: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(OPENROUTER_POLICY_HEADER, HeaderValue::from_str(v).unwrap());
+        h
+    }
+
+    // Absent header = today's behaviour for every non-claude-proxy caller.
+    #[test]
+    fn absent_header_permits() {
+        assert!(openrouter_permitted(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn deny_vetoes_case_and_space_insensitive() {
+        assert!(!openrouter_permitted(&with("deny")));
+        assert!(!openrouter_permitted(&with(" DENY ")));
+    }
+
+    // DENY-ONLY: no value can open a path the absent header would not.
+    // Anything other than "deny" behaves exactly like no header at all.
+    #[test]
+    fn other_values_are_not_a_grant_and_not_a_veto() {
+        assert!(openrouter_permitted(&with("allow")));
+        assert!(openrouter_permitted(&with("")));
     }
 }
