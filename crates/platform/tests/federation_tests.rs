@@ -330,6 +330,7 @@ fn shadow_router(state: AppState) -> Router {
             email: None,
             active: true,
             scopes: Vec::new(),
+            allow_openrouter: None,
         });
         next.run(req).await
     }

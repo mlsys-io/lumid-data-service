@@ -114,6 +114,7 @@ async fn resolve_identity(
             email: None,
             active: true,
             scopes: Vec::new(),
+            allow_openrouter: None,
         }));
     }
     match st.lumid.introspect(&token).await {
@@ -145,6 +146,7 @@ pub async fn resolve_bearer(
             email: None,
             active: true,
             scopes: Vec::new(),
+            allow_openrouter: None,
         }));
     }
     match st.lumid.introspect(token).await {

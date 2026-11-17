@@ -54,26 +54,84 @@ use crate::state::AppState;
 const KEEPALIVE_FRAME: &[u8] = b": keep-alive\n\n";
 const KEEPALIVE_INTERVAL_S: u64 = 15;
 
-/// Per-request OpenRouter veto. claude-proxy sets `x-lumid-openrouter: deny`
-/// when the caller's Claude pool has `allow_openrouter` off (lum.id/code's
-/// "openrouter: off"). With it present, NOTHING in this module may hand the
-/// request to OpenRouter — not the roof/outage overflow, not the connect-fail
-/// spill, not the hedge, not a mapped OpenRouter-only id.
+/// Per-request OpenRouter policy header. claude-proxy sets it from the END
+/// USER's Claude pool (lum.id/code's "openrouter: on/off"): `deny` when the
+/// pool has `allow_openrouter` off, `allow` when it is on.
 ///
-/// DENY-ONLY by construction: the header can remove a spend path, never add
-/// one, so a client that forges it can only hurt itself, and an absent header
-/// keeps today's behaviour for every other caller (chatbox, apps, local keys).
-/// Added 2026-11-14: the pool toggle gated only externally-billed model ids at
-/// claude-proxy, while self-hosted deepseek/qwen still overflowed here — ~370
-/// OpenRouter spills / 3 h with every pool set to "off".
+/// History: until 2026-11-14 the pool toggle gated only externally-billed ids
+/// at claude-proxy, while self-hosted deepseek/qwen still overflowed here.
+/// The 11-14 fix made this header DENY-ONLY with absent = permitted — which
+/// left every caller that does not go through claude-proxy (lum.id/llm with a
+/// user's own PAT: Claude Code pointed at lum.id/llm, OpenAI SDK scripts)
+/// unpoliced. Measured 2026-11-17: 3,573 OpenRouter spills in 24 h vs 472
+/// vetoes, every pool set to "off". See `openrouter_permitted` for the
+/// policy that replaced it.
 pub const OPENROUTER_POLICY_HEADER: &str = "x-lumid-openrouter";
 
-/// Whether this request may reach OpenRouter at all (`false` = vetoed).
-fn openrouter_permitted(headers: &axum::http::HeaderMap) -> bool {
-    !headers
+#[derive(Debug, PartialEq, Eq)]
+enum PolicyHeader {
+    Absent,
+    Deny,
+    Allow,
+}
+
+fn policy_header(headers: &axum::http::HeaderMap) -> PolicyHeader {
+    match headers
         .get(OPENROUTER_POLICY_HEADER)
         .and_then(|v| v.to_str().ok())
-        .map_or(false, |v| v.trim().eq_ignore_ascii_case("deny"))
+        .map(|v| v.trim().to_ascii_lowercase())
+    {
+        Some(v) if v == "deny" => PolicyHeader::Deny,
+        Some(v) if v == "allow" => PolicyHeader::Allow,
+        _ => PolicyHeader::Absent,
+    }
+}
+
+/// Is this caller a delegate — trusted to state SOMEONE ELSE's OpenRouter
+/// verdict via the header? Matched on sub or email (case-insensitive).
+fn is_openrouter_delegate(delegates: &std::collections::HashSet<String>, i: &Identity) -> bool {
+    if delegates.is_empty() {
+        return false;
+    }
+    delegates.contains(&i.sub.to_ascii_lowercase())
+        || i.email.as_deref().map_or(false, |e| delegates.contains(&e.to_ascii_lowercase()))
+}
+
+/// Whether this request may reach OpenRouter at all (`false` = vetoed).
+///
+/// FAIL-CLOSED — it protects the bill (the key has no credit limit):
+/// 1. `x-lumid-openrouter: deny` from anyone vetoes. A client forging it only
+///    hurts itself.
+/// 2. A DELEGATE (`LUMID_LLM_OPENROUTER_DELEGATES`, i.e. claude-proxy's
+///    service PAT) saying `allow` is permitted: the delegate resolved the end
+///    user's pool, and its own PAT's pool says nothing about that user.
+/// 3. Otherwise the caller's OWN pool verdict from introspection decides, and
+///    only an explicit `allow_openrouter: true` permits. Absent (old identity,
+///    local key, anonymous) = denied. A non-delegate's `allow` is ignored.
+fn openrouter_permitted_for(
+    delegates: &std::collections::HashSet<String>,
+    headers: &axum::http::HeaderMap,
+    ident: &Option<Extension<Identity>>,
+) -> bool {
+    let hdr = policy_header(headers);
+    if hdr == PolicyHeader::Deny {
+        return false;
+    }
+    let Some(Extension(i)) = ident else {
+        return false;
+    };
+    if hdr == PolicyHeader::Allow && is_openrouter_delegate(delegates, i) {
+        return true;
+    }
+    i.allow_openrouter == Some(true)
+}
+
+fn openrouter_permitted(
+    st: &AppState,
+    headers: &axum::http::HeaderMap,
+    ident: &Option<Extension<Identity>>,
+) -> bool {
+    openrouter_permitted_for(&st.settings.llm_openrouter_delegates, headers, ident)
 }
 
 // ─────────────────────────────────────────── helpers
@@ -554,7 +612,8 @@ fn resolve(
             // different remedies, and the operator reads this line first.
             let why = if all_down { "circuit-open (unhealthy)" } else { "at concurrency roof" };
             tracing::warn!(
-                "llm resolve: model={:?} all {} local backends {} — overflowing to OpenRouter",
+                "llm resolve: model={:?} all {} local backends {} — overflowing to OpenRouter \
+                 (caller={caller})",
                 model,
                 backends.len(),
                 why
@@ -1424,7 +1483,7 @@ pub async fn chat_completions(
     headers: axum::http::HeaderMap,
     body: Json<Value>,
 ) -> Response {
-    let or_ok = openrouter_permitted(&headers);
+    let or_ok = openrouter_permitted(&st, &headers, &ident);
     let body = match require_object(body.0) {
         Ok(b) => apply_default_model(&st, b),
         Err(e) => return e.into_response(),
@@ -1443,7 +1502,7 @@ pub async fn completions(
     headers: axum::http::HeaderMap,
     body: Json<Value>,
 ) -> Response {
-    let or_ok = openrouter_permitted(&headers);
+    let or_ok = openrouter_permitted(&st, &headers, &ident);
     let body = match require_object(body.0) {
         Ok(b) => apply_default_model(&st, b),
         Err(e) => return e.into_response(),
@@ -1462,7 +1521,7 @@ pub async fn embeddings(
     headers: axum::http::HeaderMap,
     body: Json<Value>,
 ) -> Response {
-    let or_ok = openrouter_permitted(&headers);
+    let or_ok = openrouter_permitted(&st, &headers, &ident);
     let body = match require_object(body.0) {
         Ok(b) => apply_default_model(&st, b),
         Err(e) => return e.into_response(),
@@ -1480,7 +1539,7 @@ pub async fn rerank(
     headers: axum::http::HeaderMap,
     body: Json<Value>,
 ) -> Response {
-    let or_ok = openrouter_permitted(&headers);
+    let or_ok = openrouter_permitted(&st, &headers, &ident);
     let body = match require_object(body.0) {
         Ok(b) => apply_default_model(&st, b),
         Err(e) => return e.into_response(),
@@ -1501,7 +1560,7 @@ pub async fn images_generations(
     headers: axum::http::HeaderMap,
     body: Json<Value>,
 ) -> Response {
-    let or_ok = openrouter_permitted(&headers);
+    let or_ok = openrouter_permitted(&st, &headers, &ident);
     let body = match require_object(body.0) {
         Ok(b) => apply_default_model(&st, b),
         Err(e) => return e.into_response(),
@@ -1680,7 +1739,7 @@ pub async fn messages(
     headers: axum::http::HeaderMap,
     body: Json<Value>,
 ) -> Response {
-    let or_ok = openrouter_permitted(&headers);
+    let or_ok = openrouter_permitted(&st, &headers, &ident);
     let body = match require_object(body.0) {
         Ok(b) => apply_thinking_control(apply_default_model(&st, b)),
         Err(e) => return e.into_response(),
@@ -1699,7 +1758,7 @@ pub async fn count_tokens(
     headers: axum::http::HeaderMap,
     body: Json<Value>,
 ) -> Response {
-    let or_ok = openrouter_permitted(&headers);
+    let or_ok = openrouter_permitted(&st, &headers, &ident);
     let body = match require_object(body.0) {
         Ok(b) => apply_default_model(&st, b),
         Err(e) => return e.into_response(),
@@ -1958,8 +2017,11 @@ mod short_prompt_class_tests {
 
 #[cfg(test)]
 mod openrouter_policy_header_tests {
-    use super::{openrouter_permitted, OPENROUTER_POLICY_HEADER};
+    use super::{openrouter_permitted_for, OPENROUTER_POLICY_HEADER};
+    use crate::auth::Identity;
+    use axum::extract::Extension;
     use axum::http::{HeaderMap, HeaderValue};
+    use std::collections::HashSet;
 
     fn with(v: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -1967,23 +2029,69 @@ mod openrouter_policy_header_tests {
         h
     }
 
-    // Absent header = today's behaviour for every non-claude-proxy caller.
+    fn who(sub: &str, email: &str, verdict: Option<bool>) -> Option<Extension<Identity>> {
+        Some(Extension(Identity {
+            sub: sub.into(),
+            role: "user".into(),
+            email: Some(email.into()),
+            active: true,
+            scopes: vec![],
+            allow_openrouter: verdict,
+        }))
+    }
+
+    fn delegates() -> HashSet<String> {
+        ["admin@lum.id".to_string()].into_iter().collect()
+    }
+
+    // THE 11-17 HOLE: a user's own PAT on lum.id/llm, no header, pool off.
     #[test]
-    fn absent_header_permits() {
-        assert!(openrouter_permitted(&HeaderMap::new()));
+    fn direct_caller_with_pool_off_is_denied() {
+        let d = delegates();
+        assert!(!openrouter_permitted_for(&d, &HeaderMap::new(), &who("u1", "a@x", Some(false))));
     }
 
     #[test]
-    fn deny_vetoes_case_and_space_insensitive() {
-        assert!(!openrouter_permitted(&with("deny")));
-        assert!(!openrouter_permitted(&with(" DENY ")));
+    fn absent_verdict_is_denied() {
+        let d = delegates();
+        assert!(!openrouter_permitted_for(&d, &HeaderMap::new(), &who("u1", "a@x", None)));
+        assert!(!openrouter_permitted_for(&d, &HeaderMap::new(), &None));
     }
 
-    // DENY-ONLY: no value can open a path the absent header would not.
-    // Anything other than "deny" behaves exactly like no header at all.
     #[test]
-    fn other_values_are_not_a_grant_and_not_a_veto() {
-        assert!(openrouter_permitted(&with("allow")));
-        assert!(openrouter_permitted(&with("")));
+    fn direct_caller_with_pool_on_is_permitted() {
+        let d = delegates();
+        assert!(openrouter_permitted_for(&d, &HeaderMap::new(), &who("u1", "a@x", Some(true))));
+    }
+
+    #[test]
+    fn deny_vetoes_everyone_case_and_space_insensitive() {
+        let d = delegates();
+        assert!(!openrouter_permitted_for(&d, &with("deny"), &who("u1", "a@x", Some(true))));
+        assert!(!openrouter_permitted_for(&d, &with(" DENY "), &who("s", "admin@lum.id", Some(true))));
+    }
+
+    // A non-delegate cannot grant itself spend by sending `allow`.
+    #[test]
+    fn non_delegate_allow_is_ignored() {
+        let d = delegates();
+        assert!(!openrouter_permitted_for(&d, &with("allow"), &who("u1", "a@x", Some(false))));
+        assert!(!openrouter_permitted_for(&HashSet::new(), &with("allow"), &who("s", "admin@lum.id", None)));
+    }
+
+    // claude-proxy's service PAT speaks for the end user.
+    #[test]
+    fn delegate_allow_is_honoured_and_matches_case_insensitively() {
+        let d = delegates();
+        assert!(openrouter_permitted_for(&d, &with("allow"), &who("s", "Admin@Lum.ID", Some(false))));
+        let by_sub: HashSet<String> = ["local:ops".to_string()].into_iter().collect();
+        assert!(openrouter_permitted_for(&by_sub, &with("ALLOW"), &who("local:ops", "", None)));
+    }
+
+    // A delegate with no header falls back to its own verdict (deny here).
+    #[test]
+    fn delegate_without_header_uses_own_verdict() {
+        let d = delegates();
+        assert!(!openrouter_permitted_for(&d, &HeaderMap::new(), &who("s", "admin@lum.id", Some(false))));
     }
 }

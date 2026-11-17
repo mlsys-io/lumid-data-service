@@ -21,6 +21,12 @@ pub struct Identity {
     pub email: Option<String>,
     pub active: bool,
     pub scopes: Vec<String>,
+    /// The caller's Claude-pool OpenRouter verdict from introspection
+    /// (`allow_openrouter`, ClaudePool.AllowOpenrouter — lum.id/code's
+    /// "openrouter: on/off"). `None` = identity sent no verdict (an old
+    /// identity server, or a local key). Consumers MUST treat `None` as
+    /// DENIED: an absent opinion must never open a spend path.
+    pub allow_openrouter: Option<bool>,
 }
 
 /// Distinguishes "rejected" (cache & return None → 401) from "unreachable"
@@ -42,6 +48,8 @@ struct IntrospectData {
     active: bool,
     #[serde(default)]
     scopes: Option<Vec<String>>,
+    #[serde(default)]
+    allow_openrouter: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +66,8 @@ struct IntrospectBody {
     active: bool,
     #[serde(default)]
     scopes: Option<Vec<String>>,
+    #[serde(default)]
+    allow_openrouter: Option<bool>,
 }
 
 pub struct LumidClient {
@@ -131,9 +141,9 @@ impl LumidClient {
             Ok(b) => b,
             Err(_) => return Ok(None),
         };
-        let (sub, role, email, active, scopes) = match body.data {
-            Some(d) => (d.sub, d.role, d.email, d.active, d.scopes),
-            None => (body.sub, body.role, body.email, body.active, body.scopes),
+        let (sub, role, email, active, scopes, allow_openrouter) = match body.data {
+            Some(d) => (d.sub, d.role, d.email, d.active, d.scopes, d.allow_openrouter),
+            None => (body.sub, body.role, body.email, body.active, body.scopes, body.allow_openrouter),
         };
         if !active {
             self.cache.insert(key, None).await;
@@ -145,6 +155,7 @@ impl LumidClient {
             email,
             active: true,
             scopes: scopes.unwrap_or_default(),
+            allow_openrouter,
         };
         self.cache.insert(key, Some(ident.clone())).await;
         Ok(Some(ident))

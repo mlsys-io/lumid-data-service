@@ -227,6 +227,7 @@ fn make_identity(role: &str) -> Identity {
         email: None,
         active: true,
         scopes: Vec::new(),
+        allow_openrouter: None,
     }
 }
 
@@ -237,6 +238,7 @@ fn make_scoped_identity(scopes: &[&str]) -> Identity {
         email: None,
         active: true,
         scopes: scopes.iter().map(|s| s.to_string()).collect(),
+        allow_openrouter: None,
     }
 }
 

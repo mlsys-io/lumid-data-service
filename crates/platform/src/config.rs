@@ -243,6 +243,14 @@ pub struct Settings {
     /// them verbatim 400s at OpenRouter. Local-backend requests never consult
     /// this map; it only rewrites the id in the two `proxy_*_openrouter` calls.
     pub llm_openrouter_model_map: std::collections::HashMap<String, String>,
+    /// Callers trusted to speak for SOMEONE ELSE on the OpenRouter question
+    /// (`LUMID_LLM_OPENROUTER_DELEGATES`, comma-separated identity subs,
+    /// emails, or `local:<label>` for a local key). claude-proxy is the
+    /// canonical one: it calls with a shared service PAT, so that PAT's own
+    /// pool says nothing about the end user — the proxy resolves the end
+    /// user's pool and states it as `x-lumid-openrouter: allow|deny`.
+    /// Only a delegate's `allow` is honoured; anyone else's is ignored.
+    pub llm_openrouter_delegates: std::collections::HashSet<String>,
     /// Optional bearer for upstream LLM calls made by the agent loop. When
     /// non-empty, the platform injects `Authorization: Bearer <key>` on the
     /// requests it originates from the agent loop. The `/v1/*` proxy does NOT
@@ -426,6 +434,11 @@ impl Settings {
                 .filter_map(|e| e.trim().split_once('='))
                 .map(|(local, or)| (local.trim().to_string(), or.trim().to_string()))
                 .filter(|(local, or)| !local.is_empty() && !or.is_empty())
+                .collect(),
+            llm_openrouter_delegates: env_str("LLM_OPENROUTER_DELEGATES", "")
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
                 .collect(),
             llm_api_key: env_str("LLM_API_KEY", ""),
             user_schemas: env_str("USER_SCHEMAS", "")
