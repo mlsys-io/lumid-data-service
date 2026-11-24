@@ -279,3 +279,127 @@ async fn retrieval_runs_migration_survives_concurrent_boots_and_hides_from_reade
         "retrieval_runs readable by the reader role"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; LUMID_JOBS_E2E=1 + DATABASE_URL"]
+async fn planner_inputs_come_from_the_catalog_and_health_is_owner_written() {
+    use lumid_platform::jobs::{inputs, planner::Size, refs::parse};
+    let Some(pool) = pool().await else { return };
+    schema::migrate(&pool, "lumid_reader").await.unwrap();
+    let c = pool.get().await.unwrap();
+    c.batch_execute(
+        "DROP SCHEMA IF EXISTS est CASCADE; CREATE SCHEMA est;
+         CREATE TABLE est.big AS SELECT g AS id, repeat('x', 200) AS pad FROM generate_series(1, 20000) g;
+         CREATE TABLE est.small (id int);
+         INSERT INTO jobs.catalog_mirror (hub_id, schema_name, table_name, size_bytes_est)
+           VALUES ('findata', 'market', 'ohlc_1d', 7000000000), ('findata', 'market', 'trades', 1000);
+         INSERT INTO jobs.sources (source_id, home_hub, owner_sub, name, kind, site, visibility)
+           VALUES ('ld', 'home', 'system', 'ld', 'estate', 'home', 'public');
+         INSERT INTO jobs.source_locations (source_id, site, role, home_hub) VALUES ('ld', 'nas', 'primary', 'home');
+         INSERT INTO jobs.site_routes (route_id, from_site, source_id, kind, url, home_hub) VALUES
+           ('mine', 'office', 'ld', 'tailnet', 'http://t', 'home'),
+           ('theirs', 'nus', 'ld', 'lan', 'http://n', 'nus');",
+    )
+    .await
+    .unwrap();
+    drop(c);
+
+    // Table size: an upper bound from the catalog, no scan.
+    match inputs::estimate(
+        &pool,
+        "lumid-data",
+        &parse("lumid-data://est.big").unwrap(),
+        None,
+    )
+    .await
+    .unwrap()
+    {
+        Size::UpperBound(n) => assert!(n > 20000 * 200, "{n}"),
+        other => panic!("{other:?}"),
+    }
+    let schema_size = inputs::estimate(
+        &pool,
+        "lumid-data",
+        &parse("lumid-data://est").unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(schema_size, Size::UpperBound(n) if n > 20000 * 200));
+    assert_eq!(
+        inputs::estimate(
+            &pool,
+            "lumid-data",
+            &parse("lumid-data://est.missing").unwrap(),
+            None
+        )
+        .await
+        .unwrap(),
+        Size::Unknown
+    );
+    // Another instance → the synced mirror.
+    assert_eq!(
+        inputs::estimate(
+            &pool,
+            "lumid-data",
+            &parse("findata://market.ohlc_1d").unwrap(),
+            None
+        )
+        .await
+        .unwrap(),
+        Size::UpperBound(7_000_000_000)
+    );
+    assert_eq!(
+        inputs::estimate(
+            &pool,
+            "lumid-data",
+            &parse("findata://market").unwrap(),
+            None
+        )
+        .await
+        .unwrap(),
+        Size::UpperBound(7_000_001_000)
+    );
+    // A declared bound always wins.
+    assert_eq!(
+        inputs::estimate(
+            &pool,
+            "lumid-data",
+            &parse("findata://market.ohlc_1d").unwrap(),
+            Some(5_000_000)
+        )
+        .await
+        .unwrap(),
+        Size::Declared(5_000_000)
+    );
+
+    // Location: the primary location beats the source row's site.
+    assert_eq!(
+        inputs::source_site(&pool, "ld").await.unwrap().as_deref(),
+        Some("nas")
+    );
+    assert_eq!(inputs::source_site(&pool, "nope").await.unwrap(), None);
+
+    // Health: only the owning hub writes it.
+    assert!(
+        inputs::record_route_health(&pool, "home", "mine", "up", Some(4))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !inputs::record_route_health(&pool, "home", "theirs", "down", None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        inputs::record_route_health(&pool, "home", "mine", "sideways", None)
+            .await
+            .is_err()
+    );
+    let routes = inputs::load_routes(&pool).await.unwrap();
+    let mine = routes.iter().find(|r| r.route_id == "mine").unwrap();
+    assert_eq!((mine.health.as_str(), mine.latency_ms), ("up", Some(4)));
+    assert!(mine.health_at.is_some());
+    let theirs = routes.iter().find(|r| r.route_id == "theirs").unwrap();
+    assert_eq!(theirs.health, "unknown");
+}

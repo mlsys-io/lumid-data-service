@@ -228,6 +228,9 @@ pub struct Settings {
     /// process's SQL sees (job-scope checks on `/retrieve`). Defaults to the
     /// first `LUMID_JOBS_ESTATE` entry.
     pub jobs_instance: String,
+    /// `LUMID_JOBS_SITES_JSON` — candidate compute sites for the planner
+    /// (`[{site, runtimes, ext_egress?, cached_models?}]`).
+    pub jobs_sites_json: String,
     /// `LUMID_JOBS_ROUTES_JSON` — this hub's route table (JSON array of
     /// `{route_id, from_site, source_id, kind, url, cred_mode?, max_bytes?, pref?}`).
     pub jobs_routes_json: String,
@@ -383,6 +386,7 @@ impl Settings {
                 .unwrap_or_else(|| env_str("HUB_ID", "local")),
             jobs_estate: env_str("JOBS_ESTATE", ""),
             jobs_routes_json: env_str("JOBS_ROUTES_JSON", ""),
+            jobs_sites_json: env_str("JOBS_SITES_JSON", ""),
             jobs_instance: env_var("JOBS_INSTANCE")
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| {
