@@ -20,26 +20,54 @@ CREATE ROLE lumid_reader WITH
   NOCREATEROLE
   NOBYPASSRLS;
 
--- Broad read access without superuser. `pg_read_all_data` (PG14+) grants SELECT
--- on every table/view + USAGE on every schema, but NOT the server-side file
--- functions (pg_read_file, pg_ls_dir — those require superuser or
--- pg_read_server_files). This closes the host-file exfiltration vector.
+-- Read access to the DATA, never to per-user bookkeeping or secrets.
 --
--- KNOWN LIMITATION: pg_read_all_data also covers pg_catalog tables including
--- pg_authid (password hashes, stored as scram-sha-256). The REVOKE below has
--- no effect because the grant derives from role membership, not a table ACL.
--- If you need to exclude pg_authid, use the per-schema grant block below
--- instead of pg_read_all_data.
-GRANT pg_read_all_data TO lumid_reader;
+-- Do NOT use `GRANT pg_read_all_data TO lumid_reader` (this file did until
+-- 2026-11-25). It derives from role membership, so no per-table REVOKE can
+-- carve anything out of it, and every caller-shaped SELECT could read:
+--   * provenance.runs           — every user's ingest runs (submitter, args)
+--   * provenance.webhooks       — includes a `secret_plain` column
+--   * raw.tenant_blobs          — every user's private-upload index
+--   * provenance.retrieval_runs — who ran which retrieval
+--   * pg_authid                 — password hashes
+-- and a SQL deny-list cannot fix it: the reader may call
+-- query_to_xml('<any sql>').
+--
+-- Instead: USAGE + SELECT on every non-system schema that exists now, the
+-- sensitive tables revoked, and default privileges so tables the app creates
+-- LATER (ingest proposals add schemas at runtime) stay readable. The app's own
+-- boot DDL revokes each new sensitive table it creates (e.g.
+-- handlers::retrieve::migrate) — default privileges would otherwise grant it.
+DO $grant$
+DECLARE s text;
+BEGIN
+  FOR s IN SELECT nspname FROM pg_namespace
+            WHERE nspname NOT IN ('pg_catalog', 'information_schema', 'sync')
+              AND nspname NOT LIKE 'pg_toast%' AND nspname NOT LIKE 'pg_temp%'
+  LOOP
+    EXECUTE format('GRANT USAGE ON SCHEMA %I TO lumid_reader', s);
+    EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA %I TO lumid_reader', s);
+  END LOOP;
+END
+$grant$;
 
--- ── Stricter alternative: make LUMID_USER_SCHEMAS a real access boundary ───────
--- Replace the pg_read_all_data grant above with per-schema grants so the reader
--- can ONLY see the schemas you expose to the agent. Repeat per schema and add a
--- matching ALTER DEFAULT PRIVILEGES so future tables are covered:
---
---   GRANT USAGE ON SCHEMA app TO lumid_reader;
---   GRANT SELECT ON ALL TABLES IN SCHEMA app TO lumid_reader;
---   ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO lumid_reader;
+DO $revoke$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['provenance.runs', 'provenance.webhooks',
+                           'provenance.ingress_proposals', 'provenance.ingress_acl',
+                           'provenance.retrieval_runs', 'raw.tenant_blobs']
+  LOOP
+    IF to_regclass(t) IS NOT NULL THEN
+      EXECUTE format('REVOKE ALL ON %s FROM lumid_reader', t);
+    END IF;
+  END LOOP;
+END
+$revoke$;
+
+-- Objects the app creates later (it connects as postgres; change FOR ROLE if not).
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres GRANT USAGE ON SCHEMAS TO lumid_reader;
+ALTER DEFAULT PRIVILEGES FOR ROLE postgres GRANT SELECT ON TABLES TO lumid_reader;
 
 -- ── If the app pool's login role is NOT a superuser ───────────────────────────
 -- It must be a member of lumid_reader to `SET ROLE` into it. Uncomment and set

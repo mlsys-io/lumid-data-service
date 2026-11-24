@@ -48,7 +48,7 @@ async fn pool() -> Option<Pool> {
         )
         .await
         .expect("provenance schema");
-    migrate(&pool).await.expect("migrate retrieval_runs");
+    migrate(&pool, "").await.expect("migrate retrieval_runs");
     Some(pool)
 }
 
