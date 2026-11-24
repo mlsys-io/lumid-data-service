@@ -25,6 +25,9 @@ pub enum Need {
     Retrieve,
     /// `POST /ingest/<schema>/<table>[/stream|/file]`.
     Ingest { schema: String, table: String },
+    /// A `/jobs/v1/jobs/<id>/…` route a job may use for ITSELF only
+    /// (status, its events, reporting progress, renewing its token).
+    OwnJob(String),
     /// Not available to job tokens.
     Deny(&'static str),
 }
@@ -61,6 +64,9 @@ pub fn classify(method: &str, path: &str, retrieval_prefix: &str) -> Need {
                 table: table.to_string(),
             }
         }
+        ("GET", ["jobs", "v1", "jobs", id])
+        | ("GET", ["jobs", "v1", "jobs", id, "events"])
+        | ("POST", ["jobs", "v1", "jobs", id, "events" | "token"]) => Need::OwnJob(id.to_string()),
         ("GET", ["catalog", "lineage", ..]) => Need::Deny("job_tokens_cannot_read_lineage"),
         ("GET", ["blobs"]) | ("GET", ["me", "blobs"]) => Need::Deny("job_tokens_cannot_list"),
         _ => Need::Deny("route_not_available_to_job_tokens"),
@@ -635,6 +641,18 @@ mod tests {
         );
         assert_eq!(classify("POST", "/retrieve", rp), Need::Retrieve);
         assert_eq!(
+            classify("POST", "/jobs/v1/jobs/j1/events", rp),
+            Need::OwnJob("j1".into())
+        );
+        assert_eq!(
+            classify("POST", "/jobs/v1/jobs/j1/token", rp),
+            Need::OwnJob("j1".into())
+        );
+        assert_eq!(
+            classify("GET", "/jobs/v1/jobs/j1", rp),
+            Need::OwnJob("j1".into())
+        );
+        assert_eq!(
             classify("POST", "/ingest/exp/results/stream", rp),
             Need::Ingest {
                 schema: "exp".into(),
@@ -652,6 +670,11 @@ mod tests {
             ("POST", "/admin/ingress/acl"),
             ("GET", "/events/recent"),
             ("POST", "/sync/apply"),
+            ("POST", "/jobs/v1/jobs"),
+            ("POST", "/jobs/v1/plan"),
+            ("GET", "/jobs/v1/jobs"),
+            ("POST", "/jobs/v1/sources/s/grants"),
+            ("POST", "/jobs/v1/jobs/j/cancel"),
         ] {
             assert!(matches!(classify(m, p, rp), Need::Deny(_)), "{m} {p}");
         }
