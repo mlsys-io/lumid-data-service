@@ -207,6 +207,10 @@ pub fn build_router(
             state.clone(),
             crate::federation::shadow_forward,
         ))
+        // Job-token scoping: runs right after the gate (Identity known),
+        // before the shadow forward and every handler. Pure passthrough for
+        // any caller whose role is not `job`.
+        .layer(from_fn_with_state(state.clone(), crate::jobs::enforce::enforce))
         .layer(from_fn_with_state(state.clone(), crate::auth::gate));
 
     public

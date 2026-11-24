@@ -7,13 +7,21 @@
 //! metadata, the registry, and small user data sync — and every synced row has
 //! exactly one writer, its `home_hub`.
 //!
-//! Phase 1 (this module today): the schema, the source-ref grammar, and the
-//! boot-time seeding of this hub's estate sources and routes. Everything is
-//! off unless `LUMID_JOBS_ENABLED` is set, so deploying it changes nothing.
+//! * Phase 1: the schema, the source-ref grammar, boot-time seeding of this
+//!   hub's estate sources and routes.
+//! * Phase 2: the access rule (`access`), per-job tokens (`token`), and
+//!   job-token enforcement (`enforce`, with the pure checks in `scope`).
+//!
+//! Everything is off unless `LUMID_JOBS_ENABLED` is set: no schema, no seed,
+//! and `ljt_` tokens are refused — deploying it changes nothing.
 
+pub mod access;
+pub mod enforce;
 pub mod refs;
 pub mod schema;
+pub mod scope;
 pub mod seed;
+pub mod token;
 
 use deadpool_postgres::Pool;
 
