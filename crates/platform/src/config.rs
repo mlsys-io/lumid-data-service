@@ -224,6 +224,10 @@ pub struct Settings {
     /// `LUMID_JOBS_ESTATE` — comma list of estate instances (`findata`,
     /// `lumid-data`, `lqt`, `nus`) this hub is home to.
     pub jobs_estate: String,
+    /// `LUMID_JOBS_INSTANCE` — the estate instance whose tables THIS
+    /// process's SQL sees (job-scope checks on `/retrieve`). Defaults to the
+    /// first `LUMID_JOBS_ESTATE` entry.
+    pub jobs_instance: String,
     /// `LUMID_JOBS_ROUTES_JSON` — this hub's route table (JSON array of
     /// `{route_id, from_site, source_id, kind, url, cred_mode?, max_bytes?, pref?}`).
     pub jobs_routes_json: String,
@@ -379,6 +383,16 @@ impl Settings {
                 .unwrap_or_else(|| env_str("HUB_ID", "local")),
             jobs_estate: env_str("JOBS_ESTATE", ""),
             jobs_routes_json: env_str("JOBS_ROUTES_JSON", ""),
+            jobs_instance: env_var("JOBS_INSTANCE")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| {
+                    env_str("JOBS_ESTATE", "")
+                        .split(',')
+                        .map(str::trim)
+                        .find(|s| !s.is_empty())
+                        .unwrap_or("")
+                        .to_string()
+                }),
             sync_target_url: env_str("SYNC_TARGET_URL", "").trim_end_matches('/').to_string(),
             sync_target_token: env_str("SYNC_TARGET_TOKEN", ""),
             sync_peer_id: env_str("SYNC_PEER_ID", ""),
