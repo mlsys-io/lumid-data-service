@@ -304,6 +304,10 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         crate::handlers::retrieve::migrate(&pool, &settings.retrieval_db_role).await?;
     }
 
+    // Multi-user jobs registry (schema + this hub's estate sources/routes).
+    // No-op unless LUMID_JOBS_ENABLED; bad seed config fails boot loudly.
+    crate::jobs::boot(&pool, &settings).await?;
+
     // Data-push plane: create the `sync` bookkeeping tables (idempotent) when
     // enabled. A target that can't migrate its inbox shouldn't start.
     if parts.enable_sync {

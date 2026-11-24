@@ -287,6 +287,23 @@ pub struct Settings {
     /// is byte-identical to today. `LUMID_ADMIN_READ_ROLE`.
     pub admin_read_role: String,
 
+    // Multi-user jobs over federated hubs (`crate::jobs`). Off by default:
+    // with `jobs_enabled` false nothing is migrated, seeded, or mounted.
+    /// `LUMID_JOBS_ENABLED` — create/seed the `jobs` schema at boot.
+    pub jobs_enabled: bool,
+    /// `LUMID_HUB_ID` — this hub's id (`home`, `nus`, …). The only hub that
+    /// writes rows whose `home_hub` equals it. Default `local`.
+    pub hub_id: String,
+    /// `LUMID_HUB_SITE` — the compute site this hub's data lives at (planner
+    /// colocation key). Defaults to `hub_id`.
+    pub hub_site: String,
+    /// `LUMID_JOBS_ESTATE` — comma list of estate instances (`findata`,
+    /// `lumid-data`, `lqt`, `nus`) this hub is home to.
+    pub jobs_estate: String,
+    /// `LUMID_JOBS_ROUTES_JSON` — this hub's route table (JSON array of
+    /// `{route_id, from_site, source_id, kind, url, cred_mode?, max_bytes?, pref?}`).
+    pub jobs_routes_json: String,
+
     // Data-push / sync plane (generic). `enable_sync` (ServeParts) mounts the
     // inbox + admin routes; these knobs drive the optional push helper and the
     // inbox peer gate. Empty `sync_target_url` ⇒ the push helper is a no-op.
@@ -440,6 +457,16 @@ impl Settings {
             retrieval_sample_rows: env_u32("RETRIEVAL_SAMPLE_ROWS", 5) as usize,
             retrieval_db_role: env_str("RETRIEVAL_DB_ROLE", ""),
             admin_read_role: env_str("ADMIN_READ_ROLE", ""),
+            jobs_enabled: matches!(
+                env_str("JOBS_ENABLED", "false").to_lowercase().as_str(),
+                "1" | "true" | "yes"
+            ),
+            hub_id: env_str("HUB_ID", "local"),
+            hub_site: env_var("HUB_SITE")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| env_str("HUB_ID", "local")),
+            jobs_estate: env_str("JOBS_ESTATE", ""),
+            jobs_routes_json: env_str("JOBS_ROUTES_JSON", ""),
             sync_target_url: env_str("SYNC_TARGET_URL", "").trim_end_matches('/').to_string(),
             sync_target_token: env_str("SYNC_TARGET_TOKEN", ""),
             sync_peer_id: env_str("SYNC_PEER_ID", ""),
