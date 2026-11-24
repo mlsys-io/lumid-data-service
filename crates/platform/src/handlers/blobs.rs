@@ -116,8 +116,9 @@ pub struct ListBlobsResponse {
 /// be hidden from general listing results.
 ///
 /// Security: don't enumerate other runs' materialized outputs via `GET /blobs`.
-/// Fetch-by-key (`GET /blobs/<key>`) intentionally stays open — run IDs are
-/// unguessable UUIDs and are only handed to the run's own requester.
+/// Fetch-by-key (`GET /blobs/<key>`) is owner-gated in `serve_blob` via
+/// `handlers::retrieve::may_read_key` — an unguessable run id is not access
+/// control once a URI is logged, forwarded, or shared.
 ///
 /// Matching is path-segment–bounded so `retrievals-archive/x` is NOT hidden
 /// when `retrieval_prefix` is `"retrievals"`.
@@ -315,15 +316,20 @@ pub async fn serve_blob(
         return Err(ApiError::Unavailable("blob storage not configured".into()));
     }
     let key = sanitize_key(&key).ok_or_else(|| ApiError::BadRequest("invalid key".into()))?;
-    // Tenant-private objects (`tenants/<sub>/…`, see me_blobs): owner or admin
-    // only. 404 rather than 403, so a probe cannot confirm someone else's key.
-    if let Some(owner) = crate::handlers::me_blobs::tenant_owner_of(&key) {
-        let allowed = identity
-            .as_ref()
-            .is_some_and(|Extension(id)| crate::handlers::me_blobs::may_read_tenant(id, owner));
-        if !allowed {
-            return Err(ApiError::NotFound("blob not found".into()));
-        }
+    // Private objects — tenant blobs (`tenants/<sub>/…`, see me_blobs) and
+    // materialized retrievals (`<retrieval_prefix>/<run_id>/…`, see
+    // handlers::retrieve): owner or admin only. 404 rather than 403, so a
+    // probe cannot confirm someone else's key.
+    let caller = identity.as_ref().map(|Extension(id)| id);
+    if !crate::handlers::retrieve::may_read_key(
+        &st.pool,
+        caller,
+        &key,
+        &st.settings.retrieval_prefix,
+    )
+    .await?
+    {
+        return Err(ApiError::NotFound("blob not found".into()));
     }
 
     // Fetch from the object store (localfs default, or S3/MinIO).

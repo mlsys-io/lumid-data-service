@@ -72,6 +72,7 @@ pub async fn run_loop(
     mut messages: Vec<Value>,
     request_max_iter: Option<usize>,
     model_override: Option<String>,
+    caller: Option<&crate::auth::Identity>,
 ) -> Vec<String> {
     let max_iter = request_max_iter
         .map(|n| n.min(cfg.max_iterations))
@@ -231,7 +232,7 @@ pub async fn run_loop(
             })));
 
             let (tool_result_content, is_error) =
-                match dispatch(st, &fn_name, &fn_args, cfg).await {
+                match dispatch(st, &fn_name, &fn_args, cfg, caller).await {
                     Ok(v) => {
                         // Track the last RetrievalResult for the done frame.
                         if fn_name == "replay_retrieval_plan" {
@@ -289,7 +290,11 @@ pub async fn run_loop(
 
 // ── Axum handler ─────────────────────────────────────────────────────────────
 
-pub async fn agent_chat(State(st): State<AppState>, body: Json<Value>) -> Response {
+pub async fn agent_chat(
+    State(st): State<AppState>,
+    identity: Option<axum::Extension<crate::auth::Identity>>,
+    body: Json<Value>,
+) -> Response {
     let body = match body.0.as_object() {
         Some(o) => o.clone(),
         None => {
@@ -324,6 +329,7 @@ pub async fn agent_chat(State(st): State<AppState>, body: Json<Value>) -> Respon
         messages,
         max_iterations,
         model_override,
+        identity.as_ref().map(|axum::Extension(id)| id),
     )
     .await;
 

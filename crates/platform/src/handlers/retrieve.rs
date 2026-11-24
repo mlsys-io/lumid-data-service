@@ -5,10 +5,12 @@
 //! transaction, row cap, key sanitization.
 
 use axum::extract::State;
-use axum::Json;
+use axum::{Extension, Json};
+use deadpool_postgres::Pool;
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::auth::Identity;
 use crate::error::{ApiError, ApiResult};
 use crate::retrieve::materialize::OutputFormat;
 use crate::retrieve::plan::{RetrievalOp, RetrievalPlan, SqlOp};
@@ -60,13 +62,121 @@ pub fn parse_request(body: &Value) -> ApiResult<(RetrievalPlan, OutputFormat)> {
     Ok((plan, output_format))
 }
 
+// ── retrieval ownership ──────────────────────────────────────────────────────
+//
+// A retrieval materializes `<retrieval_prefix>/<run_id>/result.<ext>` and hands
+// the caller that key. The run id used to be the only protection ("unguessable
+// UUID"), so anyone holding — or logging, or being forwarded — a URI could read
+// another user's result. Each run now records its owner here, and both readers
+// (`GET /blobs/<key>` and a `storage_get` op inside a later plan) require the
+// owner or a privileged role.
+
+/// Idempotent DDL, applied at boot when blob storage is configured. One
+/// simple-query batch = one implicit transaction, serialized on the platform
+/// bootstrap lock: concurrent `CREATE TABLE IF NOT EXISTS` from replicas
+/// booting together can otherwise race on the catalog and fail boot.
+pub const RETRIEVAL_RUNS_DDL: &str = "\
+SELECT pg_advisory_xact_lock(7815273027795448930);
+CREATE TABLE IF NOT EXISTS provenance.retrieval_runs (
+  run_id      uuid        PRIMARY KEY,
+  owner_sub   text        NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);";
+
+/// Create `provenance.retrieval_runs` (idempotent; `provenance` already exists
+/// once `platform_tables::migrate` has run).
+pub async fn migrate(pool: &Pool) -> anyhow::Result<()> {
+    let client = pool.get().await?;
+    client.batch_execute(RETRIEVAL_RUNS_DDL).await?;
+    Ok(())
+}
+
+/// Roles that may read any run's output (same set as tenant blobs).
+fn is_privileged(identity: &Identity) -> bool {
+    matches!(identity.role.as_str(), "local" | "admin" | "super_admin")
+}
+
+/// The run id segment of a key under the retrieval prefix:
+/// `<prefix>/<run_id>/result.jsonl` → `<run_id>`.
+pub fn retrieval_run_of<'a>(key: &'a str, retrieval_prefix: &str) -> Option<&'a str> {
+    let pfx = retrieval_prefix.trim_matches('/');
+    if pfx.is_empty() {
+        return None;
+    }
+    let rest = key.strip_prefix(pfx)?.strip_prefix('/')?;
+    let run = rest.split('/').next()?;
+    (!run.is_empty()).then_some(run)
+}
+
+/// Record `owner` for `run_id` before anything is materialized, so a result
+/// never exists without an owner.
+pub async fn record_owner(pool: &Pool, run_id: &str, owner: &str) -> ApiResult<()> {
+    let uuid = Uuid::parse_str(run_id)
+        .map_err(|e| ApiError::Internal(anyhow::anyhow!("retrieval run id: {e}")))?;
+    let client = pool.get().await?;
+    client
+        .execute(
+            "INSERT INTO provenance.retrieval_runs (run_id, owner_sub) VALUES ($1, $2) \
+             ON CONFLICT (run_id) DO NOTHING",
+            &[&uuid, &owner],
+        )
+        .await?;
+    Ok(())
+}
+
+async fn owner_of(pool: &Pool, run_id: &str) -> ApiResult<Option<String>> {
+    let Ok(uuid) = Uuid::parse_str(run_id) else {
+        return Ok(None);
+    };
+    let client = pool.get().await?;
+    let row = client
+        .query_opt(
+            "SELECT owner_sub FROM provenance.retrieval_runs WHERE run_id = $1",
+            &[&uuid],
+        )
+        .await?;
+    Ok(row.map(|r| r.get::<_, String>(0)))
+}
+
+/// May `caller` read the object at `key`? Applies both private-object rules:
+/// tenant blobs (`tenants/<sub>/…`) and materialized retrievals
+/// (`<retrieval_prefix>/<run_id>/…`). Every other key is unrestricted here.
+/// An anonymous caller may read neither kind.
+pub async fn may_read_key(
+    pool: &Pool,
+    caller: Option<&Identity>,
+    key: &str,
+    retrieval_prefix: &str,
+) -> ApiResult<bool> {
+    if let Some(owner) = crate::handlers::me_blobs::tenant_owner_of(key) {
+        return Ok(caller.is_some_and(|id| crate::handlers::me_blobs::may_read_tenant(id, owner)));
+    }
+    if crate::handlers::blobs::is_hidden_key(key, retrieval_prefix) {
+        let Some(id) = caller else {
+            return Ok(false);
+        };
+        if is_privileged(id) {
+            return Ok(true);
+        }
+        let Some(run) = retrieval_run_of(key, retrieval_prefix) else {
+            return Ok(false);
+        };
+        // A run with no ownership row predates this check (or was produced
+        // anonymously): only privileged roles may read it.
+        return Ok(owner_of(pool, run).await?.is_some_and(|o| o == id.sub));
+    }
+    Ok(true)
+}
+
 pub async fn post_retrieve(
     State(st): State<AppState>,
+    identity: Option<Extension<Identity>>,
     Json(body): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     let (plan, output_format) = parse_request(&body)?;
     let run_id = Uuid::new_v4().to_string();
-    let result = replayer::replay(&plan, &st, &output_format, &run_id).await?;
+    let caller = identity.as_ref().map(|Extension(id)| id);
+    let result = replayer::replay(&plan, &st, &output_format, &run_id, caller).await?;
     Ok(Json(
         serde_json::to_value(&result)
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("serializing result: {e}")))?,
@@ -90,6 +200,52 @@ mod tests {
         assert!(msg.contains("jsonl"), "{msg}");
         assert!(msg.contains("csv"), "{msg}");
         assert!(msg.contains("raw"), "{msg}");
+    }
+
+    fn ident(sub: &str, role: &str) -> Identity {
+        Identity {
+            sub: sub.into(),
+            role: role.into(),
+            email: None,
+            active: true,
+            scopes: vec![],
+        }
+    }
+
+    #[test]
+    fn retrieval_ddl_takes_the_platform_bootstrap_lock() {
+        let lock = format!(
+            "SELECT pg_advisory_xact_lock({});",
+            crate::platform_tables::MIGRATION_LOCK_KEY
+        );
+        assert!(RETRIEVAL_RUNS_DDL.starts_with(&lock));
+    }
+
+    #[test]
+    fn retrieval_run_of_extracts_the_run_segment() {
+        assert_eq!(
+            retrieval_run_of("retrievals/abc-1/result.jsonl", "retrievals"),
+            Some("abc-1")
+        );
+        assert_eq!(
+            retrieval_run_of("retrievals/abc-1", "/retrievals/"),
+            Some("abc-1")
+        );
+        assert_eq!(retrieval_run_of("retrievals/", "retrievals"), None);
+        assert_eq!(
+            retrieval_run_of("retrievals-archive/x/y", "retrievals"),
+            None
+        );
+        assert_eq!(retrieval_run_of("retrievals/x", ""), None);
+    }
+
+    #[test]
+    fn privileged_roles_match_tenant_blob_rule() {
+        assert!(is_privileged(&ident("x", "local")));
+        assert!(is_privileged(&ident("x", "admin")));
+        assert!(is_privileged(&ident("x", "super_admin")));
+        assert!(!is_privileged(&ident("x", "user")));
+        assert!(!is_privileged(&ident("x", "job")));
     }
 
     #[test]

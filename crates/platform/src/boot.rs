@@ -294,6 +294,9 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     // storage is configured at all.
     if !settings.blob_root.is_empty() {
         crate::handlers::me_blobs::migrate(&pool).await?;
+        // Retrieval outputs are materialized to the blob store; their owner
+        // index must exist before `/retrieve` or `GET /blobs/<retrieval>` runs.
+        crate::handlers::retrieve::migrate(&pool).await?;
     }
 
     // Data-push plane: create the `sync` bookkeeping tables (idempotent) when

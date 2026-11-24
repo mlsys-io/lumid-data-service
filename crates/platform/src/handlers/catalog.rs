@@ -108,12 +108,28 @@ pub async fn get_writable(
 /// GET /catalog/lineage/run/{run_id}
 pub async fn get_lineage_run(
     State(st): State<AppState>,
+    Extension(identity): Extension<Identity>,
     Path(run_id): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    match q::trace_run(&st.pool, &run_id).await? {
-        Some(row) => Ok(Json(row)),
-        None => Err(ApiError::NotFound(format!("unknown run_id '{run_id}'"))),
+    // Same rule as `/catalog/lineage/runs`: non-admin callers see only their
+    // own runs. Someone else's run answers exactly like an unknown id (404),
+    // so a probe cannot confirm it exists.
+    let not_found = || ApiError::NotFound(format!("unknown run_id '{run_id}'"));
+    let row = q::trace_run(&st.pool, &run_id)
+        .await?
+        .ok_or_else(not_found)?;
+    if may_see_run(&identity, &row) {
+        Ok(Json(row))
+    } else {
+        Err(not_found())
     }
+}
+
+/// Admins and local keys see every run; everyone else only runs they submitted.
+fn may_see_run(identity: &Identity, run: &Value) -> bool {
+    identity.role == "super_admin"
+        || identity.role == "local"
+        || run.get("submitted_by").and_then(Value::as_str) == Some(identity.sub.as_str())
 }
 
 #[derive(Deserialize)]
@@ -233,4 +249,34 @@ pub async fn get_submitters(
     };
     let submitters = q::list_submitters(&st.pool, only_self).await?;
     Ok(Json(json!({ "submitters": submitters })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ident(sub: &str, role: &str) -> Identity {
+        Identity {
+            sub: sub.into(),
+            role: role.into(),
+            email: None,
+            active: true,
+            scopes: vec![],
+        }
+    }
+
+    #[test]
+    fn lineage_run_is_visible_to_its_submitter_and_privileged_roles_only() {
+        let run = json!({"run_id": "r", "submitted_by": "user-a"});
+        assert!(may_see_run(&ident("user-a", "user"), &run));
+        assert!(!may_see_run(&ident("user-b", "user"), &run));
+        assert!(may_see_run(&ident("ops", "super_admin"), &run));
+        assert!(may_see_run(&ident("ops", "local"), &run));
+        // Mirrors /catalog/lineage/runs, which does not widen for plain admin.
+        assert!(!may_see_run(&ident("ops", "admin"), &run));
+        // A run with no submitter (scraper/sync rows) is privileged-only.
+        let unowned = json!({"run_id": "r", "submitted_by": null});
+        assert!(!may_see_run(&ident("user-a", "user"), &unowned));
+        assert!(may_see_run(&ident("ops", "local"), &unowned));
+    }
 }
