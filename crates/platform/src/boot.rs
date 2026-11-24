@@ -385,7 +385,11 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     };
 
     // Auto-MCP: one tool per declarative read endpoint, merged into ext routes.
-    let mcp_registry = Arc::new(mcp::registry_from_specs(&specs));
+    let mut mcp_registry = mcp::registry_from_specs(&specs);
+    if state.settings.jobs_enabled {
+        mcp_registry.tools.extend(crate::jobs::mcp_tools::tools());
+    }
+    let mcp_registry = Arc::new(mcp_registry);
     tracing::info!("mcp: {} tools (POST /mcp)", mcp_registry.len());
     let mut ext_router = parts.ext_routes.merge(mcp::build_router(mcp_registry));
     if parts.enable_llm {
@@ -401,6 +405,10 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
             "llm proxy enabled (/v1/*), max body {} MiB",
             state.settings.llm_max_body_bytes / (1024 * 1024)
         );
+    }
+    if state.settings.jobs_enabled {
+        ext_router = ext_router.merge(crate::jobs::api::routes());
+        tracing::info!("jobs API enabled (/jobs/v1/*)");
     }
     if parts.enable_agent {
         ext_router = ext_router.merge(crate::agent::routes());
@@ -427,6 +435,16 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         if let (Some(dst), Some(src)) = (
             openapi_paths.as_object_mut(),
             crate::llm::openapi_paths().as_object(),
+        ) {
+            for (k, v) in src {
+                dst.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+    if state.settings.jobs_enabled {
+        if let (Some(dst), Some(src)) = (
+            openapi_paths.as_object_mut(),
+            crate::jobs::api::openapi_paths().as_object(),
         ) {
             for (k, v) in src {
                 dst.entry(k.clone()).or_insert_with(|| v.clone());

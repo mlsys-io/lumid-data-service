@@ -23,7 +23,12 @@ use crate::state::AppState;
 /// A tool handler: takes the live AppState + the call arguments, returns a JSON
 /// result (or an ApiError, surfaced to the client as an MCP tool error).
 pub type BoxFut = BoxFuture<'static, ApiResult<Value>>;
-pub type ToolHandler = Arc<dyn Fn(AppState, Map<String, Value>) -> BoxFut + Send + Sync>;
+/// A tool handler gets the live AppState, the gated caller's identity (`None`
+/// only if the router is mounted outside the auth gate), and the arguments.
+/// Tools that act for a user (jobs, sources) need the caller; read-spec tools
+/// ignore it.
+pub type ToolHandler =
+    Arc<dyn Fn(AppState, Option<crate::auth::Identity>, Map<String, Value>) -> BoxFut + Send + Sync>;
 
 /// One MCP tool: its advertised name/description/JSON-schema + the handler.
 pub struct McpTool {
@@ -59,15 +64,24 @@ const PROTOCOL_VERSION: &str = "2025-03-26";
 pub fn build_router(registry: Arc<McpRegistry>) -> Router<AppState> {
     Router::new().route(
         "/mcp",
-        post(move |st: State<AppState>, body: Json<Value>| {
-            let registry = registry.clone();
-            async move { handle(&registry, st.0, body.0).await }
-        })
+        post(
+            move |st: State<AppState>,
+                  identity: Option<axum::Extension<crate::auth::Identity>>,
+                  body: Json<Value>| {
+                let registry = registry.clone();
+                async move { handle(&registry, st.0, identity.map(|e| e.0), body.0).await }
+            },
+        )
         .get(|| async { Json(json!({"service": "mcp", "transport": "streamable-http"})) }),
     )
 }
 
-async fn handle(reg: &McpRegistry, st: AppState, body: Value) -> Response {
+async fn handle(
+    reg: &McpRegistry,
+    st: AppState,
+    identity: Option<crate::auth::Identity>,
+    body: Value,
+) -> Response {
     let id = body.get("id").cloned().unwrap_or(Value::Null);
     let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
     match method {
@@ -105,7 +119,7 @@ async fn handle(reg: &McpRegistry, st: AppState, body: Value) -> Response {
                 .unwrap_or_default();
             match reg.find(name) {
                 None => rpc_ok(id, tool_error(format!("unknown tool {name:?}"))),
-                Some(t) => match (t.handler)(st, args).await {
+                Some(t) => match (t.handler)(st, identity, args).await {
                     Ok(v) => rpc_ok(id, tool_result(v)),
                     Err(e) => rpc_ok(id, tool_error(format!("{e}"))),
                 },
@@ -166,7 +180,7 @@ fn tool_from_spec(spec: Arc<EndpointSpec>) -> McpTool {
     let input_schema = json!({"type": "object", "properties": props, "required": required});
     let description = format!("{} — {} {}", spec.id, spec.method, spec.path);
     let spec_h = spec.clone();
-    let handler: ToolHandler = Arc::new(move |st: AppState, args: serde_json::Map<String, Value>| {
+    let handler: ToolHandler = Arc::new(move |st: AppState, _identity, args: serde_json::Map<String, Value>| {
         let spec = spec_h.clone();
         Box::pin(async move {
             let (path, query) = split_args(&spec, &args);

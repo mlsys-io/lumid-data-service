@@ -848,7 +848,13 @@ mod tests {
         )];
         let s = [site("office", &["flowmesh"])];
         let down = route("tail", "office", "ld", "tailnet", "down", &p);
-        let alts = refused(plan(&needs, &s, std::slice::from_ref(&down), &p, &RuntimeSel::auto()));
+        let alts = refused(plan(
+            &needs,
+            &s,
+            std::slice::from_ref(&down),
+            &p,
+            &RuntimeSel::auto(),
+        ));
         assert_eq!(alts[0].blocking[0].code, "route_unavailable");
         // Down stays down even when its health is old.
         let mut old_down = down.clone();

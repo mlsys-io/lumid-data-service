@@ -13,18 +13,23 @@
 //!   job-token enforcement (`enforce`, with the pure checks in `scope`).
 //! * Phase 3: the networking planner (`planner`, pure) and its catalog-only
 //!   inputs (`inputs`).
+//! * Phase 4: the service (`service`) behind both `/jobs/v1/*` (`api`) and
+//!   the MCP tools (`mcp_tools`) — one implementation, two surfaces.
 //!
 //! Everything is off unless `LUMID_JOBS_ENABLED` is set: no schema, no seed,
 //! and `ljt_` tokens are refused — deploying it changes nothing.
 
 pub mod access;
+pub mod api;
 pub mod enforce;
 pub mod inputs;
+pub mod mcp_tools;
 pub mod planner;
 pub mod refs;
 pub mod schema;
 pub mod scope;
 pub mod seed;
+pub mod service;
 pub mod token;
 
 use deadpool_postgres::Pool;
