@@ -214,10 +214,8 @@ mod tests {
 
     #[test]
     fn retrieval_ddl_takes_the_platform_bootstrap_lock() {
-        let lock = format!(
-            "SELECT pg_advisory_xact_lock({});",
-            crate::platform_tables::MIGRATION_LOCK_KEY
-        );
+        // This deploy base predates `platform_tables`; same key, as a literal.
+        let lock = "SELECT pg_advisory_xact_lock(7815273027795448930);".to_string();
         assert!(RETRIEVAL_RUNS_DDL.starts_with(&lock));
     }
 
