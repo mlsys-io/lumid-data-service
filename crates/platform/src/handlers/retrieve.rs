@@ -94,10 +94,14 @@ CREATE TABLE IF NOT EXISTS provenance.retrieval_runs (
 /// per table at all — see deploy/standalone/reader_role.sql.)
 pub async fn migrate(pool: &Pool, reader_role: &str) -> anyhow::Result<()> {
     let client = pool.get().await?;
-    client.batch_execute(RETRIEVAL_RUNS_DDL).await?;
-    if let Some(sql) = revoke_from_reader_sql(reader_role) {
-        client.batch_execute(&sql).await?;
-    }
+    // One batch, so the DDL's advisory lock also covers the REVOKE: concurrent
+    // REVOKEs from replicas booting together fail with "tuple concurrently
+    // updated" when run as separate batches.
+    let sql = match revoke_from_reader_sql(reader_role) {
+        Some(revoke) => format!("{RETRIEVAL_RUNS_DDL}\n{revoke}"),
+        None => RETRIEVAL_RUNS_DDL.to_string(),
+    };
+    client.batch_execute(&sql).await?;
     Ok(())
 }
 
