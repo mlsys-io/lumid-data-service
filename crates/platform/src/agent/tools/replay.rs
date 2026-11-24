@@ -3,6 +3,7 @@
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
+use crate::auth::Identity;
 use crate::error::{ApiError, ApiResult};
 use crate::retrieve::materialize::OutputFormat;
 use crate::retrieve::plan::RetrievalPlan;
@@ -44,7 +45,11 @@ impl super::Tool for ReplayRetrievalPlanTool {
     }
 }
 
-pub async fn replay_retrieval_plan(st: &AppState, args: &Map<String, Value>) -> ApiResult<Value> {
+pub async fn replay_retrieval_plan(
+    st: &AppState,
+    args: &Map<String, Value>,
+    caller: Option<&Identity>,
+) -> ApiResult<Value> {
     let plan_val = args
         .get("plan")
         .cloned()
@@ -62,7 +67,7 @@ pub async fn replay_retrieval_plan(st: &AppState, args: &Map<String, Value>) -> 
         .ok_or_else(|| ApiError::BadRequest(format!("unknown output_format: {fmt_str}")))?;
 
     let run_id = Uuid::new_v4().to_string();
-    let result = replayer::replay(&plan, st, &output_format, &run_id).await?;
+    let result = replayer::replay(&plan, st, &output_format, &run_id, caller).await?;
 
     Ok(serde_json::to_value(&result)
         .map_err(|e| ApiError::Internal(anyhow::anyhow!("serializing result: {e}")))?)

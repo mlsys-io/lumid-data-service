@@ -81,10 +81,11 @@ pub async fn dispatch(
     name: &str,
     args: &Map<String, Value>,
     _cfg: &AgentConfig,
+    caller: Option<&crate::auth::Identity>,
 ) -> ApiResult<Value> {
     match name {
         "get_schema_cards" => schema_cards::get_schema_cards(st, args).await,
-        "replay_retrieval_plan" => replay::replay_retrieval_plan(st, args).await,
+        "replay_retrieval_plan" => replay::replay_retrieval_plan(st, args, caller).await,
         other => Err(ApiError::NotFound(format!("unknown tool '{other}'"))),
     }
 }
