@@ -84,11 +84,39 @@ CREATE TABLE IF NOT EXISTS provenance.retrieval_runs (
 );";
 
 /// Create `provenance.retrieval_runs` (idempotent; `provenance` already exists
-/// once `platform_tables::migrate` has run).
-pub async fn migrate(pool: &Pool) -> anyhow::Result<()> {
+/// once `platform_tables::migrate` has run), and make sure the retrieval
+/// reader role can NOT read it.
+///
+/// The ownership index names who ran what; it must never be reachable from
+/// `/retrieve` SQL itself. A reader granted broad read (`pg_read_all_data`, or
+/// `ALTER DEFAULT PRIVILEGES … GRANT SELECT ON TABLES`) would otherwise see it
+/// the moment it is created. (A `pg_read_all_data` grant cannot be overridden
+/// per table at all — see deploy/standalone/reader_role.sql.)
+pub async fn migrate(pool: &Pool, reader_role: &str) -> anyhow::Result<()> {
     let client = pool.get().await?;
     client.batch_execute(RETRIEVAL_RUNS_DDL).await?;
+    if let Some(sql) = revoke_from_reader_sql(reader_role) {
+        client.batch_execute(&sql).await?;
+    }
     Ok(())
+}
+
+/// `REVOKE ALL` on the ownership index from `reader_role`, guarded so a role
+/// that does not exist (or an unset one) is a no-op rather than a boot failure.
+fn revoke_from_reader_sql(reader_role: &str) -> Option<String> {
+    let role = reader_role.trim();
+    if role.is_empty() {
+        return None;
+    }
+    let ident = format!("\"{}\"", role.replace('"', "\"\""));
+    let literal = role.replace('\'', "''");
+    Some(format!(
+        "DO $revoke$ BEGIN \
+           IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{literal}') THEN \
+             REVOKE ALL ON provenance.retrieval_runs FROM {ident}; \
+           END IF; \
+         END $revoke$;"
+    ))
 }
 
 /// Roles that may read any run's output (same set as tenant blobs).
@@ -219,6 +247,19 @@ mod tests {
             crate::platform_tables::MIGRATION_LOCK_KEY
         );
         assert!(RETRIEVAL_RUNS_DDL.starts_with(&lock));
+    }
+
+    #[test]
+    fn reader_revoke_is_guarded_and_quoted() {
+        assert_eq!(revoke_from_reader_sql(""), None);
+        assert_eq!(revoke_from_reader_sql("  "), None);
+        let sql = revoke_from_reader_sql("lumid_reader").unwrap();
+        assert!(sql.contains("rolname = 'lumid_reader'"), "{sql}");
+        assert!(sql.contains("FROM \"lumid_reader\""), "{sql}");
+        // Hostile names stay inside their quotes.
+        let sql = revoke_from_reader_sql("a\"b'c").unwrap();
+        assert!(sql.contains("rolname = 'a\"b''c'"), "{sql}");
+        assert!(sql.contains("FROM \"a\"\"b'c\""), "{sql}");
     }
 
     #[test]
