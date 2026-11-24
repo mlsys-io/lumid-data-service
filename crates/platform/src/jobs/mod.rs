@@ -11,12 +11,16 @@
 //!   hub's estate sources and routes.
 //! * Phase 2: the access rule (`access`), per-job tokens (`token`), and
 //!   job-token enforcement (`enforce`, with the pure checks in `scope`).
+//! * Phase 3: the networking planner (`planner`, pure) and its catalog-only
+//!   inputs (`inputs`).
 //!
 //! Everything is off unless `LUMID_JOBS_ENABLED` is set: no schema, no seed,
 //! and `ljt_` tokens are refused — deploying it changes nothing.
 
 pub mod access;
 pub mod enforce;
+pub mod inputs;
+pub mod planner;
 pub mod refs;
 pub mod schema;
 pub mod scope;
@@ -36,6 +40,9 @@ pub async fn boot(pool: &Pool, settings: &Settings) -> anyhow::Result<()> {
     }
     let estate = seed::parse_estate(&settings.jobs_estate).map_err(anyhow::Error::msg)?;
     let routes = seed::parse_routes(&settings.jobs_routes_json).map_err(anyhow::Error::msg)?;
+    // Validate the site table at boot too, so a typo fails loudly here rather
+    // than at the first plan.
+    inputs::parse_sites(&settings.jobs_sites_json).map_err(anyhow::Error::msg)?;
     schema::migrate(pool, &settings.retrieval_db_role).await?;
     let rep = seed::apply(pool, &settings.hub_id, &settings.hub_site, &estate, &routes).await?;
     tracing::info!(
