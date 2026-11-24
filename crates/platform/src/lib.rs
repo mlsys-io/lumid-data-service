@@ -17,6 +17,7 @@ pub mod error;
 pub mod federation;
 pub mod handlers;
 pub mod ingest;
+pub mod jobs;
 pub mod llm;
 pub mod llm_pool;
 pub mod mcp;
