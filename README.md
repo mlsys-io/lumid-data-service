@@ -183,6 +183,46 @@ minting a new run, so the FK requires it; a missing run returns `400`. Provenanc
 verbatim (`ON CONFLICT DO NOTHING`). Response: `{batch_id, inserted, updated, failed, duplicate}`.
 A fully-invalid batch returns `422` (nothing recorded); a partial one ACKs with `failed > 0`.
 
+## Hub-to-hub sync (jobs registry)
+Federated data hubs (`home` = the entrance, `nus`, …) share the **jobs registry**, each hub's
+**catalog mirror**, and **small tenant blobs**. Data never moves; user tables never move on this
+plane. Mounted when the app has `ServeParts.enable_sync` **and** `LUMID_JOBS_ENABLED`.
+
+**Ownership follows location.** Every synced row names its only writer in `home_hub`. A hub emits
+only its own rows and applies an incoming row only when `incoming.updated_at > local.updated_at`
+**and** `incoming.home_hub != LUMID_HUB_ID` **and** the row belongs to the sending peer. A hub never
+overwrites its own rows (enforced in the upsert's `WHERE`, not just in Rust). Deletes are
+tombstones (`deleted_at`). `jobs.job_tokens` is local-only and refused by name; `provenance.*` is
+never synced.
+
+**Driven from one side.** NUS cannot reach home, so home does both directions every
+`LUMID_SYNC_INTERVAL`: it pushes home-owned rows to the peer's `/sync/inbox` and pulls the peer's
+rows from its `/sync/outbox`, applying them through the same code as the inbox (same
+content-hashed `batch_id`, same `sync.inbox_ledger`, cursor saved only after the batch is applied).
+
+| Env (`LUMID_*`) | Default | Meaning |
+|---|---|---|
+| `HUB_ID` | `local` | This hub's id (the only writer of rows with that `home_hub`) |
+| `HUB_SYNC_PEERS` | empty (no scheduler) | Hubs this hub drives: `[{"hub_id":"nus","base_url":"http://…:5101","key_env":"LUMID_SYNC_KEY_NUS"}]`. `key_env` defaults to `LUMID_SYNC_KEY_<HUB_ID>`; boot fails if it is unset |
+| `SYNC_INTERVAL` | `30` (s) | Cycle period (`30`, `30s`, `2m`) |
+| `HUB_SYNC_OVERLAP_SECS` | `120` | Each cycle re-reads this far behind its cursor (a row whose transaction committed late is still delivered; re-reads apply as no-ops) |
+| `HUB_SMALL_MAX` | `67108864` (64 MiB) | Largest blob that copies; larger never copy. `0` disables blob sync |
+| `HUB_PEER_IDS` | empty | Hub ids whose `sync:<id>` key may call `/sync/inbox`/`/sync/outbox` (empty = any `sync:*` key). The ids in `HUB_SYNC_PEERS` are always included. These ids are refused on `/sync/apply` |
+| `HUB_SYNC_CONFINE` | `true` | With jobs on, every `sync:*` local key may call `/sync/*` only |
+| `HUB_CATALOG_REFRESH_SECS` | `600` | How often this hub republishes its own tables into `jobs.catalog_mirror` (catalog estimates, no scans). `0` disables |
+| `SYNC_BATCH_ROWS` | `1000` | Rows per table per outbox page |
+
+Wiring for two hubs: on **nus** `LUMID_HUB_ID=nus`, `LUMID_API_KEYS=…,<k>:sync:home`,
+`LUMID_HUB_PEER_IDS=home`; on **home** `LUMID_HUB_ID=home`,
+`LUMID_HUB_SYNC_PEERS=[{"hub_id":"nus","base_url":"http://<nus>:5101"}]`, `LUMID_SYNC_KEY_NUS=<k>`.
+
+| Endpoint | Caller | |
+|---|---|---|
+| `POST /sync/inbox` | `sync:<peer>` key | Apply one registry batch `{batch_id, scope, hub, table, records}` → `{inserted, updated, stale, skipped_own, rejected, duplicate}` |
+| `GET /sync/outbox?scope=registry\|blobs&since=<cursor>&limit=` | `sync:<peer>` key | This hub's own rows past the opaque cursor → `{batches \| blobs, cursor, more}` |
+| `POST /sync/blobs/have`, `PUT\|GET /sync/blobs/:owner/:sha` | `sync:<peer>` key | Copy-if-missing for blobs ≤ `HUB_SMALL_MAX`; the receiver re-hashes, and the `raw.tenant_blobs` row moves with the bytes |
+| `GET /sync/status` | any authenticated caller | Per peer × scope × direction: `last_success_at/_age_s`, `last_error_at` (+ `last_error` for admins), `cursor_age_s`, `failing`; per peer `synced_age_s` for a "NUS hub: synced 20 s ago" badge |
+
 ## Dev layout
 Two repos, one binary. Clone as siblings:
 ```

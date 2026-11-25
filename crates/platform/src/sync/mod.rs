@@ -11,6 +11,7 @@
 //! and provenance stamping for free. Exactly-once-effective = at-least-once
 //! delivery + (`sync.inbox_ledger` dedup AND the idempotent merge).
 
+pub mod hub;
 pub mod inbox;
 pub mod push;
 

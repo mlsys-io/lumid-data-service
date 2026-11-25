@@ -312,6 +312,11 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     // enabled. A target that can't migrate its inbox shouldn't start.
     if parts.enable_sync {
         crate::sync::migrate(&pool).await?;
+        // Hub-to-hub registry sync rides on the jobs plane: its columns,
+        // indexes and bookkeeping (one locked batch + the reader revoke).
+        if settings.jobs_enabled {
+            crate::sync::hub::migrate(&pool, &settings.retrieval_db_role).await?;
+        }
         if settings.sync_target_url.is_empty() {
             tracing::info!("sync: inbox enabled (/sync/apply); no push target configured");
         } else {
@@ -422,6 +427,37 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
             axum::extract::DefaultBodyLimit::max(state.settings.ingest_max_bytes as usize),
         ));
         tracing::info!("sync plane enabled (POST /sync/apply, /admin/sync/*)");
+        if state.settings.jobs_enabled {
+            // Bad peer config fails boot: a hub that silently never syncs is
+            // worse than one that refuses to start.
+            let peers = crate::sync::hub::parse_hub_peers(
+                &state.settings.hub_sync_peers_json,
+                &state.settings.hub_id,
+                &|k| std::env::var(k).ok(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            ext_router = ext_router.merge(crate::sync::hub::routes(state.settings.hub_small_max));
+            let instance = if state.settings.jobs_instance.is_empty() {
+                state.settings.hub_id.clone()
+            } else {
+                state.settings.jobs_instance.clone()
+            };
+            crate::sync::hub::catalog::spawn(
+                state.pool.clone(),
+                state.settings.hub_id.clone(),
+                instance,
+                state.settings.user_schemas.clone(),
+                state.settings.hub_catalog_refresh_s,
+            );
+            tracing::info!(
+                hub = %state.settings.hub_id,
+                peers = ?peers.iter().map(|p| p.hub_id.as_str()).collect::<Vec<_>>(),
+                interval_s = state.settings.hub_sync_interval_s,
+                small_max = state.settings.hub_small_max,
+                "hub sync enabled (/sync/inbox, /sync/outbox, /sync/status, /sync/blobs/*)"
+            );
+            crate::sync::hub::sched::spawn(state.clone(), peers);
+        }
     }
 
     let read_router = read::exec::build_router(&specs);

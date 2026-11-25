@@ -186,7 +186,7 @@ pub async fn dispatch(st: &AppState, job_id: Uuid) {
 async fn set_error(st: &AppState, job_id: Uuid, msg: &str) -> anyhow::Result<()> {
     let c = st.pool.get().await?;
     c.execute(
-        "UPDATE jobs.jobs SET error = $2 WHERE job_id = $1",
+        "UPDATE jobs.jobs SET error = $2, updated_at = now() WHERE job_id = $1",
         &[&job_id, &json!({"code": "dispatch_failed", "message": msg})],
     )
     .await?;

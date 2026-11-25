@@ -210,7 +210,7 @@ pub async fn record_route_health(
     let n = c
         .execute(
             "UPDATE jobs.site_routes
-                SET health = $3, latency_ms = $4, health_at = now()
+                SET health = $3, latency_ms = $4, health_at = now(), updated_at = now()
               WHERE route_id = $2 AND home_hub = $1 AND deleted_at IS NULL",
             &[&hub_id, &route_id, &health, &latency_ms],
         )

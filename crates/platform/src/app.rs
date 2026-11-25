@@ -211,6 +211,12 @@ pub fn build_router(
         // before the shadow forward and every handler. Pure passthrough for
         // any caller whose role is not `job`.
         .layer(from_fn_with_state(state.clone(), crate::jobs::enforce::enforce))
+        // `sync:*` keys are confined to `/sync/*` when the jobs plane is on
+        // (passthrough otherwise) — see `sync::hub::confine_sync_keys`.
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::sync::hub::confine_sync_keys,
+        ))
         .layer(from_fn_with_state(state.clone(), crate::auth::gate));
 
     public
