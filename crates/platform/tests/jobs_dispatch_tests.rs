@@ -149,8 +149,12 @@ async fn stub_lumilake(seen: Shared, hub: Arc<Mutex<String>>) -> String {
         seen.lock().unwrap().cancels.push(id);
         Json(json!({"ok": true}))
     }
+    async fn openapi() -> Json<Value> {
+        Json(json!({"components": {"schemas": {"LumidJobBinding": {"type": "object"}}}}))
+    }
     serve(
         Router::new()
+            .route("/openapi.json", get(openapi))
             .route("/api/v1/jobs", post(submit))
             .route("/api/v1/jobs/:id", get(status))
             .route("/api/v1/jobs/:id/cancel", post(cancel))
@@ -455,4 +459,71 @@ async fn service_key_owned_jobs_fail_dispatch_clearly() {
         "{err}"
     );
     let _ = hub;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; LUMID_JOBS_E2E=1 + DATABASE_URL"]
+async fn a_lumilake_without_lumid_job_support_is_refused_not_used_unscoped() {
+    let Some((st, _hub, seen)) = boot().await else {
+        return;
+    };
+    // An older Lumilake: healthy, accepts jobs, but its schema has no
+    // LumidJobBinding — it would silently drop the binding.
+    async fn old_openapi() -> Json<Value> {
+        Json(json!({"components": {"schemas": {"JobSubmitRequest": {}}}}))
+    }
+    async fn accept() -> Json<Value> {
+        Json(json!({"ok": true, "data": {"job_id": "req-old", "status": "pending"}}))
+    }
+    let old = serve(
+        Router::new()
+            .route("/openapi.json", get(old_openapi))
+            .route("/api/v1/jobs", post(accept)),
+    )
+    .await;
+    let mut settings = (*st.settings).clone();
+    settings.jobs_runtimes_json = format!(r#"{{"lumilake": {{"home": "{old}"}}}}"#);
+    let st2 = AppState {
+        settings: Arc::new(settings),
+        ..st.clone()
+    };
+    let id: uuid::Uuid = st2
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "INSERT INTO jobs.jobs (home_hub, owner_sub, app, runtime, site, status, spec)
+             VALUES ('home', 'bob-sub', 'e2e', 'lumilake', 'home', 'planned',
+                     '{\"payload\":{\"data\":[{\"name\":\"x\"}]}}')
+             RETURNING job_id",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    lumid_platform::jobs::dispatch::dispatch(&st2, id).await;
+    let row = st2
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT status, error, runtime_ref FROM jobs.jobs WHERE job_id = $1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>("status"), "failed");
+    assert!(
+        row.get::<_, Option<String>>("runtime_ref").is_none(),
+        "it was submitted anyway"
+    );
+    let err: Value = row.get("error");
+    assert!(
+        err["message"].as_str().unwrap().contains("Lumilake#187"),
+        "{err}"
+    );
+    // The supporting stub was never involved.
+    assert!(seen.lock().unwrap().submits.is_empty());
 }

@@ -11,7 +11,8 @@
 //! never travels in this request.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -94,6 +95,58 @@ async fn mint_for_owner(st: &AppState, sub: &str, audience: &str) -> Result<Stri
         .map_err(|e| format!("lum.id mint response: {e}"))
 }
 
+/// Lumilake base URL -> (supports `lumid_job`, checked at). Positive answers
+/// are reused for 10 min, negative for 1 min (so a release is picked up fast).
+static CAPABILITY: Mutex<Option<HashMap<String, (bool, Instant)>>> = Mutex::new(None);
+
+/// Does the Lumilake at `base` understand `lumid_job`? Answered from its
+/// published OpenAPI schema. Without it, Lumilake's request model silently
+/// IGNORES the binding and the job would read with its server-wide token —
+/// unscoped, while the hub believed otherwise — so the hub refuses instead.
+async fn lumilake_supports_jobs(st: &AppState, base: &str, token: &str) -> Result<bool, String> {
+    if let Some((ok, at)) = CAPABILITY
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .get(base)
+        .copied()
+    {
+        let ttl = if ok {
+            Duration::from_secs(600)
+        } else {
+            Duration::from_secs(60)
+        };
+        if at.elapsed() < ttl {
+            return Ok(ok);
+        }
+    }
+    let resp = st
+        .http
+        .get(format!("{base}/openapi.json"))
+        .bearer_auth(token)
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| format!("lumilake unreachable (schema check): {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "lumilake schema check failed (HTTP {})",
+            resp.status()
+        ));
+    }
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("lumilake schema: {e}"))?;
+    let ok = body.contains("LumidJobBinding");
+    CAPABILITY
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(base.to_string(), (ok, Instant::now()));
+    Ok(ok)
+}
+
 /// The data URL the plan chose for this job's data (first data-plane source
 /// with a route URL); `None` lets the runtime use its own default.
 fn planned_data_url(job: &Value) -> Option<String> {
@@ -168,6 +221,13 @@ async fn dispatch_inner(st: &AppState, job_id: Uuid) -> Result<(), String> {
                 json!({"job_id": job_id.to_string(), "data_url": planned_data_url(&job)}),
             );
             let token = mint_for_owner(st, owner, "lumilake").await?;
+            if !lumilake_supports_jobs(st, &base, &token).await? {
+                return Err(format!(
+                    "the Lumilake at {base} does not support job-scoped data (needs \
+                     mlsys-io/Lumilake#187); refusing to dispatch rather than let it \
+                     read with its server-wide token"
+                ));
+            }
             let resp = st
                 .http
                 .post(format!("{base}/api/v1/jobs"))
