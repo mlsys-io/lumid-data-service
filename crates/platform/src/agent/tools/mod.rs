@@ -95,6 +95,18 @@ pub async fn dispatch(
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
     pub max_iterations: usize,
+    /// `LUMID_AGENT_LLM_URL` / `_MODEL` / `_KEY`: the agent's OWN model
+    /// endpoint. Each falls back to the shared `LUMID_LLM_BACKEND_URL` /
+    /// `_DEFAULT_MODEL` / `_API_KEY`. Separate because on FinData those shared
+    /// settings also drive the `/llm` proxy (lum.id/llm-cloud), and the agent's
+    /// backend had died with it unnoticed (a GPU box retired 2026-10-27).
+    pub llm_url: Option<String>,
+    pub llm_model: Option<String>,
+    pub llm_key: Option<String>,
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
 impl AgentConfig {
@@ -103,6 +115,11 @@ impl AgentConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
-        Self { max_iterations }
+        Self {
+            max_iterations,
+            llm_url: nonempty_env("LUMID_AGENT_LLM_URL"),
+            llm_model: nonempty_env("LUMID_AGENT_LLM_MODEL"),
+            llm_key: nonempty_env("LUMID_AGENT_LLM_KEY"),
+        }
     }
 }
