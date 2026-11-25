@@ -33,9 +33,7 @@ pub async fn build_cards(
                 &[],
             )
             .await?;
-        rows.iter()
-            .map(|r| r.get::<_, String>("nspname"))
-            .collect()
+        rows.iter().map(|r| r.get::<_, String>("nspname")).collect()
     } else {
         schemas.to_vec()
     };
@@ -44,10 +42,10 @@ pub async fn build_cards(
     let schema_refs: Vec<String> = effective_schemas.clone();
     let table_rows = client
         .query(
-            "SELECT table_schema, table_name \
+            "SELECT table_schema, table_name, table_type \
                FROM information_schema.tables \
               WHERE table_schema = ANY($1) \
-                AND table_type = 'BASE TABLE' \
+                AND table_type IN ('BASE TABLE', 'FOREIGN') \
               ORDER BY table_schema, table_name",
             &[&schema_refs],
         )
@@ -57,7 +55,14 @@ pub async fn build_cards(
     for row in &table_rows {
         let schema: String = row.get("table_schema");
         let table: String = row.get("table_name");
-        match build_one_card(pool, &schema, &table, sample_rows).await {
+        let table_type: String = row.get("table_type");
+        // Foreign tables (e.g. the restricted UK Biobank import at the NUS hub)
+        // get a card — name, columns, estimates — but NEVER sample rows: cards
+        // are sent to the model, and that data must not leave the database
+        // (the model endpoint can overflow to an external provider). Sampling
+        // would also fail anyway for roles without the foreign-data mapping.
+        let with_values = table_type != "FOREIGN";
+        match build_one_card(pool, &schema, &table, sample_rows, with_values).await {
             Ok(card) => cards.push(card),
             Err(e) => {
                 tracing::warn!("card build failed for {schema}.{table}: {e}");
@@ -108,6 +113,9 @@ async fn build_one_card(
     schema: &str,
     table: &str,
     sample_rows: usize,
+    // false: no value-bearing statistics at all (MCVs, histogram min/max) —
+    // for data whose values must never reach the model (foreign tables).
+    with_values: bool,
 ) -> ApiResult<SchemaCard> {
     let client = pool.get().await?;
     let fqname = format!("{schema}.{table}");
@@ -138,24 +146,16 @@ async fn build_one_card(
 
     // Columns from pg_attribute.
     // quote_ident params avoid direct-param-to-regclass cast which fails to encode Rust String.
-    let col_rows = client
-        .query(SQL_COL_ROWS, &[&schema, &table])
-        .await?;
+    let col_rows = client.query(SQL_COL_ROWS, &[&schema, &table]).await?;
 
     // Primary key columns.
-    let pk_rows = client
-        .query(SQL_PK_ROWS, &[&schema, &table])
-        .await?;
-    let pk_set: std::collections::HashSet<String> = pk_rows
-        .iter()
-        .map(|r| r.get::<_, String>("name"))
-        .collect();
+    let pk_rows = client.query(SQL_PK_ROWS, &[&schema, &table]).await?;
+    let pk_set: std::collections::HashSet<String> =
+        pk_rows.iter().map(|r| r.get::<_, String>("name")).collect();
     let pk: Vec<String> = pk_rows.iter().map(|r| r.get::<_, String>("name")).collect();
 
     // Foreign keys.
-    let fk_rows = client
-        .query(SQL_FK_ROWS, &[&schema, &table])
-        .await?;
+    let fk_rows = client.query(SQL_FK_ROWS, &[&schema, &table]).await?;
     let fk_set: std::collections::HashSet<String> = fk_rows
         .iter()
         .map(|r| r.get::<_, String>("column"))
@@ -174,19 +174,22 @@ async fn build_one_card(
         .collect();
 
     // Column stats from pg_stats.
-    let stat_rows = client
-        .query(
-            "SELECT attname, n_distinct, null_frac, \
+    let stat_rows = if with_values {
+        client
+            .query(
+                "SELECT attname, n_distinct, null_frac, \
                     most_common_vals::text AS mcv_text, \
                     most_common_freqs, \
                     histogram_bounds::text AS hist_text \
                FROM pg_stats \
               WHERE schemaname = $1 AND tablename = $2",
-            &[&schema, &table],
-        )
-        .await?;
-    let mut stats: std::collections::HashMap<String, ColStat> =
-        std::collections::HashMap::new();
+                &[&schema, &table],
+            )
+            .await?
+    } else {
+        Vec::new()
+    };
+    let mut stats: std::collections::HashMap<String, ColStat> = std::collections::HashMap::new();
     for r in &stat_rows {
         let col_name: String = r.get("attname");
         let n_distinct: Option<f64> = r.try_get("n_distinct").ok().flatten();
@@ -242,9 +245,7 @@ async fn build_one_card(
                 is_fk,
                 distinct_count: stat.and_then(|s| s.distinct_count),
                 null_pct: stat.and_then(|s| s.null_pct),
-                sample_values: stat
-                    .map(|s| s.sample_values.clone())
-                    .unwrap_or_default(),
+                sample_values: stat.map(|s| s.sample_values.clone()).unwrap_or_default(),
                 min: stat.and_then(|s| s.min.clone()),
                 max: stat.and_then(|s| s.max.clone()),
                 name,
