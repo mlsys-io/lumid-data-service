@@ -137,10 +137,90 @@ pub async fn get_schema_cards(
         .collect();
     let rendered = render_bundle_for_prompt(&cards);
 
+    // Size budget. The cards go into the model request; on a big warehouse
+    // (FinData: 13 schemas, hundreds of tables) the full bundle overflowed the
+    // model endpoint's request limit (HTTP 413, 2026-11-25). Over budget, send a
+    // compact index instead and ask for one schema's details at a time.
+    if rendered.len() > CARD_BUDGET_BYTES {
+        let index = compact_index(&cards, CARD_BUDGET_BYTES);
+        return Ok(json!({
+            "table_count": cards.len(),
+            "truncated": true,
+            "note": "Too many tables to describe at once. This is an index of table names. \
+                     Call get_schema_cards again with scope set to ONE schema (e.g. scope=\"macro\") \
+                     to get its columns before writing SQL.",
+            "schema_cards": index,
+        }));
+    }
+
     Ok(json!({
         "table_count": cards.len(),
         "schema_cards": rendered,
     }))
+}
+
+/// Largest rendered card bundle sent to the model in one tool result.
+const CARD_BUDGET_BYTES: usize = 48 * 1024;
+
+/// One line per table: `schema.table (~rows) — description`, grouped by
+/// schema, cut at `budget` bytes with a count of what was left out.
+fn compact_index(cards: &[crate::retrieve::schema_card::SchemaCard], budget: usize) -> String {
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for c in cards {
+        let rows = c
+            .approx_row_count
+            .filter(|n| *n >= 0)
+            .map(|n| format!(" (~{n} rows)"))
+            .unwrap_or_default();
+        let desc = c
+            .description
+            .as_deref()
+            .map(|d| d.lines().next().unwrap_or("").chars().take(120).collect::<String>())
+            .filter(|d| !d.is_empty())
+            .map(|d| format!(" — {d}"))
+            .unwrap_or_default();
+        let line = format!("{}{rows}{desc}\n", c.fqname);
+        if out.len() + line.len() > budget {
+            break;
+        }
+        out.push_str(&line);
+        shown += 1;
+    }
+    if shown < cards.len() {
+        out.push_str(&format!(
+            "… and {} more tables; narrow with scope=<schema>.\n",
+            cards.len() - shown
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::compact_index;
+    use crate::retrieve::schema_card::SchemaCard;
+
+    fn card(fq: &str, rows: i64, desc: Option<&str>) -> SchemaCard {
+        let mut c: SchemaCard = serde_json::from_value(serde_json::json!({
+            "fqname": fq, "description": desc, "approx_row_count": rows,
+            "size_bytes": null, "columns": [], "built_at": "2026-11-25T00:00:00Z"
+        }))
+        .unwrap();
+        c.fqname = fq.into();
+        c
+    }
+
+    #[test]
+    fn index_lists_tables_and_says_what_it_left_out() {
+        let cards: Vec<_> = (0..500).map(|i| card(&format!("s.t{i}"), 10, Some("a table\nmore"))).collect();
+        let idx = compact_index(&cards, 2000);
+        assert!(idx.starts_with("s.t0 (~10 rows) — a table\n"));
+        assert!(idx.len() < 2100);
+        assert!(idx.contains("more tables; narrow with scope="));
+        let small = compact_index(&cards[..2], 2000);
+        assert!(!small.contains("more tables"));
+    }
 }
 
 #[cfg(test)]
