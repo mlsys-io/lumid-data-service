@@ -297,6 +297,25 @@ async fn resolve_decl(
         // An estate table: authorized by the estate source (public, read-only).
         SourceRef::Table { instance, .. } => {
             let dec = access::can(&st.pool, &caller.sub, instance, access).await?;
+            // An estate this hub does not serve. Estates are public, so saying
+            // so leaks nothing — and "not entitled" would send the user hunting
+            // for a permission that does not exist.
+            if !dec.allow && dec.reason == "source_not_found" {
+                let served = home_instances(st)
+                    .iter()
+                    .map(|i| format!("{i}://schema.table"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(not_found(
+                    "estate_not_served",
+                    format!(
+                        "{instance} data can't be used in jobs on this hub yet. Jobs can read: \
+                         {served}, your own or shared sources (src://…), blobs \
+                         (data://{hub}/…), models (hf://…) and external APIs (ext://…)."
+                    ),
+                )
+                .with(json!({"ref": d.r, "instance": instance, "served": home_instances(st)})));
+            }
             if !dec.allow {
                 return Err(deny(if access == Access::Write {
                     "write into estate tables through a registered src:// sink"
