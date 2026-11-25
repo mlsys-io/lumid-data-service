@@ -39,7 +39,7 @@ fn esc(s: &str) -> String {
 
 /// One discovery tile.
 struct Tile {
-    href: &'static str,
+    href: String,
     title: &'static str,
     desc: &'static str,
     endpoint: String,
@@ -53,7 +53,16 @@ fn tile_html(t: &Tile) -> String {
         <div class="e">{endpoint}</div>
       </a>
 "#,
-        href = t.href,
+        // Relative, not root-absolute: behind an edge that mounts the service
+        // under a prefix (lum.id serves it at /data/ and /llm/, root-stripped,
+        // and 301s the bare prefix to the slash form) a "/x" link escapes the
+        // mount while "x" resolves under it — and still resolves at "/" when
+        // the service is reached directly. Absolute URLs pass through.
+        href = if t.href.starts_with("http") {
+            t.href.to_string()
+        } else {
+            t.href.trim_start_matches('/').to_string()
+        },
         title = t.title,
         desc = t.desc,
         endpoint = t.endpoint
@@ -70,7 +79,11 @@ pub async fn landing(State(st): State<AppState>) -> Html<String> {
         || !st.llm_pool.openrouter_url.is_empty();
 
     let name = crate::config::env_var("SERVICE_NAME").unwrap_or_else(|| {
-        if llm_live { "Lumid LLM".into() } else { "lumid-data-service".into() }
+        if llm_live {
+            "Lumid LLM".into()
+        } else {
+            "lumid-data-service".into()
+        }
     });
     let heading = crate::config::env_var("SERVICE_HEADING").unwrap_or_else(|| {
         if llm_live {
@@ -97,7 +110,7 @@ pub async fn landing(State(st): State<AppState>) -> Html<String> {
 
     let mut tiles: Vec<Tile> = Vec::new();
     tiles.push(Tile {
-        href: "/openapi.json",
+        href: "/openapi.json".into(),
         title: "OpenAPI",
         desc: "The full machine-readable spec for every route this binary serves.",
         endpoint: "GET /openapi.json".into(),
@@ -112,13 +125,13 @@ pub async fn landing(State(st): State<AppState>) -> Html<String> {
             esc(&st.settings.llm_default_model)
         };
         tiles.push(Tile {
-            href: "/v1/models",
+            href: "/v1/models".into(),
             title: "Models",
             desc: "Every model this gateway will actually route — local pool first,                    then the configured OpenRouter roster. Ids listed here are exactly                    the ids accepted in `model`.",
             endpoint: "GET /v1/models".into(),
         });
         tiles.push(Tile {
-            href: "/openapi.json",
+            href: "/openapi.json".into(),
             title: "Chat",
             desc: "OpenAI-shaped and Anthropic-shaped chat, streaming or buffered.                    SSE keepalives are relayed, so a long prefill never looks idle.",
             endpoint: format!(
@@ -126,33 +139,51 @@ pub async fn landing(State(st): State<AppState>) -> Html<String> {
             ),
         });
         tiles.push(Tile {
-            href: "/status",
+            href: "/status".into(),
             title: "Status",
             desc: "Live backend health — per-backend probe state, in-flight count                    and circuit-breaker position.",
             endpoint: "GET /status".into(),
         });
     } else {
         tiles.push(Tile {
-            href: "/catalog/schemas",
+            href: "/catalog/schemas".into(),
             title: "Catalog",
             desc: "Browse schemas, tables, and per-table profiles. Trace row lineage.",
             endpoint: "GET /catalog/schemas • /catalog/lineage/*".into(),
         });
         tiles.push(Tile {
-            href: "/status",
+            href: "/status".into(),
             title: "Status",
             desc: "Live health board — realtime feeds + per-endpoint freshness.",
             endpoint: "GET /status • /freshness".into(),
         });
     }
     tiles.push(Tile {
-        href: "/usage",
+        href: "/usage".into(),
         title: "Usage",
         desc: "The global request dashboard.",
         endpoint: "GET /usage • /usage/me".into(),
     });
 
+    // An optional browsing UI for this service (operator-set; the platform
+    // names no domain itself). http/https only.
+    if let Some(v) = std::env::var("LUMID_VIEWER_URL")
+        .ok()
+        .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+    {
+        tiles.push(Tile {
+            endpoint: esc(&v),
+            href: esc(&v),
+            title: "Viewer",
+            desc: "Browse schemas and tables, sample rows, and manage data jobs in a UI.",
+        });
+    }
     let tiles_html: String = tiles.iter().map(tile_html).collect();
+    let jobs_html = if st.settings.jobs_enabled {
+        JOBS_SECTION
+    } else {
+        ""
+    };
 
     // Raw strings: this block is shell + JSON + HTML entities, and every one of
     // those wants a backslash or a brace of its own.
@@ -175,7 +206,10 @@ curl -H "Authorization: Bearer &lt;token&gt;" https://&lt;host&gt;/catalog/schem
     };
 
     let footer = if llm_live {
-        format!("{} · model-routed inference over a pooled GPU fleet", esc(&name))
+        format!(
+            "{} · model-routed inference over a pooled GPU fleet",
+            esc(&name)
+        )
     } else {
         format!("{} · the portable data platform", esc(&name))
     };
@@ -196,6 +230,7 @@ curl -H "Authorization: Bearer &lt;token&gt;" https://&lt;host&gt;/catalog/schem
             .replace("{{TAGLINE}}", &tagline)
             .replace("{{TILES}}", &tiles_html)
             .replace("{{EXAMPLE}}", &example)
+            .replace("{{JOBS}}", jobs_html)
             .replace("{{FOOTER}}", &footer),
     )
 }
@@ -257,15 +292,68 @@ const LANDING_SHELL: &str = r##"<!DOCTYPE html>
 
 <pre class="code">{{EXAMPLE}}</pre>
   </section>
+{{JOBS}}
 
   <footer>{{FOOTER}}</footer>
 </div>
 </body>
 </html>"##;
 
+/// Shown only when this process serves the jobs entrance (`/jobs/v1/*`).
+const JOBS_SECTION: &str = r##"
+  <section>
+    <h2>Jobs</h2>
+    <p>
+      Run work on FlowMesh, Lumilake or a sandbox <em>where the data is</em>. A job declares
+      the sources it reads (<code>findata://</code>, <code>lumid-data://</code>,
+      <code>src://</code>, <code>data://&lt;hub&gt;/…</code>, <code>hf://</code>); this service
+      checks you may read each one, plans the site and the network route for every source,
+      and dispatches as you. The job gets a token scoped to exactly its declared sources, and
+      withdrawing a share cuts a running job off within seconds.
+    </p>
+    <div class="tiles">
+      <a class="tile" href="openapi.json">
+        <div class="t">Sources</div>
+        <div class="d">Register data you own, share it read or write, see what is shared with you.</div>
+        <div class="e">/jobs/v1/sources • /jobs/v1/sources/{id}/grants</div>
+      </a>
+      <a class="tile" href="openapi.json">
+        <div class="t">Plan</div>
+        <div class="d">Dry run: where a job would run and how each source is reached, with reasons.</div>
+        <div class="e">POST /jobs/v1/plan</div>
+      </a>
+      <a class="tile" href="openapi.json">
+        <div class="t">Jobs</div>
+        <div class="d">Submit (idempotent), follow status and events, cancel.</div>
+        <div class="e">/jobs/v1/jobs • /jobs/v1/jobs/{id}/events</div>
+      </a>
+      <a class="tile" href="openapi.json">
+        <div class="t">Agents</div>
+        <div class="d">The same verbs as MCP tools: jobs_sources, jobs_plan, jobs_submit, jobs_status.</div>
+        <div class="e">POST /mcp</div>
+      </a>
+    </div>
+  </section>
+"##;
+
 #[cfg(test)]
 mod landing_template_tests {
-    use super::LANDING_SHELL;
+    use super::{tile_html, Tile, JOBS_SECTION, LANDING_SHELL};
+
+    #[test]
+    fn tile_links_are_relative_unless_absolute() {
+        let t = |h: &str| {
+            tile_html(&Tile {
+                href: h.into(),
+                title: "t",
+                desc: "d",
+                endpoint: "e".into(),
+            })
+        };
+        assert!(t("/openapi.json").contains(r#"href="openapi.json""#));
+        assert!(t("https://lum.id/studio").contains(r#"href="https://lum.id/studio""#));
+        assert!(!JOBS_SECTION.contains("href=\"/"));
+    }
 
     /// Every `{{PLACEHOLDER}}` in the shell must be one `landing()` actually
     /// substitutes. A forgotten one does not fail to compile -- it ships a
@@ -279,6 +367,7 @@ mod landing_template_tests {
             "{{TAGLINE}}",
             "{{TILES}}",
             "{{EXAMPLE}}",
+            "{{JOBS}}",
             "{{FOOTER}}",
         ];
         let mut rest = LANDING_SHELL.to_string();
@@ -292,7 +381,12 @@ mod landing_template_tests {
         assert!(
             !rest.contains("{{"),
             "shell has a placeholder landing() never substitutes: {}",
-            rest.split("{{").nth(1).unwrap_or("").split("}}").next().unwrap_or("")
+            rest.split("{{")
+                .nth(1)
+                .unwrap_or("")
+                .split("}}")
+                .next()
+                .unwrap_or("")
         );
     }
 }
