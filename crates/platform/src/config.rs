@@ -234,6 +234,10 @@ pub struct Settings {
     /// `LUMID_BRIDGE_SECRET` — lum.id's `X-Bridge-Secret`, used to mint a
     /// short-lived token for a job's owner when dispatching to its runtime.
     pub bridge_secret: String,
+    /// `LUMID_BRIDGE_URL` — where lum.id's internal mint endpoint is reached
+    /// (it is not exposed on the public edge). Defaults to `lumid_url`. On a
+    /// hub outside the cloud cluster this is a private route to identity.
+    pub bridge_url: String,
     /// `LUMID_JOBS_SITES_JSON` — candidate compute sites for the planner
     /// (`[{site, runtimes, ext_egress?, cached_models?}]`).
     pub jobs_sites_json: String,
@@ -395,6 +399,9 @@ impl Settings {
             jobs_sites_json: env_str("JOBS_SITES_JSON", ""),
             jobs_runtimes_json: env_str("JOBS_RUNTIMES_JSON", ""),
             bridge_secret: env_str("BRIDGE_SECRET", ""),
+            bridge_url: env_var("BRIDGE_URL")
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| env_str("AUTH_URL", "https://lum.id")),
             jobs_instance: env_var("JOBS_INSTANCE")
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| {
