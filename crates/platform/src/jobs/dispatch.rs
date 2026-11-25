@@ -71,10 +71,19 @@ pub const JOB_BIND_SCOPE: &str = "lumid-job:bind";
 /// submit/read scopes plus the bind scope. Nothing broader.
 pub fn owner_scopes(runtime: &str) -> Vec<&'static str> {
     let mut v: Vec<&'static str> = match runtime {
+        // Lumilake runs its work on FlowMesh AS the submitter (it forwards this
+        // token), so the token needs FlowMesh's workflow scopes too — the same
+        // set identity's per-user compute token carries (compute_token.go).
+        // Without them every hub-dispatched Lumilake job failed at FlowMesh with
+        // 403 "requires 'flowmesh:workflows:write'" (2026-11-25).
         "lumilake" => vec![
             "lumilake:jobs:write",
             "lumilake:jobs:read",
             "lumilake:jobs:cancel",
+            "flowmesh:workflows:write",
+            "flowmesh:workflows:read",
+            "flowmesh:tasks:read",
+            "flowmesh:results:read",
         ],
         "flowmesh" => vec![
             "flowmesh:workflows:write",
