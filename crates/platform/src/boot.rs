@@ -140,6 +140,11 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     // separate Postgres instance (findata: warehouse in the main pool, LQT
     // mailbox + xpio.* in the LQT data DB). None ⇒ handlers use the main pool.
     let xpio_pool = db::build_xpio_pool(&settings)?;
+    // Who read/wrote which table, from which app/workflow/run. Never fatal: a
+    // warehouse that can't create its activity table still serves every read.
+    if let Err(e) = crate::activity::migrate(&pool, &settings.retrieval_db_role).await {
+        tracing::warn!("activity: table not created ({e}); activity will not be recorded");
+    }
     if xpio_pool.is_some() {
         tracing::info!("xpio: dedicated secondary DB pool active (LUMID_XPIO_DB_HOST set)");
     }

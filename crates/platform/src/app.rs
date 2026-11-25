@@ -42,6 +42,14 @@ pub fn build_router(
         // the generic `ws::{quotes,news}` transport handlers but names no path.
 
     let gated = Router::new()
+        // Table activity: what a run read/wrote, what an app reads/writes, who
+        // writes/reads a table (see `activity`).
+        .route("/activity/runs/:run_id", get(crate::activity::run_activity))
+        .route("/activity/apps/:app", get(crate::activity::app_activity))
+        .route(
+            "/catalog/tables/:schema/:table/activity",
+            get(crate::activity::table_activity),
+        )
         // Catalog read plane (provenance-exposing) — port of api/routes/catalog.py.
         .route("/catalog/schemas", get(handlers::catalog::get_schemas))
         .route("/catalog/schemas/:schema/tables", get(handlers::catalog::get_schema_tables))
@@ -132,6 +140,8 @@ pub fn build_router(
         // `X-Lumid-Origin-*` attribution headers. Pure passthrough when not
         // shadowing — non-shadow instances are byte-identical to today.
         .layer(from_fn_with_state(state.clone(), crate::federation::shadow_forward))
+        // Table activity for ingest writes and retrieve reads (after the gate).
+        .layer(from_fn_with_state(state.clone(), crate::activity::record))
         .layer(from_fn_with_state(state.clone(), crate::auth::gate));
 
     public

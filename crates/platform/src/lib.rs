@@ -6,6 +6,7 @@
 //! the read-config TOML (declarative reads) + the bespoke handlers/upstreams that
 //! register into it (the `my_ext` boundary, established incrementally).
 
+pub mod activity;
 pub mod agent;
 pub mod app;
 pub mod auth;
@@ -27,6 +28,7 @@ pub mod queries;
 pub mod read;
 pub mod realtime;
 pub mod retrieve;
+pub mod sql_relations;
 pub mod state;
 pub mod sync;
 pub mod validation;
