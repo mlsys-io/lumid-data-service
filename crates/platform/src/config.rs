@@ -68,6 +68,16 @@ fn parse_peers(raw: &str, read_env: &dyn Fn(&str) -> Option<String>) -> Vec<Peer
         .collect()
 }
 
+/// `30` / `30s` / `2m` → seconds (min 1). Unparseable → `default`.
+pub fn parse_interval_s(raw: &str, default: u64) -> u64 {
+    let raw = raw.trim();
+    let secs = raw
+        .parse::<u64>()
+        .ok()
+        .or_else(|| humantime::parse_duration(raw).ok().map(|d| d.as_secs()));
+    secs.unwrap_or(default).max(1)
+}
+
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub db_host: String,
@@ -346,6 +356,40 @@ pub struct Settings {
     /// Base backoff (ms) for push retries; doubles per attempt. Default 500.
     pub sync_backoff_ms: u64,
 
+    // Hub-to-hub registry sync (`crate::sync::hub`). Mounted only with
+    // `enable_sync` AND `jobs_enabled`; the scheduler runs only on a hub that
+    // lists peers (the entrance hub drives both directions).
+    /// `LUMID_HUB_SYNC_PEERS` — JSON array of the hubs THIS hub drives:
+    /// `[{"hub_id":"nus","base_url":"http://...:5101","key_env":"LUMID_SYNC_KEY_NUS"}]`.
+    /// `key_env` names the env var holding the bearer (a local key on the
+    /// peer labelled `sync:<this hub id>`); default `LUMID_SYNC_KEY_<HUB_ID>`.
+    /// Empty (default) ⇒ no scheduler: this hub only answers its peers.
+    pub hub_sync_peers_json: String,
+    /// `LUMID_SYNC_INTERVAL` — scheduler period (`30`, `30s`, `2m`). Default 30 s.
+    pub hub_sync_interval_s: u64,
+    /// `LUMID_HUB_SYNC_OVERLAP_SECS` — each cycle re-reads this far behind its
+    /// cursor, so a row whose transaction committed after the cursor passed its
+    /// `updated_at` is still delivered (the apply rule makes the re-read a
+    /// no-op). Default 120.
+    pub hub_sync_overlap_s: u64,
+    /// `LUMID_HUB_SMALL_MAX` — largest tenant blob that copies between hubs
+    /// (bytes). Default 64 MiB; 0 disables blob copy.
+    pub hub_small_max: u64,
+    /// `LUMID_HUB_PEER_IDS` — hub ids whose `sync:<id>` key may call this
+    /// hub's `/sync/inbox` + `/sync/outbox` (comma list). Empty ⇒ any
+    /// `sync:*` local key (the ids in `LUMID_HUB_SYNC_PEERS` are always added).
+    /// These ids are refused on the data-plane `/sync/apply`: a hub peer key
+    /// carries registry metadata only.
+    pub hub_peer_ids: Vec<String>,
+    /// `LUMID_HUB_SYNC_CONFINE` — when the jobs plane is on, confine every
+    /// `sync:*` local key to the `/sync/*` routes (it otherwise carries the
+    /// full `local` role). Default true; `0` turns the confinement off.
+    pub hub_sync_confine: bool,
+    /// `LUMID_HUB_CATALOG_REFRESH_SECS` — how often this hub republishes its
+    /// own tables into `jobs.catalog_mirror` (catalog estimates only, no
+    /// scans). Default 600; 0 disables.
+    pub hub_catalog_refresh_s: u64,
+
     // ── Federation / mesh core (F1) ──────────────────────────────────────────
     // The peer-forward plane. When no peers + no `*_federate` are set, behavior
     // is IDENTICAL to a pure-local instance (every knob defaults to off).
@@ -517,6 +561,20 @@ impl Settings {
             sync_batch_rows: env_u64("SYNC_BATCH_ROWS", 1000),
             sync_max_attempts: env_u32("SYNC_MAX_ATTEMPTS", 5),
             sync_backoff_ms: env_u64("SYNC_BACKOFF_MS", 500),
+            hub_sync_peers_json: env_str("HUB_SYNC_PEERS", ""),
+            hub_sync_interval_s: parse_interval_s(&env_str("SYNC_INTERVAL", "30"), 30),
+            hub_sync_overlap_s: env_u64("HUB_SYNC_OVERLAP_SECS", 120),
+            hub_small_max: env_u64("HUB_SMALL_MAX", 64 * 1024 * 1024),
+            hub_peer_ids: env_str("HUB_PEER_IDS", "")
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            hub_sync_confine: !matches!(
+                env_str("HUB_SYNC_CONFINE", "true").to_lowercase().as_str(),
+                "0" | "false" | "no"
+            ),
+            hub_catalog_refresh_s: env_u64("HUB_CATALOG_REFRESH_SECS", 600),
             instance_id: env_str("INSTANCE_ID", "local"),
             app_id: env_str("APP_ID", "findata"),
             peers: parse_peers(&env_str("PEERS", ""), &|name| env_var(name)),
@@ -585,6 +643,15 @@ mod tests {
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].id, "good");
         assert_eq!(peers[0].base_url, "http://g:1");
+    }
+
+    #[test]
+    fn interval_accepts_bare_seconds_and_humantime() {
+        assert_eq!(parse_interval_s("30", 7), 30);
+        assert_eq!(parse_interval_s("45s", 7), 45);
+        assert_eq!(parse_interval_s("2m", 7), 120);
+        assert_eq!(parse_interval_s("soon", 7), 7);
+        assert_eq!(parse_interval_s("0", 7), 1);
     }
 
     #[test]

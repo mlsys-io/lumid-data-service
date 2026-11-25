@@ -34,6 +34,17 @@ pub async fn post_sync_apply(
 ) -> ApiResult<Json<SyncAck>> {
     let peer = require_sync_peer(&st.settings, &identity)?;
 
+    // A hub peer key carries registry metadata only (`/sync/inbox`); it never
+    // writes user tables through the data-push plane.
+    if super::hub::hub_peer_ids(&st.settings)
+        .iter()
+        .any(|h| *h == peer)
+    {
+        return Err(ApiError::Forbidden(format!(
+            "`sync:{peer}` is a hub peer key; hub peers sync via /sync/inbox only"
+        )));
+    }
+
     // Target denylist: a peer must not write to the sync/provenance/system
     // schemas (replaces the `gate_target` ACL the normal /ingest path applies).
     if super::is_denied_schema(&schema) {

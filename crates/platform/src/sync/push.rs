@@ -377,7 +377,7 @@ async fn build_preamble(client: &Client, run_id: &Uuid) -> ApiResult<super::Prea
 /// it) while any change to the group's contents yields a different id. Hashing
 /// the full content — not just first/last+len — prevents a distinct group from
 /// colliding with an already-applied batch_id and being silently dropped.
-fn deterministic_batch_id(
+pub(crate) fn deterministic_batch_id(
     peer: &str,
     schema: &str,
     table: &str,
