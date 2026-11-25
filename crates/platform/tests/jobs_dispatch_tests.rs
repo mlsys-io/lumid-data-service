@@ -255,7 +255,11 @@ async fn boot() -> Option<(AppState, String, Shared)> {
         )
         .await
         .unwrap();
-    lumid_platform::platform_tables::migrate(&st.pool)
+    st.pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute("CREATE SCHEMA IF NOT EXISTS provenance; CREATE SCHEMA IF NOT EXISTS raw;")
         .await
         .unwrap();
     lumid_platform::handlers::me_blobs::migrate(&st.pool)
