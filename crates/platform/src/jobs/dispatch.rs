@@ -75,7 +75,7 @@ async fn mint_for_owner(st: &AppState, sub: &str, audience: &str) -> Result<Stri
         .http
         .post(format!(
             "{}/api/v1/internal/mint-user-token",
-            st.settings.lumid_url.trim_end_matches('/')
+            st.settings.bridge_url.trim_end_matches('/')
         ))
         .header("X-Bridge-Secret", secret)
         .json(&json!({"sub": sub, "audience": audience, "scopes": [], "ttl_seconds": 900}))
@@ -170,6 +170,8 @@ pub async fn dispatch(st: &AppState, job_id: Uuid) {
     let outcome = dispatch_inner(st, job_id).await;
     if let Err(msg) = outcome {
         tracing::warn!(%job_id, "jobs: dispatch failed: {msg}");
+        // Reason first, then status: a reader never sees `failed` without why.
+        let _ = set_error(st, job_id, &msg).await;
         let _ = service::transition(
             st,
             job_id,
@@ -178,7 +180,6 @@ pub async fn dispatch(st: &AppState, job_id: Uuid) {
             json!({"by": "hub", "message": format!("dispatch failed: {msg}")}),
         )
         .await;
-        let _ = set_error(st, job_id, &msg).await;
     }
 }
 
