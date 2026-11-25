@@ -166,13 +166,55 @@ async fn runtime_supports_jobs(st: &AppState, base: &str, token: &str) -> Result
         .text()
         .await
         .map_err(|e| format!("{base} schema: {e}"))?;
-    let ok = body.contains("LumidJobBinding");
+    let ok = schema_supports_jobs(&body);
     CAPABILITY
         .lock()
         .unwrap()
         .get_or_insert_with(HashMap::new)
         .insert(base.to_string(), (ok, Instant::now()));
     Ok(ok)
+}
+
+/// Whether a Lumilake OpenAPI document shows `lumid_job` support: the
+/// `LumidJobBinding` schema, or a Lumilake release that shipped it (>= 0.1.11).
+/// The version matters because Lumilake's submit route publishes a hand-written
+/// request schema that omits the field, so 0.1.11 accepts `lumid_job` while its
+/// schema never mentions it (found when switching job tokens on, 2026-11-25).
+fn schema_supports_jobs(body: &str) -> bool {
+    if body.contains("LumidJobBinding") {
+        return true;
+    }
+    let version = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v["info"]["version"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let nums: Vec<u64> = version
+        .trim_start_matches('v')
+        .split(|c: char| c == '.' || c == '-' || c == '+')
+        .take(3)
+        .map(|p| p.parse().unwrap_or(0))
+        .collect();
+    let (a, b, c) = (
+        *nums.first().unwrap_or(&0),
+        *nums.get(1).unwrap_or(&0),
+        *nums.get(2).unwrap_or(&0),
+    );
+    (a, b, c) >= (0, 1, 11)
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::schema_supports_jobs;
+
+    #[test]
+    fn binding_schema_or_a_release_that_shipped_it() {
+        assert!(schema_supports_jobs(r#"{"components":{"schemas":{"LumidJobBinding":{}}}}"#));
+        assert!(schema_supports_jobs(r#"{"info":{"version":"0.1.11"}}"#));
+        assert!(schema_supports_jobs(r#"{"info":{"version":"v0.2.0"}}"#));
+        assert!(!schema_supports_jobs(r#"{"info":{"version":"0.1.10"}}"#));
+        assert!(!schema_supports_jobs(r#"{"info":{}}"#));
+        assert!(!schema_supports_jobs("not json"));
+    }
 }
 
 /// The data URL the plan chose for this job's data (first data-plane source
