@@ -62,8 +62,36 @@ struct MintResp {
     data: MintData,
 }
 
+/// Scope that lets a principal bind a submission to a lum.id/data job. No
+/// user can mint it on a PAT (identity does not grant it), so a runtime that
+/// requires it knows the binding came from a hub.
+pub const JOB_BIND_SCOPE: &str = "lumid-job:bind";
+
+/// Scopes on the owner token the hub dispatches with: the runtime's own
+/// submit/read scopes plus the bind scope. Nothing broader.
+pub fn owner_scopes(runtime: &str) -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = match runtime {
+        "lumilake" => vec![
+            "lumilake:jobs:write",
+            "lumilake:jobs:read",
+            "lumilake:jobs:cancel",
+        ],
+        "flowmesh" => vec![
+            "flowmesh:workflows:write",
+            "flowmesh:workflows:read",
+            "flowmesh:tasks:read",
+            "flowmesh:results:read",
+        ],
+        _ => vec![],
+    };
+    v.push(JOB_BIND_SCOPE);
+    v
+}
+
 /// A short-lived lum.id token for `sub`, so the runtime sees the real user.
-async fn mint_for_owner(st: &AppState, sub: &str, audience: &str) -> Result<String, String> {
+/// Its audience is the runtime, and its scopes are `owner_scopes(runtime)`.
+async fn mint_for_owner(st: &AppState, sub: &str, runtime: &str) -> Result<String, String> {
+    let audience = runtime;
     if sub.starts_with("local:") {
         return Err("jobs owned by a service key cannot be dispatched as a user".into());
     }
@@ -78,7 +106,7 @@ async fn mint_for_owner(st: &AppState, sub: &str, audience: &str) -> Result<Stri
             st.settings.bridge_url.trim_end_matches('/')
         ))
         .header("X-Bridge-Secret", secret)
-        .json(&json!({"sub": sub, "audience": audience, "scopes": [], "ttl_seconds": 900}))
+        .json(&json!({"sub": sub, "audience": audience, "scopes": owner_scopes(runtime), "ttl_seconds": 900}))
         .timeout(Duration::from_secs(15))
         .send()
         .await
@@ -99,11 +127,11 @@ async fn mint_for_owner(st: &AppState, sub: &str, audience: &str) -> Result<Stri
 /// are reused for 10 min, negative for 1 min (so a release is picked up fast).
 static CAPABILITY: Mutex<Option<HashMap<String, (bool, Instant)>>> = Mutex::new(None);
 
-/// Does the Lumilake at `base` understand `lumid_job`? Answered from its
-/// published OpenAPI schema. Without it, Lumilake's request model silently
-/// IGNORES the binding and the job would read with its server-wide token —
-/// unscoped, while the hub believed otherwise — so the hub refuses instead.
-async fn lumilake_supports_jobs(st: &AppState, base: &str, token: &str) -> Result<bool, String> {
+/// Does the runtime at `base` understand `lumid_job`? Answered from its
+/// published OpenAPI schema. Without it, a runtime's request model may
+/// silently IGNORE the binding and the job would read with a server-wide
+/// token — unscoped, while the hub believed otherwise — so the hub refuses.
+async fn runtime_supports_jobs(st: &AppState, base: &str, token: &str) -> Result<bool, String> {
     if let Some((ok, at)) = CAPABILITY
         .lock()
         .unwrap()
@@ -127,17 +155,17 @@ async fn lumilake_supports_jobs(st: &AppState, base: &str, token: &str) -> Resul
         .timeout(Duration::from_secs(20))
         .send()
         .await
-        .map_err(|e| format!("lumilake unreachable (schema check): {e}"))?;
+        .map_err(|e| format!("{base} unreachable (schema check): {e}"))?;
     if !resp.status().is_success() {
         return Err(format!(
-            "lumilake schema check failed (HTTP {})",
+            "{base} schema check failed (HTTP {})",
             resp.status()
         ));
     }
     let body = resp
         .text()
         .await
-        .map_err(|e| format!("lumilake schema: {e}"))?;
+        .map_err(|e| format!("{base} schema: {e}"))?;
     let ok = body.contains("LumidJobBinding");
     CAPABILITY
         .lock()
@@ -161,7 +189,97 @@ fn planned_data_url(job: &Value) -> Option<String> {
 /// its runtime key: token + events) — the hub never fails a job just because
 /// it has no dispatcher for it.
 pub fn dispatches(st: &AppState, runtime: &str, site: &str) -> bool {
-    runtime == "lumilake" && base_url(st, runtime, site).is_ok()
+    matches!(runtime, "lumilake" | "flowmesh" | "sandbox") && base_url(st, runtime, site).is_ok()
+}
+
+/// The binding FlowMesh and the sandbox accept: the job, its planned data
+/// URL, its site, and each source's planned route. Never a token.
+fn full_binding(job_id: Uuid, job: &Value, site: &str) -> Result<Value, String> {
+    let sources: Vec<Value> = job["sources"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|s| {
+                    json!({
+                        "ref": s["ref"],
+                        "url": s["url"],
+                        "route_kind": s["via"],
+                        "local": s["via"] == "local" || s["site"].as_str() == Some(site),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let data_url = planned_data_url(job)
+        .ok_or("no planned data URL for this job (it declares no data-plane source)")?;
+    Ok(
+        json!({"job_id": job_id.to_string(), "data_url": data_url, "site": site, "sources": sources}),
+    )
+}
+
+/// Submit to a runtime that reports its own status back to the hub (FlowMesh,
+/// the sandbox): check it understands `lumid_job`, post as the owner, record
+/// the runtime ref it returns.
+async fn submit_as_owner(
+    st: &AppState,
+    job_id: Uuid,
+    runtime: &str,
+    site: &str,
+    owner: &str,
+    path: &str,
+    body: &Value,
+    ref_of: fn(&Value) -> Option<String>,
+) -> Result<(), String> {
+    let base = base_url(st, runtime, site)?;
+    let token = mint_for_owner(st, owner, runtime).await?;
+    if !runtime_supports_jobs(st, &base, &token).await? {
+        return Err(format!(
+            "the {runtime} at {base} does not support job-scoped data (no LumidJobBinding in \
+             its OpenAPI); refusing to dispatch rather than let it read unscoped"
+        ));
+    }
+    let resp = st
+        .http
+        .post(format!("{base}{path}"))
+        .bearer_auth(token)
+        .json(body)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| format!("{runtime} unreachable: {e}"))?;
+    let status = resp.status();
+    let out: Value = resp.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        let detail = out.get("detail").cloned().unwrap_or(out);
+        return Err(format!(
+            "{runtime} refused the job (HTTP {status}): {detail}"
+        ));
+    }
+    let rref = ref_of(&out).ok_or_else(|| format!("{runtime} returned no job reference"))?;
+    service::transition(
+        st,
+        job_id,
+        "submitted",
+        Some(&rref),
+        json!({"by": "hub", "runtime": runtime, "site": site, "runtime_ref": rref}),
+    )
+    .await
+    .map_err(|e| e.message)?;
+    Ok(())
+}
+
+fn flowmesh_ref(v: &Value) -> Option<String> {
+    v["workflow_id"]
+        .as_str()
+        .or_else(|| v["data"]["workflow_id"].as_str())
+        .map(str::to_string)
+}
+
+fn sandbox_ref(v: &Value) -> Option<String> {
+    v["runtime_ref"]
+        .as_str()
+        .or_else(|| v["data"]["runtime_ref"].as_str())
+        .map(str::to_string)
 }
 
 /// Dispatch one planned job. Idempotent per state: only a `planned` job with
@@ -217,12 +335,11 @@ async fn dispatch_inner(st: &AppState, job_id: Uuid) -> Result<(), String> {
                 .remove("workflow_format")
                 .and_then(|v| v.as_str().map(str::to_string))
                 .unwrap_or_else(|| "native".into());
-            obj.insert(
-                "lumid_job".into(),
-                json!({"job_id": job_id.to_string(), "data_url": planned_data_url(&job)}),
-            );
+            // Lumilake's binding is exactly {job_id} (extra fields are refused);
+            // it reads through its own LUMID_DATA_WORKER_URL.
+            obj.insert("lumid_job".into(), json!({"job_id": job_id.to_string()}));
             let token = mint_for_owner(st, owner, "lumilake").await?;
-            if !lumilake_supports_jobs(st, &base, &token).await? {
+            if !runtime_supports_jobs(st, &base, &token).await? {
                 return Err(format!(
                     "the Lumilake at {base} does not support job-scoped data (needs \
                      mlsys-io/Lumilake#187); refusing to dispatch rather than let it \
@@ -261,6 +378,47 @@ async fn dispatch_inner(st: &AppState, job_id: Uuid) -> Result<(), String> {
             .await
             .map_err(|e| e.message)?;
             Ok(())
+        }
+        "flowmesh" => {
+            // FlowMesh's native body: {"yaml": "<workflow>"} (+ lumid_job).
+            let mut body = job["spec"]["payload"].clone();
+            let obj = body
+                .as_object_mut()
+                .ok_or("payload must be a FlowMesh submit object")?;
+            if !obj.get("yaml").is_some_and(Value::is_string) {
+                return Err("payload.yaml must be the FlowMesh workflow (YAML text)".into());
+            }
+            obj.insert("lumid_job".into(), full_binding(job_id, &job, site)?);
+            submit_as_owner(
+                st,
+                job_id,
+                "flowmesh",
+                site,
+                owner,
+                "/api/v1/workflows",
+                &body,
+                flowmesh_ref,
+            )
+            .await
+        }
+        "sandbox" => {
+            // sandbox-control's SandboxSpec (+ lumid_job).
+            let mut body = job["spec"]["payload"].clone();
+            let obj = body
+                .as_object_mut()
+                .ok_or("payload must be a sandbox spec object")?;
+            obj.insert("lumid_job".into(), full_binding(job_id, &job, site)?);
+            submit_as_owner(
+                st,
+                job_id,
+                "sandbox",
+                site,
+                owner,
+                "/api/sandboxes",
+                &body,
+                sandbox_ref,
+            )
+            .await
         }
         other => Err(format!("dispatch to {other} is not wired yet")),
     }
@@ -358,10 +516,10 @@ pub async fn reconcile_once(st: &AppState) -> anyhow::Result<usize> {
 }
 
 /// Best-effort cancel at the runtime (the hub has already cancelled locally).
+/// The sandbox needs no call: sandbox-control follows the hub and deletes the
+/// sandbox once its job has ended.
 pub async fn cancel_at_runtime(st: &AppState, job: &Value) {
-    if job["runtime"] != "lumilake" {
-        return;
-    }
+    let runtime = job["runtime"].as_str().unwrap_or("");
     let (Some(site), Some(rref), Some(owner)) = (
         job["site"].as_str(),
         job["runtime_ref"].as_str(),
@@ -369,15 +527,20 @@ pub async fn cancel_at_runtime(st: &AppState, job: &Value) {
     ) else {
         return;
     };
+    let path = match runtime {
+        "lumilake" => format!("/api/v1/jobs/{rref}/cancel"),
+        "flowmesh" => format!("/api/v1/workflows/{rref}/cancel"),
+        _ => return,
+    };
     let (Ok(base), Ok(token)) = (
-        base_url(st, "lumilake", site),
-        mint_for_owner(st, owner, "lumilake").await,
+        base_url(st, runtime, site),
+        mint_for_owner(st, owner, runtime).await,
     ) else {
         return;
     };
     let _ = st
         .http
-        .post(format!("{base}/api/v1/jobs/{rref}/cancel"))
+        .post(format!("{base}{path}"))
         .bearer_auth(token)
         .timeout(Duration::from_secs(20))
         .send()
