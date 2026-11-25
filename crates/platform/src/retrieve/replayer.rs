@@ -9,6 +9,7 @@ use std::time::Instant;
 use deadpool_postgres::Pool;
 use object_store::path::Path as ObjPath;
 
+use crate::auth::Identity;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 
@@ -20,14 +21,23 @@ use super::plan::{AccessChainStep, RetrievalOp, RetrievalPlan, RetrievalResult};
 /// - SQL ops are validated as read-only SELECTs before execution.
 /// - Row cap is enforced; the call returns `ApiError::BadRequest` if exceeded.
 /// - Output is materialized to object storage under `<prefix>/<run_id>.<fmt>`.
+/// - `caller` owns the run: it is recorded before anything is materialized,
+///   and a `storage_get` op may only read objects the caller could read via
+///   `GET /blobs/<key>` (tenant blobs and other runs' outputs are private).
+///   `None` (no authenticated caller) records no owner, so only privileged
+///   roles can read the output.
 pub async fn replay(
     plan: &RetrievalPlan,
     st: &AppState,
     output_format: &OutputFormat,
     run_id: &str,
+    caller: Option<&Identity>,
 ) -> ApiResult<RetrievalResult> {
     if plan.plan.is_empty() {
         return Err(ApiError::BadRequest("plan has no ops to execute".into()));
+    }
+    if let Some(id) = caller {
+        crate::handlers::retrieve::record_owner(&st.pool, run_id, &id.sub).await?;
     }
 
     let stmt_timeout_ms = st.settings.retrieval_stmt_timeout_ms;
@@ -80,6 +90,21 @@ pub async fn replay(
                 let op_start = Instant::now();
                 // Validate and resolve the key.
                 let resolved_key = crate::handlers::blobs::sanitize_blob_key(&sg_op.key)?;
+                // Same privacy rules as `GET /blobs/<key>`. 404, not 403, so a
+                // plan cannot probe whether someone else's object exists.
+                if !crate::handlers::retrieve::may_read_key(
+                    &st.pool,
+                    caller,
+                    &resolved_key,
+                    &st.settings.retrieval_prefix,
+                )
+                .await?
+                {
+                    return Err(ApiError::NotFound(format!(
+                        "blob '{}' not found",
+                        sg_op.key
+                    )));
+                }
                 let path = ObjPath::from(resolved_key.as_str());
                 let result = st
                     .blob_store

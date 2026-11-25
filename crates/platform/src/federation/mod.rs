@@ -227,8 +227,7 @@ const LOCAL_ONLY_PREFIX: &[&str] = &[
     "/health/", // /health/db, /health/ready
     "/v1/",     // LLM reverse proxy (its own federation switch)
     // Tenant-private blobs (handlers::me_blobs): the bytes live where they
-    // were uploaded, and the forward cache is keyed by path — not caller — so
-    // forwarding a per-caller read could serve one tenant's answer to another.
+    // were uploaded, so the peer has nothing to answer with.
     "/me/blobs",
     "/blobs/tenants/",
 ];
@@ -274,7 +273,7 @@ struct CachedForward {
 }
 
 /// Byte-weighted, per-entry-TTL moka cache of forwarded `GET` 200 responses,
-/// keyed by `METHOD path?query`. Mirrors the `read/cache.rs` L1 style (weigher +
+/// keyed by `caller METHOD path?query`. Mirrors the `read/cache.rs` L1 style (weigher +
 /// `time_to_live`) but single-tier (no Redis/invalidation — the shadow's whole
 /// dataset is remote and short-TTL is the freshness contract).
 pub struct ShadowCache {
@@ -296,10 +295,15 @@ impl ShadowCache {
         Arc::new(Self { l1, ttl })
     }
 
-    fn key(method: &Method, path: &str, query: Option<&str>) -> String {
+    /// `caller` is the gated caller's `sub` ("" when anonymous). Keying on it
+    /// means a cached answer is only ever replayed to the caller it was
+    /// fetched for: forwarded reads can be per-caller (self-tenant read
+    /// specs, lineage filtered by submitter), and a path-only key would hand
+    /// one user's cached response to the next user asking the same path.
+    fn key(caller: &str, method: &Method, path: &str, query: Option<&str>) -> String {
         match query {
-            Some(q) if !q.is_empty() => format!("{method} {path}?{q}"),
-            _ => format!("{method} {path}"),
+            Some(q) if !q.is_empty() => format!("{caller} {method} {path}?{q}"),
+            _ => format!("{caller} {method} {path}"),
         }
     }
 
@@ -371,7 +375,7 @@ pub async fn shadow_forward(State(st): State<AppState>, req: Request, next: Next
 
     // Cache: serve a warm GET 200 without a peer round-trip. HEAD is never
     // cached (no body) but is still forwarded.
-    let cache_key = ShadowCache::key(&method, &path, query.as_deref());
+    let cache_key = ShadowCache::key(&origin.sub, &method, &path, query.as_deref());
     if method == Method::GET {
         if let Some(hit) = st.shadow_cache.get(&cache_key).await {
             return response_from_parts(hit.status, &hit.headers, hit.body.clone());
@@ -501,13 +505,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shadow_cache_key_includes_method_path_query() {
+    async fn shadow_cache_key_includes_caller_method_path_query() {
         assert_eq!(
-            ShadowCache::key(&Method::GET, "/x/y", Some("a=1")),
-            "GET /x/y?a=1"
+            ShadowCache::key("u-1", &Method::GET, "/x/y", Some("a=1")),
+            "u-1 GET /x/y?a=1"
         );
-        assert_eq!(ShadowCache::key(&Method::GET, "/x/y", None), "GET /x/y");
-        assert_eq!(ShadowCache::key(&Method::GET, "/x/y", Some("")), "GET /x/y");
-        assert_eq!(ShadowCache::key(&Method::HEAD, "/x", None), "HEAD /x");
+        assert_eq!(
+            ShadowCache::key("u-1", &Method::GET, "/x/y", None),
+            "u-1 GET /x/y"
+        );
+        assert_eq!(
+            ShadowCache::key("u-1", &Method::GET, "/x/y", Some("")),
+            "u-1 GET /x/y"
+        );
+        assert_eq!(ShadowCache::key("", &Method::HEAD, "/x", None), " HEAD /x");
+    }
+
+    #[tokio::test]
+    async fn shadow_cache_key_never_shared_across_callers() {
+        assert_ne!(
+            ShadowCache::key("u-1", &Method::GET, "/catalog/lineage/runs", None),
+            ShadowCache::key("u-2", &Method::GET, "/catalog/lineage/runs", None)
+        );
+        // Anonymous callers share a key with each other, never with a user.
+        assert_ne!(
+            ShadowCache::key("", &Method::GET, "/x", None),
+            ShadowCache::key("u-1", &Method::GET, "/x", None)
+        );
     }
 }

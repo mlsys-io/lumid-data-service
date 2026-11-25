@@ -15,9 +15,8 @@
 //!   the same rule. `GET /blobs` listing hides the `tenants/` prefix from
 //!   everyone else.
 //! * Never federated: `/me/blobs` and `/blobs/tenants/` are local-only in
-//!   shadow mode (`federation::is_local_only`). The shadow's forward cache is
-//!   keyed by path, not caller, so forwarding a `/me/*` read could serve one
-//!   tenant's response to another; and the bytes live where they were written.
+//!   shadow mode (`federation::is_local_only`) — the bytes live where they
+//!   were written, so the peer has nothing to answer with.
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
