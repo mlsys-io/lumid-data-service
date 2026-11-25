@@ -408,7 +408,8 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
     }
     if state.settings.jobs_enabled {
         ext_router = ext_router.merge(crate::jobs::api::routes());
-        tracing::info!("jobs API enabled (/jobs/v1/*)");
+        crate::jobs::dispatch::spawn_reconciler(state.clone());
+        tracing::info!("jobs API enabled (/jobs/v1/*), runtime reconciler running");
     }
     if parts.enable_agent {
         ext_router = ext_router.merge(crate::agent::routes());

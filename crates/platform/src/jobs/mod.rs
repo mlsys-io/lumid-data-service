@@ -15,12 +15,15 @@
 //!   inputs (`inputs`).
 //! * Phase 4: the service (`service`) behind both `/jobs/v1/*` (`api`) and
 //!   the MCP tools (`mcp_tools`) — one implementation, two surfaces.
+//! * Phase 5: dispatch to runtimes as the job's owner, and a status
+//!   reconciler (`dispatch`; Lumilake first).
 //!
 //! Everything is off unless `LUMID_JOBS_ENABLED` is set: no schema, no seed,
 //! and `ljt_` tokens are refused — deploying it changes nothing.
 
 pub mod access;
 pub mod api;
+pub mod dispatch;
 pub mod enforce;
 pub mod inputs;
 pub mod mcp_tools;
@@ -48,6 +51,7 @@ pub async fn boot(pool: &Pool, settings: &Settings) -> anyhow::Result<()> {
     // Validate the site table at boot too, so a typo fails loudly here rather
     // than at the first plan.
     inputs::parse_sites(&settings.jobs_sites_json).map_err(anyhow::Error::msg)?;
+    dispatch::parse_runtimes(&settings.jobs_runtimes_json).map_err(anyhow::Error::msg)?;
     schema::migrate(pool, &settings.retrieval_db_role).await?;
     let rep = seed::apply(pool, &settings.hub_id, &settings.hub_site, &estate, &routes).await?;
     tracing::info!(
