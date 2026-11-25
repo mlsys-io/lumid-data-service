@@ -84,7 +84,7 @@ pub async fn dispatch(
     caller: Option<&crate::auth::Identity>,
 ) -> ApiResult<Value> {
     match name {
-        "get_schema_cards" => schema_cards::get_schema_cards(st, args).await,
+        "get_schema_cards" => schema_cards::get_schema_cards(st, args, caller).await,
         "replay_retrieval_plan" => replay::replay_retrieval_plan(st, args, caller).await,
         other => Err(ApiError::NotFound(format!("unknown tool '{other}'"))),
     }

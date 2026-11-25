@@ -125,7 +125,7 @@ fn ident_ok(s: &str) -> bool {
 pub async fn list_schemas(pool: &Pool, effective: &[String]) -> ApiResult<Vec<Map<String, Value>>> {
     let sql_ts = "
     SELECT n.nspname AS schema,
-           count(*) FILTER (WHERE c.relkind = 'r')  AS tables,
+           count(*) FILTER (WHERE c.relkind IN ('r', 'f'))  AS tables,
            count(*) FILTER (WHERE c.relkind = 'v')  AS views,
            count(*) FILTER (WHERE c.relkind = 'm')  AS materialized_views,
            coalesce(sum(approximate_row_count(c.oid)) FILTER (WHERE c.relkind = 'r'), 0)::bigint AS est_rows,
@@ -138,7 +138,7 @@ pub async fn list_schemas(pool: &Pool, effective: &[String]) -> ApiResult<Vec<Ma
      ORDER BY n.nspname";
     let sql_plain = "
     SELECT n.nspname AS schema,
-           count(*) FILTER (WHERE c.relkind = 'r')  AS tables,
+           count(*) FILTER (WHERE c.relkind IN ('r', 'f'))  AS tables,
            count(*) FILTER (WHERE c.relkind = 'v')  AS views,
            count(*) FILTER (WHERE c.relkind = 'm')  AS materialized_views,
            coalesce(sum(c.reltuples) FILTER (WHERE c.relkind = 'r'), 0)::bigint AS est_rows,
@@ -185,7 +185,7 @@ pub async fn list_tables(pool: &Pool, schema: &str) -> ApiResult<Vec<Map<String,
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE n.nspname = $1
-       AND c.relkind IN ('r', 'm')
+       AND c.relkind IN ('r', 'm', 'f')
      ORDER BY c.relname";
     // Vanilla Postgres without TimescaleDB: fall back to a version without the
     // _timescaledb_catalog reference (returns is_hypertable=false for all tables).
@@ -198,7 +198,7 @@ pub async fn list_tables(pool: &Pool, schema: &str) -> ApiResult<Vec<Map<String,
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE n.nspname = $1
-       AND c.relkind IN ('r', 'm')
+       AND c.relkind IN ('r', 'm', 'f')
      ORDER BY c.relname";
     let client = pool.get().await?;
     // Longer than the pool's statement timeout: on a big TimescaleDB warehouse

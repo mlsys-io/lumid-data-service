@@ -66,12 +66,16 @@ pub async fn replay(
                         sql_op.query.chars().take(200).collect::<String>()
                     )));
                 }
+                // Restricted schemas (crate::restricted): refuse a query naming
+                // one the caller may not see, and run allowed callers as the
+                // only role that can read that data in Postgres.
+                crate::restricted::check_sql(&st.settings, caller, &sql_op.query)?;
                 let (rows_written, rows_count) = execute_sql_op(
                     &st.pool,
                     &sql_op.query,
                     stmt_timeout_ms,
                     row_cap,
-                    &st.settings.retrieval_db_role,
+                    crate::restricted::retrieval_role(&st.settings, caller),
                     &mut materializer,
                 )
                 .await?;

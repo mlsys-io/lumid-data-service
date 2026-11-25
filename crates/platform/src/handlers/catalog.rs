@@ -85,7 +85,11 @@ where
 }
 
 /// GET /catalog/schemas
-pub async fn get_schemas(State(st): State<AppState>) -> ApiResult<Json<Value>> {
+pub async fn get_schemas(
+    State(st): State<AppState>,
+    identity: Option<Extension<Identity>>,
+) -> ApiResult<Json<Value>> {
+    let caller = identity.as_ref().map(|Extension(id)| id);
     let effective = q::effective_schemas(&st.settings.user_schemas);
     let (pool, eff) = (st.pool.clone(), effective.clone());
     let schemas = catalog_cached(
@@ -109,6 +113,14 @@ pub async fn get_schemas(State(st): State<AppState>) -> ApiResult<Json<Value>> {
     // Each note is about one schema's data, so it is served only where that schema
     // exists. Unconditional, they told the NUS hub's arXiv catalog (and the home
     // hub's) about equity OHLCV they do not hold (2026-11-25).
+    // Restricted schemas are left out for anyone not on their list.
+    let schemas: Vec<_> = schemas
+        .into_iter()
+        .filter(|row| {
+            let name = row.get("schema").and_then(Value::as_str).unwrap_or("");
+            crate::restricted::may_see(&st.settings, caller, name)
+        })
+        .collect();
     let notes = coverage_notes(&schemas);
     let mut body = json!({ "schemas": schemas });
     if !notes.is_empty() {
@@ -169,10 +181,14 @@ mod coverage_notes_tests {
 /// GET /catalog/schemas/{schema}/tables
 pub async fn get_schema_tables(
     State(st): State<AppState>,
+    identity: Option<Extension<Identity>>,
     Path(schema): Path<String>,
 ) -> ApiResult<Json<Value>> {
     let effective = q::effective_schemas(&st.settings.user_schemas);
-    if !q::is_user_schema(&schema, &effective) {
+    let caller = identity.as_ref().map(|Extension(id)| id);
+    if !q::is_user_schema(&schema, &effective)
+        || !crate::restricted::may_see(&st.settings, caller, &schema)
+    {
         return Err(ApiError::NotFound(format!("unknown schema '{schema}'")));
     }
     let (pool, sch) = (st.pool.clone(), schema.clone());
@@ -186,10 +202,14 @@ pub async fn get_schema_tables(
 /// GET /catalog/tables/{schema}/{table}
 pub async fn get_table_profile(
     State(st): State<AppState>,
+    identity: Option<Extension<Identity>>,
     Path((schema, table)): Path<(String, String)>,
 ) -> ApiResult<Json<Value>> {
     let effective = q::effective_schemas(&st.settings.user_schemas);
-    if !q::is_user_schema(&schema, &effective) {
+    let caller = identity.as_ref().map(|Extension(id)| id);
+    if !q::is_user_schema(&schema, &effective)
+        || !crate::restricted::may_see(&st.settings, caller, &schema)
+    {
         return Err(ApiError::NotFound(format!(
             "unknown table {schema}.{table}"
         )));
@@ -210,8 +230,14 @@ pub async fn get_table_profile(
 /// views (LUMID-003). See `queries::catalog::table_schema_json`.
 pub async fn get_table_schema_json(
     State(st): State<AppState>,
+    identity: Option<Extension<Identity>>,
     Path((schema, table)): Path<(String, String)>,
 ) -> ApiResult<Json<Value>> {
+    // Column lists of a restricted schema are part of what the allow-list hides.
+    let caller = identity.as_ref().map(|Extension(id)| id);
+    if !crate::restricted::may_see(&st.settings, caller, &schema) {
+        return Err(ApiError::NotFound(format!("unknown table: {schema}.{table}")));
+    }
     // No `is_user_schema` gate, matching the route's prior behavior (it
     // introspected any schema/table via `write::introspect::table_meta`,
     // unrestricted) — some ACL-only write targets live outside `USER_SCHEMAS`
