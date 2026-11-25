@@ -108,6 +108,20 @@ async fn schema_is_idempotent_concurrent_and_hidden_from_the_reader() {
         )
         .await
     );
+    // A DB with no provenance.runs at all (fresh hub) boots too.
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute("DROP SCHEMA jobs CASCADE; ALTER TABLE provenance.runs RENAME TO runs_aside;")
+        .await
+        .unwrap();
+    schema::migrate(&pool, "lumid_reader").await.unwrap();
+    pool.get()
+        .await
+        .unwrap()
+        .batch_execute("ALTER TABLE provenance.runs_aside RENAME TO runs;")
+        .await
+        .unwrap();
     // An unset / nonexistent reader role is a no-op, not a boot failure.
     schema::migrate(&pool, "").await.unwrap();
     schema::migrate(&pool, "no_such_role_xyz").await.unwrap();
