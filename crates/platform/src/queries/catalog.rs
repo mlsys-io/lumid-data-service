@@ -89,10 +89,7 @@ pub fn is_user_schema(schema: &str, effective: &[String]) -> bool {
 /// without also validating against information_schema, but this guards against
 /// anything pathological slipping through.
 fn ident_ok(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 63
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    !s.is_empty() && s.len() <= 63 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 // --------------------------------------------------------------------- core
@@ -153,11 +150,24 @@ pub async fn list_schemas(pool: &Pool, effective: &[String]) -> ApiResult<Vec<Ma
      ORDER BY n.nspname";
     let schemas: Vec<String> = effective.to_vec();
     let client = pool.get().await?;
-    let rows = match client.query(sql_ts, &[&schemas]).await {
-        Ok(r) => r,
-        Err(ref e) if is_missing_timescale(e) => client.query(sql_plain, &[&schemas]).await?,
-        Err(e) => return Err(e.into()),
-    };
+    // Longer than the pool's statement timeout: on a big TimescaleDB warehouse
+    // under I/O stall this runs past 30 s. Callers cache it and refresh in the
+    // background (handlers::catalog::catalog_cached), so no request waits on it.
+    client
+        .batch_execute("SET statement_timeout = '120s'")
+        .await?;
+    let res: ApiResult<_> = async {
+        match client.query(sql_ts, &[&schemas]).await {
+            Ok(r) => Ok(r),
+            Err(ref e) if is_missing_timescale(e) => {
+                Ok(client.query(sql_plain, &[&schemas]).await?)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+    .await;
+    let _ = client.batch_execute("RESET statement_timeout").await;
+    let rows = res?;
     Ok(rows_to_objects(&rows))
 }
 
@@ -191,15 +201,34 @@ pub async fn list_tables(pool: &Pool, schema: &str) -> ApiResult<Vec<Map<String,
        AND c.relkind IN ('r', 'm')
      ORDER BY c.relname";
     let client = pool.get().await?;
-    let rows = match client.query(sql_ts, &[&schema]).await {
-        Ok(r) => r,
-        Err(ref e) if is_missing_timescale(e) => client.query(sql_plain, &[&schema]).await?,
-        Err(e) => return Err(e.into()),
-    };
+    // Longer than the pool's statement timeout: on a big TimescaleDB warehouse
+    // under I/O stall this runs past 30 s. Callers cache it and refresh in the
+    // background (handlers::catalog::catalog_cached), so no request waits on it.
+    client
+        .batch_execute("SET statement_timeout = '120s'")
+        .await?;
+    let res: ApiResult<_> = async {
+        match client.query(sql_ts, &[&schema]).await {
+            Ok(r) => Ok(r),
+            Err(ref e) if is_missing_timescale(e) => {
+                Ok(client.query(sql_plain, &[&schema]).await?)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+    .await;
+    let _ = client.batch_execute("RESET statement_timeout").await;
+    let rows = res?;
     Ok(rows_to_objects(&rows))
 }
 
-const PROV_SET: &[&str] = &["source", "source_endpoint", "source_run_id", "ingest_ts", "raw"];
+const PROV_SET: &[&str] = &[
+    "source",
+    "source_endpoint",
+    "source_run_id",
+    "ingest_ts",
+    "raw",
+];
 
 /// One live column of a table, view, or materialized view.
 pub struct ColumnMeta {
@@ -267,8 +296,9 @@ fn json_schema_type(data_type: &str, udt_name: &str) -> Value {
         return json!({"type": "array", "items": json_schema_type_for_udt(udt_name)});
     }
     match t.as_str() {
-        "text" | "character varying" | "varchar" | "character" | "char" | "uuid"
-        | "tsvector" => json!({"type": "string"}),
+        "text" | "character varying" | "varchar" | "character" | "char" | "uuid" | "tsvector" => {
+            json!({"type": "string"})
+        }
         "boolean" | "bool" => json!({"type": "boolean"}),
         "bigint" | "integer" | "smallint" | "int8" | "int4" | "int2" => {
             json!({"type": "integer"})
@@ -283,7 +313,9 @@ fn json_schema_type(data_type: &str, udt_name: &str) -> Value {
         "timestamp without time zone" | "timestamp with time zone" => {
             json!({"type": "string", "format": "date-time"})
         }
-        "json" | "jsonb" => json!({"type": ["object", "array", "string", "number", "boolean", "null"]}),
+        "json" | "jsonb" => {
+            json!({"type": ["object", "array", "string", "number", "boolean", "null"]})
+        }
         "bytea" => json!({"type": "string", "contentEncoding": "base64"}),
         _ => json!({"type": "string"}),
     }
@@ -399,11 +431,7 @@ pub async fn natural_key_for(
 }
 
 /// Full profile of one table. Returns None (→ 404) when the table doesn't exist.
-pub async fn table_profile(
-    pool: &Pool,
-    schema: &str,
-    table: &str,
-) -> ApiResult<Option<Value>> {
+pub async fn table_profile(pool: &Pool, schema: &str, table: &str) -> ApiResult<Option<Value>> {
     let mut client = pool.get().await?;
 
     // Table meta — also tells us whether the relation exists at all.
@@ -483,8 +511,10 @@ pub async fn table_profile(
         );
         let bounded: Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> = async {
             let tx = client.transaction().await?;
-            tx.batch_execute(&format!("SET LOCAL statement_timeout = {TOP_SOURCES_TIMEOUT_MS}"))
-                .await?;
+            tx.batch_execute(&format!(
+                "SET LOCAL statement_timeout = {TOP_SOURCES_TIMEOUT_MS}"
+            ))
+            .await?;
             let rows = tx.query(sources_sql.as_str(), &[]).await?;
             Ok(rows)
         }
@@ -781,8 +811,10 @@ pub async fn list_runs_for(
     let sql = format!(
         "{RUN_SELECT}\n    {where_sql}\n     ORDER BY r.started_at DESC\n     LIMIT ${limit_idx}"
     );
-    let refs: Vec<&(dyn ToSql + Sync)> =
-        params.iter().map(|b| b.as_ref() as &(dyn ToSql + Sync)).collect();
+    let refs: Vec<&(dyn ToSql + Sync)> = params
+        .iter()
+        .map(|b| b.as_ref() as &(dyn ToSql + Sync))
+        .collect();
     let client = pool.get().await?;
     let rows = client.query(sql.as_str(), &refs).await?;
     Ok(rows.iter().map(serialize_run).collect())
@@ -819,7 +851,9 @@ fn coerce_param(value: &str, pg_type: &str) -> Param {
                 }
             }
             // naive (no offset): try parse as naive then assume UTC.
-            if let Ok(ndt) = NaiveDateTime::parse_from_str(&value.replace('Z', ""), "%Y-%m-%dT%H:%M:%S") {
+            if let Ok(ndt) =
+                NaiveDateTime::parse_from_str(&value.replace('Z', ""), "%Y-%m-%dT%H:%M:%S")
+            {
                 return Param::Ts(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
             }
             Param::Text(value.to_string())
@@ -909,8 +943,10 @@ pub async fn trace_by_natural_key(
           LIMIT 5",
         clauses.join(" AND ")
     );
-    let refs: Vec<&(dyn ToSql + Sync)> =
-        params.iter().map(|b| b.as_ref() as &(dyn ToSql + Sync)).collect();
+    let refs: Vec<&(dyn ToSql + Sync)> = params
+        .iter()
+        .map(|b| b.as_ref() as &(dyn ToSql + Sync))
+        .collect();
     let fact_rows = client.query(sql.as_str(), &refs).await?;
     if fact_rows.is_empty() {
         return Ok(None);

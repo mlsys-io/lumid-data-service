@@ -6,7 +6,10 @@
 //! /catalog/ingress/adapters, /catalog/ingress/proposals) are handled separately
 //! and are NOT ported here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
@@ -18,10 +21,78 @@ use crate::error::{ApiError, ApiResult};
 use crate::queries::catalog as q;
 use crate::state::AppState;
 
+/// How long a catalog listing is served without asking Postgres again.
+const CATALOG_TTL: Duration = Duration::from_secs(300);
+
+type Rows = Vec<Map<String, Value>>;
+
+fn catalog_cache() -> &'static Mutex<HashMap<String, (Instant, Rows)>> {
+    static C: OnceLock<Mutex<HashMap<String, (Instant, Rows)>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Catalog listings, cached: fresh for `CATALOG_TTL`, and on a failed refresh
+/// the last good answer is served instead of an error.
+///
+/// The listing calls TimescaleDB's per-hypertable size/row functions across
+/// every chunk. On FinData (32k relations) that is ~2 s normally, but when the
+/// data NAS is I/O-stalled it runs past the 30 s statement timeout, and Studio
+/// showed the whole warehouse "offline" (500, 2026-11-25). The numbers are
+/// estimates; a few minutes old is fine, an outage is not.
+async fn catalog_cached<F, Fut>(key: String, load: F) -> ApiResult<Rows>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ApiResult<Rows>> + Send + 'static,
+{
+    let cached = catalog_cache()
+        .lock()
+        .ok()
+        .and_then(|c| c.get(&key).cloned());
+    match cached {
+        // Fresh: serve it.
+        Some((at, rows)) if at.elapsed() < CATALOG_TTL => Ok(rows),
+        // Stale: serve it now and refresh in the background. Re-stamping first
+        // means concurrent requests don't all start their own refresh.
+        Some((at, rows)) => {
+            if let Ok(mut c) = catalog_cache().lock() {
+                if let Some(e) = c.get_mut(&key) {
+                    e.0 = Instant::now();
+                }
+            }
+            let fut = load();
+            tokio::spawn(async move {
+                match fut.await {
+                    Ok(fresh) => {
+                        if let Ok(mut c) = catalog_cache().lock() {
+                            c.insert(key, (Instant::now(), fresh));
+                        }
+                    }
+                    Err(e) => tracing::warn!(%key, age_s = at.elapsed().as_secs(),
+                        "catalog refresh failed; still serving the last good listing: {e}"),
+                }
+            });
+            Ok(rows)
+        }
+        // Nothing yet: this request pays for it.
+        None => {
+            let rows = load().await?;
+            if let Ok(mut c) = catalog_cache().lock() {
+                c.insert(key, (Instant::now(), rows.clone()));
+            }
+            Ok(rows)
+        }
+    }
+}
+
 /// GET /catalog/schemas
 pub async fn get_schemas(State(st): State<AppState>) -> ApiResult<Json<Value>> {
     let effective = q::effective_schemas(&st.settings.user_schemas);
-    let schemas = q::list_schemas(&st.pool, &effective).await?;
+    let (pool, eff) = (st.pool.clone(), effective.clone());
+    let schemas = catalog_cached(
+        format!("schemas:{}", effective.join(",")),
+        move || async move { q::list_schemas(&pool, &eff).await },
+    )
+    .await?;
     // COVERAGE NOTE, served with the schema list.
     //
     // The warehouse holds 6.2B rows of 1-minute equity OHLCV, which reads as
@@ -104,7 +175,11 @@ pub async fn get_schema_tables(
     if !q::is_user_schema(&schema, &effective) {
         return Err(ApiError::NotFound(format!("unknown schema '{schema}'")));
     }
-    let tables = q::list_tables(&st.pool, &schema).await?;
+    let (pool, sch) = (st.pool.clone(), schema.clone());
+    let tables = catalog_cached(format!("tables:{schema}"), move || async move {
+        q::list_tables(&pool, &sch).await
+    })
+    .await?;
     Ok(Json(json!({ "schema": schema, "tables": tables })))
 }
 
