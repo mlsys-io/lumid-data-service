@@ -1280,6 +1280,45 @@ pub async fn list_sources(
 }
 
 /// A prober reports route health (local keys labelled `prober:<site>`).
+fn is_prober_or_super(caller: &Identity) -> bool {
+    (caller.role == "local" && caller.sub.starts_with("local:prober:"))
+        || caller.role == "super_admin"
+}
+
+/// The routes a prober should probe. A `prober:<site>` key sees only its own
+/// site's routes (asking for another site is refused, not silently widened);
+/// super_admin may ask for any site or all.
+pub async fn list_routes(
+    st: &AppState,
+    caller: &Identity,
+    from_site: Option<String>,
+) -> JResult<Value> {
+    if !is_prober_or_super(caller) {
+        return Err(forbidden("not_a_prober", "route lists are for prober keys"));
+    }
+    let own = caller.sub.strip_prefix("local:prober:").map(str::to_string);
+    let site = match (&own, from_site) {
+        (Some(o), Some(f)) if *o != f => {
+            return Err(forbidden(
+                "not_your_site",
+                format!("this prober key is for site {o}"),
+            ))
+        }
+        (Some(o), _) => Some(o.clone()),
+        (None, f) => f,
+    };
+    let routes = inputs::list_routes(&st.pool, &st.settings.hub_id, site.as_deref())
+        .await
+        .map_err(|e| {
+            JobsError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "routes_unavailable",
+                e.to_string(),
+            )
+        })?;
+    Ok(json!({"hub": st.settings.hub_id, "from_site": site, "routes": routes}))
+}
+
 pub async fn route_health(
     st: &AppState,
     caller: &Identity,
@@ -1287,9 +1326,7 @@ pub async fn route_health(
     health: &str,
     latency_ms: Option<i32>,
 ) -> JResult<Value> {
-    if !(caller.role == "local" && caller.sub.starts_with("local:prober:"))
-        && caller.role != "super_admin"
-    {
+    if !is_prober_or_super(caller) {
         return Err(forbidden(
             "not_a_prober",
             "route health is reported by prober keys",

@@ -776,6 +776,32 @@ async fn refusals_quotas_mcp_openapi_and_probers() {
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
+    // Route list: a prober sees its own site's routes, with the health it
+    // just reported; another site is refused, not widened; users are refused.
+    let (s, v) = call(&app, "GET", "/jobs/v1/admin/routes", PROBER, None, None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let routes = v["routes"].as_array().expect("routes array");
+    assert!(!routes.is_empty(), "{v}");
+    assert!(routes.iter().all(|r| r["from_site"] == "home"), "{v}");
+    let ld = routes
+        .iter()
+        .find(|r| r["route_id"] == "home-lan-ld")
+        .expect("home-lan-ld listed");
+    assert_eq!(ld["health"], "up");
+    assert_eq!(ld["latency_ms"], 2);
+    let (s, _) = call(
+        &app,
+        "GET",
+        "/jobs/v1/admin/routes?from_site=office",
+        PROBER,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = call(&app, "GET", "/jobs/v1/admin/routes", BOB, None, None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
     // Unknown callers never get in.
     let (s, _) = call(
         &app,
@@ -797,6 +823,7 @@ fn openapi_documents_the_jobs_surface() {
         "/jobs/v1/jobs",
         "/jobs/v1/sources/{id}/grants",
         "/jobs/v1/jobs/{id}/token",
+        "/jobs/v1/admin/routes",
     ] {
         assert!(p.get(k).is_some(), "{k}");
     }
