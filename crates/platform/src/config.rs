@@ -304,6 +304,12 @@ pub struct Settings {
     /// process's SQL sees (job-scope checks on `/retrieve`). Defaults to the
     /// first `LUMID_JOBS_ESTATE` entry.
     pub jobs_instance: String,
+    /// `LUMID_JOBS_RUNTIMES_JSON` — where each runtime is reached per site
+    /// (`{"lumilake": {"<site>": "<base url>"}}`).
+    pub jobs_runtimes_json: String,
+    /// `LUMID_BRIDGE_SECRET` — lum.id's `X-Bridge-Secret`, used to mint a
+    /// short-lived token for a job's owner when dispatching to its runtime.
+    pub bridge_secret: String,
     /// `LUMID_JOBS_SITES_JSON` — candidate compute sites for the planner
     /// (`[{site, runtimes, ext_egress?, cached_models?}]`).
     pub jobs_sites_json: String,
@@ -475,6 +481,8 @@ impl Settings {
             jobs_estate: env_str("JOBS_ESTATE", ""),
             jobs_routes_json: env_str("JOBS_ROUTES_JSON", ""),
             jobs_sites_json: env_str("JOBS_SITES_JSON", ""),
+            jobs_runtimes_json: env_str("JOBS_RUNTIMES_JSON", ""),
+            bridge_secret: env_str("BRIDGE_SECRET", ""),
             jobs_instance: env_var("JOBS_INSTANCE")
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| {

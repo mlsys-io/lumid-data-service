@@ -680,6 +680,17 @@ pub async fn submit(
     )
     .await?;
     tx.commit().await?;
+    if status == "planned"
+        && site
+            .as_deref()
+            .is_some_and(|s| super::dispatch::dispatches(st, &rt, s))
+    {
+        // Hand it to its runtime in the background; the reconciler keeps the
+        // status current from there. Without a dispatcher for this runtime and
+        // site the job stays `planned` for an external adapter to claim.
+        let st2 = st.clone();
+        tokio::spawn(async move { super::dispatch::dispatch(&st2, job_id).await });
+    }
     let body = get_job_unchecked(st, job_id).await?;
     Ok((http, body))
 }
@@ -744,6 +755,11 @@ fn job_json(r: &tokio_postgres::Row) -> Value {
         "ended_at": r.get::<_, Option<DateTime<Utc>>>("ended_at"),
         "updated_at": r.get::<_, DateTime<Utc>>("updated_at"),
     })
+}
+
+/// A job as the hub sees it, without an access check (dispatcher/reconciler).
+pub(crate) async fn job_snapshot(st: &AppState, job_id: Uuid) -> JResult<Value> {
+    get_job_unchecked(st, job_id).await
 }
 
 async fn get_job_unchecked(st: &AppState, job_id: Uuid) -> JResult<Value> {
@@ -838,12 +854,15 @@ pub async fn cancel(st: &AppState, caller: &Identity, job_id: Uuid) -> JResult<V
         ));
     }
     transition(st, job_id, "cancelled", None, json!({"by": caller.sub})).await?;
+    let st2 = st.clone();
+    let snapshot = j.clone();
+    tokio::spawn(async move { super::dispatch::cancel_at_runtime(&st2, &snapshot).await });
     get_job_unchecked(st, job_id).await
 }
 
 /// Move a job to `status` (recording an event), stamping started/ended and
 /// revoking its tokens when it ends.
-async fn transition(
+pub(crate) async fn transition(
     st: &AppState,
     job_id: Uuid,
     status: &str,
@@ -872,7 +891,7 @@ async fn transition(
 }
 
 /// Allowed lifecycle moves.
-fn can_move(from: &str, to: &str) -> bool {
+pub(crate) fn can_move(from: &str, to: &str) -> bool {
     matches!(
         (from, to),
         (
