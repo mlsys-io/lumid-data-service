@@ -278,9 +278,11 @@ $jobs$;
 
 DO $jobs$
 BEGIN
+  -- to_regclass, not ::regclass: the cast raises when the table is missing,
+  -- and SQL does not promise to short-circuit the guard before it.
   IF to_regclass('provenance.runs') IS NOT NULL AND NOT EXISTS (
        SELECT 1 FROM pg_attribute
-        WHERE attrelid = 'provenance.runs'::regclass
+        WHERE attrelid = to_regclass('provenance.runs')
           AND attname = 'job_id' AND NOT attisdropped) THEN
     ALTER TABLE provenance.runs ADD COLUMN job_id uuid;
   END IF;
