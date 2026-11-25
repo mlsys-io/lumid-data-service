@@ -19,7 +19,7 @@
 //! A caller sees their own activity; admins see everyone's. Other people's
 //! activity on a table is summarized as a count, without names.
 
-use axum::body::{to_bytes, Body};
+use axum::body::{to_bytes, Body, HttpBody};
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, Method};
 use axum::middleware::Next;
@@ -164,6 +164,12 @@ fn retrieve_tables(body: &[u8]) -> Vec<(String, String)> {
     out
 }
 
+/// True only when the body's size is known and within `cap` — the middleware
+/// buffers nothing it can't put back whole.
+fn fits(b: &Body, cap: usize) -> bool {
+    b.size_hint().exact().is_some_and(|n| n as usize <= cap)
+}
+
 fn rows_written(v: &Value) -> i64 {
     v.get("inserted").and_then(Value::as_i64).unwrap_or(0)
         + v.get("updated").and_then(Value::as_i64).unwrap_or(0)
@@ -186,18 +192,22 @@ pub async fn record(State(st): State<AppState>, req: Request, next: Next) -> Res
     };
     let ctx = context_from(req.headers());
 
-    // Reads: name the tables from the request before it runs.
+    // Reads: name the tables from the request before it runs. A body whose
+    // size isn't known, or is over the cap, passes through unrecorded — the
+    // middleware never changes what the handler sees.
     let (req, read_tables) = if is_retrieve {
+        if !fits(req.body(), MAX_REQ_BODY) {
+            return next.run(req).await;
+        }
         let (parts, body) = req.into_parts();
         match to_bytes(body, MAX_REQ_BODY).await {
             Ok(b) => {
                 let tables = retrieve_tables(&b);
                 (Request::from_parts(parts, Body::from(b)), tables)
             }
-            // Too large to buffer for attribution: we already consumed the
-            // stream, so answer as the handler would for an oversize body.
             Err(_) => {
-                return ApiError::BadRequest("request body too large".into()).into_response_ext()
+                return ApiError::BadRequest("could not read the request body".into())
+                    .into_response_ext()
             }
         }
     } else {
@@ -205,7 +215,18 @@ pub async fn record(State(st): State<AppState>, req: Request, next: Next) -> Res
     };
 
     let resp = next.run(req).await;
+    // Only successful, small, known-size responses are read for a row count;
+    // anything else goes back untouched (a write is then recorded with 0 rows).
     if !resp.status().is_success() {
+        return resp;
+    }
+    if !fits(resp.body(), MAX_RESP_BODY) {
+        if let Some((s, t)) = write_target {
+            let pool = st.pool.clone();
+            tokio::spawn(async move {
+                let _ = upsert(&pool, &s, &t, "write", &sub, &ctx, 0).await;
+            });
+        }
         return resp;
     }
     let (parts, body) = resp.into_parts();
@@ -496,6 +517,19 @@ mod tests {
         assert!(t.contains(&("findata".into(), "markets".into())), "{t:?}");
         assert!(t.contains(&("instrument".into(), "links".into())), "{t:?}");
         assert_eq!(t.len(), 2, "{t:?}");
+    }
+
+    #[test]
+    fn only_known_small_bodies_are_buffered() {
+        assert!(fits(&Body::from(vec![0u8; 10]), 100));
+        assert!(!fits(&Body::from(vec![0u8; 101]), 100));
+        let stream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+            bytes::Bytes::from_static(b"x"),
+        )]);
+        assert!(
+            !fits(&Body::from_stream(stream), 100),
+            "unknown size is never buffered"
+        );
     }
 
     #[test]
