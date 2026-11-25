@@ -23,6 +23,9 @@ pub enum Need {
     MeBlob(String),
     /// `POST /retrieve` — the body decides (SQL relations, storage keys).
     Retrieve,
+    /// `POST /profile` — EXPLAIN-only cost estimate; allowed when its SQL reads
+    /// only declared sources (Lumilake's planner profiles a job's retrievals).
+    Profile,
     /// `POST /ingest/<schema>/<table>[/stream|/file]`.
     Ingest { schema: String, table: String },
     /// A `/jobs/v1/jobs/<id>/…` route a job may use for ITSELF only
@@ -55,6 +58,7 @@ pub fn classify(method: &str, path: &str, retrieval_prefix: &str) -> Need {
         }
         ("GET", ["me", "blobs", sha]) => Need::MeBlob(sha.to_ascii_lowercase()),
         ("POST", ["retrieve"]) => Need::Retrieve,
+        ("POST", ["profile"]) => Need::Profile,
         ("POST", ["ingest", schema, table])
         | ("POST", ["ingest", schema, table, "stream" | "file"])
             if *schema != "blob" =>
@@ -640,6 +644,7 @@ mod tests {
             Need::MeBlob("abc".into())
         );
         assert_eq!(classify("POST", "/retrieve", rp), Need::Retrieve);
+        assert_eq!(classify("POST", "/profile", rp), Need::Profile);
         assert_eq!(
             classify("POST", "/jobs/v1/jobs/j1/events", rp),
             Need::OwnJob("j1".into())
