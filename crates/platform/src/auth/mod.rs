@@ -37,7 +37,7 @@ pub fn parse_local_keys(raw: &str) -> HashMap<String, String> {
     out
 }
 
-fn extract_token(headers: &axum::http::HeaderMap) -> Option<String> {
+pub(crate) fn extract_token(headers: &axum::http::HeaderMap) -> Option<String> {
     if let Some(k) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         let k = k.trim();
         if !k.is_empty() {
@@ -97,6 +97,41 @@ fn client_ip(headers: &axum::http::HeaderMap) -> String {
     "unknown".to_string()
 }
 
+/// A per-job token (`ljt_…`, see `crate::jobs::token`) → the job's owner,
+/// with role `job`. `job` is not a privileged role anywhere (every admin
+/// check compares against `local`/`admin`/`super_admin`), and
+/// `crate::jobs::enforce` confines it to the job's declared sources.
+async fn resolve_job_token(st: &AppState, token: &str) -> Result<Identity, ApiError> {
+    if !st.settings.jobs_enabled {
+        return Err(ApiError::Unauthorized(
+            "job tokens are not accepted by this hub".into(),
+        ));
+    }
+    match crate::jobs::token::resolve(
+        &st.pool,
+        &st.settings.hub_id,
+        &st.settings.jobs_instance,
+        token,
+    )
+    .await
+    {
+        Ok(Some(ctx)) => Ok(Identity {
+            sub: ctx.owner_sub.clone(),
+            role: "job".to_string(),
+            email: None,
+            active: true,
+            scopes: vec![format!("job:{}", ctx.job_id), format!("app:{}", ctx.app)],
+        }),
+        Ok(None) => Err(ApiError::Unauthorized(
+            "invalid, expired, or revoked job token".into(),
+        )),
+        Err(e) => {
+            tracing::warn!("job token lookup failed: {e}");
+            Err(ApiError::Unavailable("job token lookup failed".into()))
+        }
+    }
+}
+
 /// Resolve an Identity from headers. Ok(Some)=authed, Ok(None)=anonymous,
 /// Err=invalid token (401) or auth service unreachable (503).
 async fn resolve_identity(
@@ -107,6 +142,9 @@ async fn resolve_identity(
         Some(t) => t,
         None => return Ok(None),
     };
+    if token.starts_with(crate::jobs::token::PREFIX) {
+        return resolve_job_token(st, &token).await.map(Some);
+    }
     if let Some(label) = st.local_keys.get(&token) {
         return Ok(Some(Identity {
             sub: format!("local:{label}"),
@@ -136,6 +174,10 @@ pub async fn resolve_bearer(
 ) -> Result<Option<Identity>, ApiError> {
     let token = token.trim();
     if token.is_empty() {
+        return Ok(None);
+    }
+    if token.starts_with(crate::jobs::token::PREFIX) {
+        // Job tokens are for the data plane, not realtime streams.
         return Ok(None);
     }
     if let Some(label) = st.local_keys.get(token) {
