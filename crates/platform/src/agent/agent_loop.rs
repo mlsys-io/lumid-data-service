@@ -78,17 +78,23 @@ pub async fn run_loop(
         .map(|n| n.min(cfg.max_iterations))
         .unwrap_or(cfg.max_iterations);
 
-    let base_url = st
-        .settings
-        .llm_backend_url
+    // The agent's own endpoint when set (AgentConfig), else the shared one.
+    let base_url = cfg
+        .llm_url
+        .as_deref()
+        .unwrap_or(&st.settings.llm_backend_url)
         .trim_end_matches('/')
         .to_string();
+    let api_key = cfg
+        .llm_key
+        .clone()
+        .unwrap_or_else(|| st.settings.llm_api_key.clone());
     let model = model_override.filter(|m| !m.is_empty()).or_else(|| {
-        let dm = &st.settings.llm_default_model;
+        let dm = cfg.llm_model.as_deref().unwrap_or(&st.settings.llm_default_model);
         if dm.is_empty() {
             None
         } else {
-            Some(dm.clone())
+            Some(dm.to_string())
         }
     });
 
@@ -124,8 +130,8 @@ pub async fn run_loop(
 
         let url = format!("{base_url}/v1/chat/completions");
         let mut req = st.http.post(&url).json(&payload);
-        if !st.settings.llm_api_key.is_empty() {
-            req = req.bearer_auth(&st.settings.llm_api_key);
+        if !api_key.is_empty() {
+            req = req.bearer_auth(&api_key);
         }
         let resp = match req.send().await {
             Ok(r) => r,
