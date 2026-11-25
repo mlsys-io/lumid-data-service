@@ -987,11 +987,40 @@ pub async fn list_events(st: &AppState, caller: &Identity, job_id: Uuid) -> JRes
 /// Issue a job token — to the runtime the job was dispatched to (with its own
 /// service key), or to the job itself (renewal). Never to a person: a token
 /// a human could copy out would outlive the job's purpose.
-pub async fn issue_token(st: &AppState, caller: &Identity, job_id: Uuid) -> JResult<Value> {
+/// Issue a job token. Callers: the job itself (refresh), or the runtime the
+/// job belongs to, which must say WHICH user it authenticated (`for_sub`).
+///
+/// A runtime takes `lumid_job.job_id` from a submit request, and the submitter
+/// is not trusted to name only their own jobs: without this check, anyone able
+/// to submit to a runtime could quote another user's job id and have the
+/// runtime fetch that job's token — their workload reading the victim's data.
+/// Each runtime could compare owners itself, but one that forgets fails open;
+/// here it fails closed, for every runtime at once.
+pub async fn issue_token(
+    st: &AppState,
+    caller: &Identity,
+    job_id: Uuid,
+    for_sub: Option<String>,
+) -> JResult<Value> {
     let j = get_job_unchecked(st, job_id).await?;
     let runtime = j["runtime"].as_str().unwrap_or("");
-    if !(is_runtime_for(caller, runtime) || is_this_job(caller, job_id)) {
+    let as_runtime = is_runtime_for(caller, runtime);
+    if !(as_runtime || is_this_job(caller, job_id)) {
         return Err(not_found("job_not_found", "no such job"));
+    }
+    if as_runtime {
+        let Some(sub) = for_sub.filter(|s| !s.is_empty()) else {
+            return Err(bad(
+                "for_sub_required",
+                "a runtime must pass for_sub: the lum.id sub of the user whose request carried this job id",
+            ));
+        };
+        if j["owner"].as_str() != Some(sub.as_str()) {
+            return Err(forbidden(
+                "not_the_owner",
+                "this job does not belong to the user the runtime authenticated",
+            ));
+        }
     }
     let status = j["status"].as_str().unwrap_or("");
     if TERMINAL.contains(&status) {

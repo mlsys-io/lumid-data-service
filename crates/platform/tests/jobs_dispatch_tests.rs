@@ -88,7 +88,10 @@ async fn stub_lumilake(seen: Shared, hub: Arc<Mutex<String>>) -> String {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        seen.lock().unwrap().submits.push((auth, body.clone()));
+        seen.lock()
+            .unwrap()
+            .submits
+            .push((auth.clone(), body.clone()));
         if body["data"][0]["name"] == "reject-me" {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -104,6 +107,9 @@ async fn stub_lumilake(seen: Shared, hub: Arc<Mutex<String>>) -> String {
         let tok: Value = http
             .post(format!("{hub}/jobs/v1/jobs/{job_id}/token"))
             .bearer_auth(RUNTIME_KEY)
+            // The user this runtime authenticated: the hub minted the
+            // dispatch bearer as `minted.<sub>` (see the identity stub).
+            .json(&json!({"for_sub": auth.trim_start_matches("Bearer ").trim_start_matches("minted.")}))
             .send()
             .await
             .unwrap()

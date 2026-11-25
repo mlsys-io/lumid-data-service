@@ -199,12 +199,24 @@ async fn post_event(
     ))
 }
 
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct TokenIn {
+    /// Required from a runtime key: the sub of the user it authenticated.
+    #[serde(default)]
+    for_sub: Option<String>,
+}
+
 async fn issue_token(
     State(st): State<AppState>,
     Extension(id): Extension<Identity>,
     Path(jid): Path<String>,
+    body: Option<Json<TokenIn>>,
 ) -> JResult<Json<Value>> {
-    Ok(Json(service::issue_token(&st, &id, parse_id(&jid)?).await?))
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    Ok(Json(
+        service::issue_token(&st, &id, parse_id(&jid)?, b.for_sub).await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -263,7 +275,7 @@ pub fn openapi_paths() -> Value {
             "get": op("A job's events"),
             "post": op("Report progress (runtime service key or the job's own token)")
         },
-        "/jobs/v1/jobs/{id}/token": {"post": op("Issue a job token (runtime service key or the job itself)")},
+        "/jobs/v1/jobs/{id}/token": {"post": op("Issue a job token: the job itself, or its runtime's key with {for_sub: <the user it authenticated>} (must own the job)")},
         "/jobs/v1/admin/route-health": {"post": op("Prober health report ({route_id, health: up|degraded|down, latency_ms?})")},
         "/jobs/v1/admin/routes": {"get": op("Routes a prober should probe (from_site=; a prober key sees only its own site)")}
     })

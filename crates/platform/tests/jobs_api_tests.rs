@@ -403,12 +403,42 @@ async fn sources_sharing_plan_submit_tokens_events_cancel() {
     )
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+    // The runtime must name the user it authenticated, and that user must
+    // own the job: a submitter quoting someone else's job id gets nothing.
     let (s, v) = call(
         &app,
         "POST",
         &format!("/jobs/v1/jobs/{job}/token"),
         RUNTIME,
         None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("for_sub_required")),
+        "{v}"
+    );
+    let (s, v) = call(
+        &app,
+        "POST",
+        &format!("/jobs/v1/jobs/{job}/token"),
+        RUNTIME,
+        Some(json!({"for_sub": "alice-sub"})),
+        None,
+    )
+    .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("not_the_owner")),
+        "{v}"
+    );
+    let (s, v) = call(
+        &app,
+        "POST",
+        &format!("/jobs/v1/jobs/{job}/token"),
+        RUNTIME,
+        Some(json!({"for_sub": "bob-sub"})),
         None,
     )
     .await;
