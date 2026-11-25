@@ -127,7 +127,13 @@ impl LumidClient {
             .client
             .post(&url)
             // Name ourselves, so lum.id refuses JWTs minted for another service.
-            .json(&serde_json::json!({ "token": token, "audience": self.audience }))
+            .json(&if self.audience.is_empty() {
+                // LUMID_AUTH_AUDIENCE="" — transition/rollback switch: introspect
+                // unbound, as before audiences were enforced.
+                serde_json::json!({ "token": token })
+            } else {
+                serde_json::json!({ "token": token, "audience": self.audience })
+            })
             .send()
             .await
             .map_err(|e| LumidError::Unreachable(e.to_string()))?;
@@ -178,6 +184,9 @@ impl LumidClient {
 /// named `ours`: no `aud` reported (a PAT, or a lum.id that predates the
 /// field), or `aud` names `ours` or the general `lumid-ecosystem` audience.
 pub(crate) fn audience_ok(aud: Option<&[String]>, ours: &str) -> bool {
+    if ours.is_empty() {
+        return true; // LUMID_AUTH_AUDIENCE="": not enforcing (see introspect)
+    }
     match aud {
         None => true,
         Some(a) if a.is_empty() => true,
@@ -201,6 +210,8 @@ mod audience_tests {
         assert!(audience_ok(Some(&v(&["lumid-data"])), "lumid-data"));
         assert!(!audience_ok(Some(&v(&["flowmesh"])), "lumid-data"));
         assert!(!audience_ok(Some(&v(&["harbor"])), "lumid-data"));
+        // The transition switch: an empty audience enforces nothing.
+        assert!(audience_ok(Some(&v(&["runmesh"])), ""));
         assert!(audience_ok(
             Some(&v(&["flowmesh", "lumid-data"])),
             "lumid-data"
