@@ -20,6 +20,8 @@ use serde_json::{json, Value};
 
 const BOB: &str = "lm_pat_live_bob_dispatch";
 const RUNTIME_KEY: &str = "rt-lumilake-dispatch";
+const FM_KEY: &str = "rt-flowmesh-dispatch";
+const SBX_KEY: &str = "rt-sandbox-dispatch";
 const BRIDGE: &str = "test-bridge-secret";
 
 #[derive(Default)]
@@ -60,6 +62,21 @@ async fn stub_lumid() -> String {
         if headers.get("x-bridge-secret").and_then(|v| v.to_str().ok()) != Some(BRIDGE) {
             return (StatusCode::UNAUTHORIZED, Json(json!({})));
         }
+        // The hub must mint for the runtime's audience and carry the bind
+        // scope (runtimes refuse a binding without it).
+        let scopes: Vec<&str> = b["scopes"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let aud = b["audience"].as_str().unwrap_or("");
+        if !scopes.contains(&"lumid-job:bind")
+            || !matches!(aud, "lumilake" | "flowmesh" | "sandbox")
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "mint without the bind scope or a runtime audience"})),
+            );
+        }
         // A JWT-shaped token so the platform's client would introspect it.
         let sub = b["sub"].as_str().unwrap_or("");
         (
@@ -92,6 +109,17 @@ async fn stub_lumilake(seen: Shared, hub: Arc<Mutex<String>>) -> String {
             .unwrap()
             .submits
             .push((auth.clone(), body.clone()));
+        // Lumilake's binding admits exactly {job_id}.
+        let keys: Vec<&String> = body["lumid_job"]
+            .as_object()
+            .map(|o| o.keys().collect())
+            .unwrap_or_default();
+        if keys != vec!["job_id"] {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"detail": format!("lumid_job fields {keys:?}")})),
+            );
+        }
         if body["data"][0]["name"] == "reject-me" {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -169,6 +197,68 @@ async fn stub_lumilake(seen: Shared, hub: Arc<Mutex<String>>) -> String {
     .await
 }
 
+/// FlowMesh / sandbox-control: accept a submit carrying the full binding,
+/// fetch the job token as the authenticated owner, read with it, and answer
+/// with a runtime reference. They report status themselves, so no status API.
+async fn stub_runtime(
+    seen: Shared,
+    hub: Arc<Mutex<String>>,
+    path: &'static str,
+    key: &'static str,
+    answer: Value,
+) -> String {
+    let h = move |headers: HeaderMap, Json(body): Json<Value>| {
+        let (seen, hub, answer) = (seen.clone(), hub.clone(), answer.clone());
+        async move {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            seen.lock()
+                .unwrap()
+                .submits
+                .push((auth.clone(), body.clone()));
+            let job_id = body["lumid_job"]["job_id"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let hub = hub.lock().unwrap().clone();
+            let http = reqwest::Client::new();
+            let tok: Value = http
+                .post(format!("{hub}/jobs/v1/jobs/{job_id}/token"))
+                .bearer_auth(key)
+                .json(&json!({"for_sub": auth.trim_start_matches("Bearer ").trim_start_matches("minted.")}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let read = http
+                .post(format!("{hub}/retrieve"))
+                .bearer_auth(tok["token"].as_str().unwrap_or(""))
+                .json(&json!({"sql": "select count(*) from ukb_demo.phenotype"}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16();
+            seen.lock().unwrap().worker_reads.push(read);
+            (StatusCode::OK, Json(answer))
+        }
+    };
+    async fn openapi() -> Json<Value> {
+        Json(json!({"components": {"schemas": {"LumidJobBinding": {"type": "object"}}}}))
+    }
+    serve(
+        Router::new()
+            .route("/openapi.json", get(openapi))
+            .route(path, post(h)),
+    )
+    .await
+}
+
 async fn boot() -> Option<(AppState, String, Shared)> {
     if std::env::var("LUMID_JOBS_E2E").ok().as_deref() != Some("1") {
         eprintln!("skipping: set LUMID_JOBS_E2E=1 + DATABASE_URL to run live");
@@ -177,6 +267,22 @@ async fn boot() -> Option<(AppState, String, Shared)> {
     let seen: Shared = Arc::new(Mutex::new(Seen::default()));
     let hub_slot = Arc::new(Mutex::new(String::new()));
     let lumilake = stub_lumilake(seen.clone(), hub_slot.clone()).await;
+    let flowmesh = stub_runtime(
+        seen.clone(),
+        hub_slot.clone(),
+        "/api/v1/workflows",
+        FM_KEY,
+        json!({"ok": true, "workflow_id": "wfl-stub-1", "count": 1, "tasks": []}),
+    )
+    .await;
+    let sandbox = stub_runtime(
+        seen.clone(),
+        hub_slot.clone(),
+        "/api/sandboxes",
+        SBX_KEY,
+        json!({"name": "sbx-1", "job_id": "x", "runtime_ref": "home/sbx/sbx-1"}),
+    )
+    .await;
     let url = reqwest::Url::parse(&std::env::var("DATABASE_URL").unwrap()).unwrap();
     let mut s = Settings::from_env();
     s.db_host = url.host_str().unwrap().into();
@@ -186,7 +292,9 @@ async fn boot() -> Option<(AppState, String, Shared)> {
     s.db_name = url.path().trim_start_matches('/').into();
     s.lumid_enabled = true;
     s.lumid_url = stub_lumid().await;
-    s.api_keys_raw = format!("{RUNTIME_KEY}:runtime:lumilake");
+    s.api_keys_raw = format!(
+        "{RUNTIME_KEY}:runtime:lumilake,{FM_KEY}:runtime:flowmesh,{SBX_KEY}:runtime:sandbox"
+    );
     s.rate_limit_anon = "100000/minute".into();
     s.rate_limit_authed = "100000/minute".into();
     s.max_concurrency_per_key = 0;
@@ -204,8 +312,10 @@ async fn boot() -> Option<(AppState, String, Shared)> {
     s.jobs_estate = "lumid-data".into();
     s.jobs_instance = "lumid-data".into();
     s.jobs_routes_json = r#"[{"route_id":"home-lan-ld","from_site":"home","source_id":"lumid-data","kind":"lan","url":"http://192.168.7.155:5101","pref":10}]"#.into();
-    s.jobs_sites_json = r#"[{"site":"home","runtimes":["lumilake"]}]"#.into();
-    s.jobs_runtimes_json = format!(r#"{{"lumilake": {{"home": "{lumilake}"}}}}"#);
+    s.jobs_sites_json = r#"[{"site":"home","runtimes":["lumilake","flowmesh","sandbox"]}]"#.into();
+    s.jobs_runtimes_json = format!(
+        r#"{{"lumilake": {{"home": "{lumilake}"}}, "flowmesh": {{"home": "{flowmesh}"}}, "sandbox": {{"home": "{sandbox}"}}}}"#
+    );
     s.bridge_secret = BRIDGE.into();
     // The mint endpoint is reached on its own (private) URL.
     s.bridge_url = s.lumid_url.clone();
@@ -356,9 +466,9 @@ async fn lumilake_dispatch_as_owner_with_job_token_and_reconcile() {
         let (auth, body) = &s.submits[0];
         // Submitted AS THE OWNER, not with an operator credential.
         assert_eq!(auth, "Bearer minted.bob-sub");
-        // The binding carries the job id and the PLANNED (LAN) data URL …
-        assert_eq!(body["lumid_job"]["job_id"], id.as_str());
-        assert_eq!(body["lumid_job"]["data_url"], "http://192.168.7.155:5101");
+        // The binding is exactly the job id: Lumilake reads through its own
+        // LUMID_DATA_WORKER_URL and refuses any other binding field …
+        assert_eq!(body["lumid_job"], json!({"job_id": id}));
         // … the runtime-native body is passed through, format moved to the header.
         assert_eq!(body["data"][0]["name"], "panel");
         assert!(body.get("workflow_format").is_none());
@@ -586,4 +696,52 @@ async fn owner_tokens_are_minted_on_the_bridge_url_not_the_auth_url() {
         err["message"].as_str().unwrap().contains("minting"),
         "{err}"
     );
+}
+
+#[tokio::test]
+#[ignore]
+async fn flowmesh_and_sandbox_dispatch_as_owner_with_the_full_binding() {
+    let Some((_st, hub, seen)) = boot().await else {
+        return;
+    };
+    for (runtime, payload, want_ref) in [
+        ("flowmesh", json!({"yaml": "kind: Workflow"}), "wfl-stub-1"),
+        ("sandbox", json!({"image": "python:3.12"}), "home/sbx/sbx-1"),
+    ] {
+        let spec = json!({
+            "app": "e2e", "runtime": runtime,
+            "sources": [{"ref": "lumid-data://ukb_demo.phenotype"}],
+            "payload": payload,
+        });
+        let created: Value = reqwest::Client::new()
+            .post(format!("{hub}/jobs/v1/jobs"))
+            .bearer_auth(BOB)
+            .json(&json!({"spec": spec}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let id = created["job_id"].as_str().expect("job id").to_string();
+        let j = wait_status(&hub, &id, "submitted").await;
+        assert_eq!(j["runtime_ref"], want_ref, "{runtime}: {j}");
+        let s = seen.lock().unwrap();
+        let (auth, body) = s.submits.last().unwrap();
+        assert_eq!(
+            auth, "Bearer minted.bob-sub",
+            "{runtime} submits as the owner"
+        );
+        let b = &body["lumid_job"];
+        assert_eq!(b["job_id"], id.as_str());
+        assert_eq!(b["site"], "home");
+        assert_eq!(b["data_url"], "http://192.168.7.155:5101");
+        assert_eq!(b["sources"][0]["ref"], "lumid-data://ukb_demo.phenotype");
+        assert!(b.get("token").is_none(), "a binding never carries a token");
+        assert_eq!(
+            s.worker_reads.last(),
+            Some(&200),
+            "{runtime} read with the job token"
+        );
+    }
 }
