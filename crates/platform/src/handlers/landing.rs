@@ -19,8 +19,37 @@ pub fn default_routes() -> Router<AppState> {
 }
 
 /// `GET /` — generic platform landing. Public.
-pub async fn landing() -> Html<&'static str> {
-    Html(GENERIC_LANDING_HTML)
+///
+/// Links are RELATIVE (`openapi.json`, not `/openapi.json`): behind an edge
+/// that mounts the service under a prefix (lum.id serves it at `/data/`,
+/// root-stripped, and 301s `/data` to `/data/`) an absolute link escapes the
+/// mount, while a relative one resolves under it — and still resolves at `/`
+/// when the service is reached directly.
+///
+/// `LUMID_VIEWER_URL` (optional, http/https only) adds a tile linking to a
+/// browsing UI for this service; the platform names no domain itself.
+pub async fn landing() -> Html<String> {
+    let viewer = std::env::var("LUMID_VIEWER_URL")
+        .ok()
+        .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+        .map(|u| viewer_tile(&u))
+        .unwrap_or_default();
+    Html(GENERIC_LANDING_HTML.replace("<!--VIEWER-->", &viewer))
+}
+
+fn viewer_tile(url: &str) -> String {
+    let u = url
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!(
+        r#"<a class="tile" href="{u}">
+        <div class="t">Viewer</div>
+        <div class="d">Browse schemas and tables, sample rows, and manage data jobs in a UI.</div>
+        <div class="e">{u}</div>
+      </a>"#
+    )
 }
 
 const GENERIC_LANDING_HTML: &str = r##"<!DOCTYPE html>
@@ -50,12 +79,12 @@ const GENERIC_LANDING_HTML: &str = r##"<!DOCTYPE html>
     header.hero .tag em { color:var(--accent); font-style:normal; font-weight:600; }
     .tiles { display:grid; grid-template-columns:repeat(2,1fr); gap:14px; }
     @media (max-width:620px){ .tiles { grid-template-columns:1fr; } }
-    a.tile { display:block; padding:18px 20px; background:var(--card); border:1px solid var(--border);
+    .tile { display:block; padding:18px 20px; background:var(--card); border:1px solid var(--border);
       border-radius:10px; color:var(--fg); transition:all 0.15s ease; }
     a.tile:hover { border-color:var(--accent); transform:translateY(-1px); }
-    a.tile .t { font-weight:600; font-size:15px; }
-    a.tile .d { color:var(--fg-dim); font-size:13.5px; margin-top:6px; }
-    a.tile .e { color:var(--fg-muted); font-size:11.5px; margin-top:9px;
+    .tile .t { font-weight:600; font-size:15px; }
+    .tile .d { color:var(--fg-dim); font-size:13.5px; margin-top:6px; }
+    .tile .e { color:var(--fg-muted); font-size:11.5px; margin-top:9px;
       font-family:ui-monospace,monospace; }
     pre.code { background:var(--code-bg); border:1px solid var(--border); border-radius:8px;
       padding:14px 16px; overflow-x:auto; font-size:13px; line-height:1.6; margin:24px 0 0; }
@@ -81,22 +110,23 @@ const GENERIC_LANDING_HTML: &str = r##"<!DOCTYPE html>
   <section>
     <h2>Discover</h2>
     <div class="tiles">
-      <a class="tile" href="/openapi.json">
+      <a class="tile" href="openapi.json">
         <div class="t">OpenAPI</div>
         <div class="d">The full machine-readable spec for every read route.</div>
         <div class="e">GET /openapi.json</div>
       </a>
-      <a class="tile" href="/catalog/schemas">
+      <a class="tile" href="catalog/schemas">
         <div class="t">Catalog</div>
         <div class="d">Browse schemas, tables, and per-table profiles. Trace row lineage.</div>
         <div class="e">GET /catalog/schemas • /catalog/lineage/*</div>
       </a>
-      <a class="tile" href="/status">
+      <a class="tile" href="status">
         <div class="t">Status</div>
         <div class="d">Live health board — realtime feeds + per-endpoint freshness.</div>
         <div class="e">GET /status • /freshness</div>
       </a>
-      <a class="tile" href="/usage">
+<!--VIEWER-->
+      <a class="tile" href="usage">
         <div class="t">Usage</div>
         <div class="d">The global request dashboard.</div>
         <div class="e">GET /usage • /usage/me</div>
@@ -107,7 +137,71 @@ const GENERIC_LANDING_HTML: &str = r##"<!DOCTYPE html>
 curl -H "Authorization: Bearer &lt;token&gt;" https://&lt;host&gt;/catalog/schemas</pre>
   </section>
 
+  <section>
+    <h2>Jobs</h2>
+    <p>
+      Run work on FlowMesh, Lumilake or a sandbox <em>where the data is</em>. A job declares
+      the sources it reads (<code>findata://</code>, <code>lumid-data://</code>,
+      <code>src://</code>, <code>data://&lt;hub&gt;/…</code>, <code>hf://</code>); this service
+      checks you may read each one, plans the site and the network route for every source,
+      and dispatches as you. The job gets a token scoped to exactly its declared sources, and
+      withdrawing a share cuts a running job off within seconds.
+    </p>
+    <div class="tiles">
+      <div class="tile">
+        <div class="t">Sources</div>
+        <div class="d">Register data you own, share it read or write, see what is shared with you.</div>
+        <div class="e">/jobs/v1/sources • /jobs/v1/sources/{id}/grants</div>
+      </div>
+      <div class="tile">
+        <div class="t">Plan</div>
+        <div class="d">Dry run: where a job would run and how each source is reached, with reasons.</div>
+        <div class="e">POST /jobs/v1/plan</div>
+      </div>
+      <div class="tile">
+        <div class="t">Jobs</div>
+        <div class="d">Submit (idempotent), follow status and events, cancel.</div>
+        <div class="e">/jobs/v1/jobs • /jobs/v1/jobs/{id}/events</div>
+      </div>
+      <div class="tile">
+        <div class="t">Agents</div>
+        <div class="d">The same verbs as MCP tools: jobs_sources, jobs_plan, jobs_submit, jobs_status.</div>
+        <div class="e">POST /mcp</div>
+      </div>
+    </div>
+  </section>
+
   <footer>lumid-data-service · the portable data platform</footer>
 </div>
 </body>
 </html>"##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn links_are_relative_so_a_prefix_mount_keeps_them() {
+        for a in [
+            "href=\"/openapi",
+            "href=\"/catalog",
+            "href=\"/status",
+            "href=\"/usage",
+        ] {
+            assert!(
+                !GENERIC_LANDING_HTML.contains(a),
+                "absolute link {a} escapes a prefix mount"
+            );
+        }
+        assert!(GENERIC_LANDING_HTML.contains("<h2>Jobs</h2>"));
+    }
+
+    #[test]
+    fn viewer_tile_escapes_its_url() {
+        let t = viewer_tile("https://x/y?a=1&b=\"<z>");
+        assert!(
+            t.contains("href=\"https://x/y?a=1&amp;b=&quot;&lt;z&gt;\""),
+            "{t}"
+        );
+    }
+}
