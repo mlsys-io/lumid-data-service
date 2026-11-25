@@ -33,6 +33,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/jobs/v1/jobs/:id/token", post(issue_token))
         .route("/jobs/v1/admin/route-health", post(route_health))
+        .route("/jobs/v1/admin/routes", get(list_routes))
 }
 
 fn parse_id(s: &str) -> JResult<Uuid> {
@@ -207,6 +208,20 @@ async fn issue_token(
 }
 
 #[derive(Deserialize)]
+struct RoutesQ {
+    #[serde(default)]
+    from_site: Option<String>,
+}
+
+async fn list_routes(
+    State(st): State<AppState>,
+    Extension(id): Extension<Identity>,
+    Query(p): Query<RoutesQ>,
+) -> JResult<Json<Value>> {
+    Ok(Json(service::list_routes(&st, &id, p.from_site).await?))
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HealthIn {
     route_id: String,
@@ -249,6 +264,7 @@ pub fn openapi_paths() -> Value {
             "post": op("Report progress (runtime service key or the job's own token)")
         },
         "/jobs/v1/jobs/{id}/token": {"post": op("Issue a job token (runtime service key or the job itself)")},
-        "/jobs/v1/admin/route-health": {"post": op("Prober health report ({route_id, health, latency_ms?})")}
+        "/jobs/v1/admin/route-health": {"post": op("Prober health report ({route_id, health: up|degraded|down, latency_ms?})")},
+        "/jobs/v1/admin/routes": {"get": op("Routes a prober should probe (from_site=; a prober key sees only its own site)")}
     })
 }

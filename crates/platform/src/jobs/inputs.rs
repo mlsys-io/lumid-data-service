@@ -218,6 +218,46 @@ pub async fn record_route_health(
     Ok(n == 1)
 }
 
+/// Routes this hub owns that start at `from_site` (all sites when `None`) —
+/// what a site's prober walks. Live rows only.
+pub async fn list_routes(
+    pool: &Pool,
+    hub_id: &str,
+    from_site: Option<&str>,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let c = pool.get().await?;
+    let rows = c
+        .query(
+            "SELECT route_id, from_site, source_id, kind, url, cred_mode, max_bytes, pref,
+                    health, latency_ms, health_at
+               FROM jobs.site_routes
+              WHERE home_hub = $1 AND deleted_at IS NULL
+                AND ($2::text IS NULL OR from_site = $2)
+              ORDER BY from_site, source_id, pref, route_id",
+            &[&hub_id, &from_site],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let at: Option<chrono::DateTime<chrono::Utc>> = r.get("health_at");
+            serde_json::json!({
+                "route_id": r.get::<_, String>("route_id"),
+                "from_site": r.get::<_, String>("from_site"),
+                "source_id": r.get::<_, String>("source_id"),
+                "kind": r.get::<_, String>("kind"),
+                "url": r.get::<_, String>("url"),
+                "cred_mode": r.get::<_, String>("cred_mode"),
+                "max_bytes": r.get::<_, Option<i64>>("max_bytes"),
+                "pref": r.get::<_, i32>("pref"),
+                "health": r.get::<_, String>("health"),
+                "latency_ms": r.get::<_, Option<i32>>("latency_ms"),
+                "health_at": at,
+            })
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
