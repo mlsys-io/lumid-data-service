@@ -290,6 +290,9 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
         .feed_liveness
         .unwrap_or_else(|| Arc::new(realtime::DefaultFeedLiveness));
 
+    // Who read/wrote which table, from which app/workflow/run.
+    crate::activity::migrate(&pool, &settings.retrieval_db_role).await?;
+
     // Tenant-private blobs (`/me/blobs`): the owner-keyed index, when blob
     // storage is configured at all.
     if !settings.blob_root.is_empty() {

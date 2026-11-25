@@ -42,6 +42,14 @@ pub fn build_router(
     // the generic `ws::{quotes,news}` transport handlers but names no path.
 
     let gated = Router::new()
+        // Table activity: what a run read/wrote, what an app reads/writes, who
+        // writes/reads a table (see `activity`).
+        .route("/activity/runs/:run_id", get(crate::activity::run_activity))
+        .route("/activity/apps/:app", get(crate::activity::app_activity))
+        .route(
+            "/catalog/tables/:schema/:table/activity",
+            get(crate::activity::table_activity),
+        )
         // Catalog read plane (provenance-exposing) — port of api/routes/catalog.py.
         .route("/catalog/schemas", get(handlers::catalog::get_schemas))
         .route(
@@ -196,6 +204,9 @@ pub fn build_router(
         // before the shadow forward and every handler. Pure passthrough for
         // any caller whose role is not `job`.
         .layer(from_fn_with_state(state.clone(), crate::jobs::enforce::enforce))
+        // Table activity for ingest writes and retrieve reads — after the gate
+        // (Identity known), outside enforce so a refused job read isn't recorded.
+        .layer(from_fn_with_state(state.clone(), crate::activity::record))
         // `sync:*` keys are confined to `/sync/*` when the jobs plane is on
         // (passthrough otherwise) — see `sync::hub::confine_sync_keys`.
         .layer(from_fn_with_state(
