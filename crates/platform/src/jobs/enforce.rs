@@ -65,6 +65,16 @@ pub async fn enforce(
     let path = req.uri().path().to_string();
     match scope::classify(method.as_str(), &path, &st.settings.retrieval_prefix) {
         Need::Allow => Ok(next.run(req).await),
+        Need::OwnJob(id) => {
+            if id == ctx.job_id.to_string() {
+                Ok(next.run(req).await)
+            } else {
+                Err(refuse(
+                    "not_this_job",
+                    "a job token may only act on its own job",
+                ))
+            }
+        }
         Need::Deny(code) => Err(refuse(
             code,
             format!("{method} {path} is not available to job tokens"),
