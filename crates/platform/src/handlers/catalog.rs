@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::auth::Identity;
 use crate::error::{ApiError, ApiResult};
@@ -34,13 +34,65 @@ pub async fn get_schemas(State(st): State<AppState>) -> ApiResult<Json<Value>> {
     //
     // Tick-level and order-book data exist ONLY for prediction markets. Saying
     // so here costs one field and saves the search.
-    Ok(Json(json!({
-        "schemas": schemas,
-        "coverage_notes": {
-            "equities": "OHLCV only (market.ohlc_1min, 1-minute bars). No tick/trade tape and no L2 depth.",
-            "prediction_markets": "Full depth: trades, L2 orderbook snapshots, and derived candles for Polymarket and Kalshi.",
-        },
-    })))
+    //
+    // Each note is about one schema's data, so it is served only where that schema
+    // exists. Unconditional, they told the NUS hub's arXiv catalog (and the home
+    // hub's) about equity OHLCV they do not hold (2026-11-25).
+    let notes = coverage_notes(&schemas);
+    let mut body = json!({ "schemas": schemas });
+    if !notes.is_empty() {
+        body["coverage_notes"] = Value::Object(notes);
+    }
+    Ok(Json(body))
+}
+
+/// Coverage notes for the schemas this instance actually lists.
+fn coverage_notes(schemas: &[Map<String, Value>]) -> Map<String, Value> {
+    let has = |name: &str| {
+        schemas
+            .iter()
+            .any(|s| s.get("schema").and_then(Value::as_str) == Some(name))
+    };
+    let mut notes = Map::new();
+    if has("market") {
+        notes.insert(
+            "equities".into(),
+            "OHLCV only (market.ohlc_1min, 1-minute bars). No tick/trade tape and no L2 depth."
+                .into(),
+        );
+    }
+    if has("prediction_markets") {
+        notes.insert(
+            "prediction_markets".into(),
+            "Full depth: trades, L2 orderbook snapshots, and derived candles for Polymarket and Kalshi.".into(),
+        );
+    }
+    notes
+}
+
+#[cfg(test)]
+mod coverage_notes_tests {
+    use super::*;
+
+    fn schemas(names: &[&str]) -> Vec<Map<String, Value>> {
+        names
+            .iter()
+            .map(|n| {
+                let mut m = Map::new();
+                m.insert("schema".into(), Value::from(*n));
+                m
+            })
+            .collect()
+    }
+
+    #[test]
+    fn notes_only_for_schemas_that_exist() {
+        assert!(coverage_notes(&schemas(&["arxiv", "provenance"])).is_empty());
+        let fin = coverage_notes(&schemas(&["market", "prediction_markets", "macro"]));
+        assert!(fin.contains_key("equities") && fin.contains_key("prediction_markets"));
+        let only_pm = coverage_notes(&schemas(&["prediction_markets"]));
+        assert!(!only_pm.contains_key("equities") && only_pm.contains_key("prediction_markets"));
+    }
 }
 
 /// GET /catalog/schemas/{schema}/tables
@@ -63,11 +115,15 @@ pub async fn get_table_profile(
 ) -> ApiResult<Json<Value>> {
     let effective = q::effective_schemas(&st.settings.user_schemas);
     if !q::is_user_schema(&schema, &effective) {
-        return Err(ApiError::NotFound(format!("unknown table {schema}.{table}")));
+        return Err(ApiError::NotFound(format!(
+            "unknown table {schema}.{table}"
+        )));
     }
     match q::table_profile(&st.pool, &schema, &table).await? {
         Some(profile) => Ok(Json(profile)),
-        None => Err(ApiError::NotFound(format!("unknown table {schema}.{table}"))),
+        None => Err(ApiError::NotFound(format!(
+            "unknown table {schema}.{table}"
+        ))),
     }
 }
 
@@ -87,7 +143,9 @@ pub async fn get_table_schema_json(
     // and their `schema_url` (see `list_writable_for_role`) must keep resolving.
     match q::table_schema_json(&st.pool, &schema, &table).await? {
         Some(schema_json) => Ok(Json(schema_json)),
-        None => Err(ApiError::NotFound(format!("unknown table: {schema}.{table}"))),
+        None => Err(ApiError::NotFound(format!(
+            "unknown table: {schema}.{table}"
+        ))),
     }
 }
 
@@ -197,7 +255,9 @@ pub async fn get_lineage_row(
         // LUMID-007: name the actual natural key instead of a generic 400, so
         // the caller doesn't have to separately fetch the table profile first.
         let client = st.pool.get().await?;
-        let key_cols = q::natural_key_for(&client, &schema, &table).await.unwrap_or_default();
+        let key_cols = q::natural_key_for(&client, &schema, &table)
+            .await
+            .unwrap_or_default();
         let msg = if key_cols.is_empty() {
             "supply at least one <column>=<value> query parameter (natural key)".to_string()
         } else {
