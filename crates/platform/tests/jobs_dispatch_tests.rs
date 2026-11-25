@@ -201,6 +201,8 @@ async fn boot() -> Option<(AppState, String, Shared)> {
     s.jobs_sites_json = r#"[{"site":"home","runtimes":["lumilake"]}]"#.into();
     s.jobs_runtimes_json = format!(r#"{{"lumilake": {{"home": "{lumilake}"}}}}"#);
     s.bridge_secret = BRIDGE.into();
+    // The mint endpoint is reached on its own (private) URL.
+    s.bridge_url = s.lumid_url.clone();
     let settings = Arc::new(s);
     let pool = lumid_platform::db::build_pool(&settings).unwrap();
     let st = AppState {
@@ -526,4 +528,52 @@ async fn a_lumilake_without_lumid_job_support_is_refused_not_used_unscoped() {
     );
     // The supporting stub was never involved.
     assert!(seen.lock().unwrap().submits.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires a live Postgres; LUMID_JOBS_E2E=1 + DATABASE_URL"]
+async fn owner_tokens_are_minted_on_the_bridge_url_not_the_auth_url() {
+    let Some((st, _hub, _seen)) = boot().await else {
+        return;
+    };
+    // Auth (introspection) still works on lumid_url; only the mint URL is dead.
+    let mut settings = (*st.settings).clone();
+    settings.bridge_url = "http://127.0.0.1:9".into();
+    let st2 = AppState {
+        settings: Arc::new(settings),
+        ..st.clone()
+    };
+    let id: uuid::Uuid = st2
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "INSERT INTO jobs.jobs (home_hub, owner_sub, app, runtime, site, status, spec)
+             VALUES ('home', 'bob-sub', 'e2e', 'lumilake', 'home', 'planned',
+                     '{\"payload\":{\"data\":[{\"name\":\"x\"}]}}')
+             RETURNING job_id",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    lumid_platform::jobs::dispatch::dispatch(&st2, id).await;
+    let row = st2
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT status, error FROM jobs.jobs WHERE job_id = $1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>("status"), "failed");
+    let err: Value = row.get("error");
+    assert!(
+        err["message"].as_str().unwrap().contains("minting"),
+        "{err}"
+    );
 }
