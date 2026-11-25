@@ -88,9 +88,17 @@ pub async fn refresh(
     self_hub: &str,
     instance: &str,
     only: &[String],
+    also_hidden: &[String],
 ) -> anyhow::Result<Refresh> {
     let mut client = pool.get().await?;
-    let hidden: Vec<String> = HIDDEN_SCHEMAS.iter().map(|s| s.to_string()).collect();
+    // Restricted schemas (crate::restricted) are never published: the mirror
+    // syncs to the other hub, where their access list does not apply, so even
+    // their table names and sizes must stay home (UK Biobank at NUS, 2026-11-25).
+    let hidden: Vec<String> = HIDDEN_SCHEMAS
+        .iter()
+        .map(|s| s.to_string())
+        .chain(also_hidden.iter().cloned())
+        .collect();
     let mut tx = client.transaction().await?;
     let sp = tx.savepoint("ts").await?;
     let changed = match sp
@@ -124,7 +132,14 @@ pub async fn refresh(
 }
 
 /// Background refresher (every `LUMID_HUB_CATALOG_REFRESH_SECS`, first run at boot).
-pub fn spawn(pool: Pool, self_hub: String, instance: String, only: Vec<String>, every_s: u64) {
+pub fn spawn(
+    pool: Pool,
+    self_hub: String,
+    instance: String,
+    only: Vec<String>,
+    also_hidden: Vec<String>,
+    every_s: u64,
+) {
     if every_s == 0 {
         return;
     }
@@ -132,7 +147,7 @@ pub fn spawn(pool: Pool, self_hub: String, instance: String, only: Vec<String>, 
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(every_s));
         loop {
             tick.tick().await;
-            match refresh(&pool, &self_hub, &instance, &only).await {
+            match refresh(&pool, &self_hub, &instance, &only, &also_hidden).await {
                 Ok(r) if r.changed + r.tombstoned > 0 => tracing::info!(
                     changed = r.changed,
                     tombstoned = r.tombstoned,

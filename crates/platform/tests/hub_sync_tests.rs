@@ -806,11 +806,27 @@ async fn small_blobs_copy_both_ways_and_large_ones_never() {
 async fn catalog_mirror_carries_the_peers_tables() {
     let Some(h) = hubs().await else { return };
     exec(&h.nus, "CREATE SCHEMA nusdata; CREATE TABLE nusdata.cohort (id int); INSERT INTO nusdata.cohort SELECT generate_series(1,100); ANALYZE nusdata.cohort;").await;
-    let r = hub::catalog::refresh(&h.nus.pool, "nus", "nus-data", &[])
+    // A restricted schema never reaches the mirror, so its names never sync.
+    exec(&h.nus, "CREATE SCHEMA ukbish; CREATE TABLE ukbish.phenotype (id int);").await;
+    hub::catalog::refresh(
+        &h.nus.pool,
+        "nus",
+        "nus-data",
+        &["ukbish".to_string()],
+        &["ukbish".to_string()],
+    )
+        .await
+        .unwrap();
+    assert!(
+        one(&h.nus, "SELECT 1 FROM jobs.catalog_mirror WHERE schema_name='ukbish'").await.is_none(),
+        "a restricted schema must not be published"
+    );
+    exec(&h.nus, "DROP SCHEMA ukbish CASCADE").await;
+    let r = hub::catalog::refresh(&h.nus.pool, "nus", "nus-data", &[], &[])
         .await
         .unwrap();
     assert!(r.changed >= 1, "{r:?}");
-    let again = hub::catalog::refresh(&h.nus.pool, "nus", "nus-data", &[])
+    let again = hub::catalog::refresh(&h.nus.pool, "nus", "nus-data", &[], &[])
         .await
         .unwrap();
     assert_eq!(again.changed, 0, "an unchanged table keeps its version");
@@ -822,7 +838,7 @@ async fn catalog_mirror_carries_the_peers_tables() {
     // Home's planner sees it; a dropped table tombstones and that syncs too.
     exec(&h.nus, "DROP TABLE nusdata.cohort").await;
     assert_eq!(
-        hub::catalog::refresh(&h.nus.pool, "nus", "nus-data", &[])
+        hub::catalog::refresh(&h.nus.pool, "nus", "nus-data", &[], &[])
             .await
             .unwrap()
             .tombstoned,
