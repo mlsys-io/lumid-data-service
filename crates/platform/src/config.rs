@@ -288,6 +288,13 @@ pub struct Settings {
     /// (`pg_read_file`) and makes `user_schemas` a real access boundary when the
     /// role's grants match it. Empty (default) = no `SET ROLE` (current behavior).
     pub retrieval_db_role: String,
+    /// `LUMID_RESTRICTED_SCHEMAS` — schema → allow-listed lum.id subs
+    /// (`crate::restricted`). Empty = nothing restricted.
+    pub restricted_schemas:
+        std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// `LUMID_RESTRICTED_DB_ROLE` — the role allowed callers' retrievals run as;
+    /// the only role that can read the restricted data in Postgres.
+    pub restricted_db_role: String,
 
     /// Postgres role a declarative read is de-escalated / re-scoped to (via
     /// `SET LOCAL ROLE` inside a `READ ONLY` transaction) when the endpoint is
@@ -523,6 +530,10 @@ impl Settings {
             retrieval_prefix: env_str("RETRIEVAL_PREFIX", "retrievals"),
             retrieval_sample_rows: env_u32("RETRIEVAL_SAMPLE_ROWS", 5) as usize,
             retrieval_db_role: env_str("RETRIEVAL_DB_ROLE", ""),
+            // Malformed = refuse to start: failing open would publish the data.
+            restricted_schemas: crate::restricted::parse(&env_str("RESTRICTED_SCHEMAS", ""))
+                .unwrap_or_else(|e| panic!("{e}")),
+            restricted_db_role: env_str("RESTRICTED_DB_ROLE", ""),
             admin_read_role: env_str("ADMIN_READ_ROLE", ""),
             jobs_enabled: matches!(
                 env_str("JOBS_ENABLED", "false").to_lowercase().as_str(),

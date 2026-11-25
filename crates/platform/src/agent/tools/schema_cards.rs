@@ -93,7 +93,11 @@ pub fn effective_scope(requested: &[String], allowlist: &[String]) -> Scope {
     }
 }
 
-pub async fn get_schema_cards(st: &AppState, args: &Map<String, Value>) -> ApiResult<Value> {
+pub async fn get_schema_cards(
+    st: &AppState,
+    args: &Map<String, Value>,
+    caller: Option<&crate::auth::Identity>,
+) -> ApiResult<Value> {
     let scope_raw = args
         .get("scope")
         .and_then(|v| v.as_str())
@@ -120,6 +124,17 @@ pub async fn get_schema_cards(st: &AppState, args: &Map<String, Value>) -> ApiRe
         Scope::Only(_) => vec![].into(),
     };
 
+    // Never describe a restricted schema to someone not on its list
+    // (crate::restricted): the model would plan queries the replayer refuses,
+    // and the table names alone would confirm the data is here.
+    let cards: Vec<_> = cards
+        .iter()
+        .filter(|c| {
+            let schema = c.fqname.split('.').next().unwrap_or("");
+            crate::restricted::may_see(&st.settings, caller, schema)
+        })
+        .cloned()
+        .collect();
     let rendered = render_bundle_for_prompt(&cards);
 
     Ok(json!({

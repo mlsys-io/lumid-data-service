@@ -428,6 +428,9 @@ pub async fn table_activity(
     Path((schema, table)): Path<(String, String)>,
     Query(q): Query<DaysQ>,
 ) -> ApiResult<Json<Value>> {
+    if !crate::restricted::may_see(&st.settings, Some(&id), &schema) {
+        return Err(ApiError::NotFound(format!("unknown table {schema}.{table}")));
+    }
     let c = st
         .pool
         .get()
