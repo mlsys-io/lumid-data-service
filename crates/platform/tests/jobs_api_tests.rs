@@ -778,6 +778,26 @@ async fn refusals_quotas_mcp_openapi_and_probers() {
         .unwrap()
         .contains("job_not_found"));
 
+    // An estate this hub doesn't serve is named as such, not as a permission.
+    let (s, v) = call(
+        &app,
+        "POST",
+        "/jobs/v1/plan",
+        BOB,
+        Some(json!({"spec": {"app": "t", "runtime": "auto", "sources": [{"ref": "findata://market.ohlc_1d"}]}})),
+        None,
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(v["error"]["code"], "estate_not_served", "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("lumid-data://schema.table"),
+        "{v}"
+    );
+
     // Route health: probers only, this hub's routes only.
     let (s, _) = call(
         &app,
