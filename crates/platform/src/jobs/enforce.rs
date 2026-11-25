@@ -127,6 +127,7 @@ pub async fn enforce(
             Ok(resp)
         }
         Need::Retrieve => retrieve(&st, ctx.job_id, &ctx.scope, req, next).await,
+        Need::Profile => profile(&ctx.scope, req, next).await,
     }
 }
 
@@ -199,6 +200,25 @@ async fn retrieve(
         record_bytes(st, job_id, &used[0], Access::Read, n);
     }
     Ok(Response::from_parts(parts, Body::from(body)))
+}
+
+/// `/profile`: EXPLAIN only (never executes), but its SQL may still name only
+/// declared sources — the same check as `/retrieve`'s SQL ops. Lumilake's
+/// planner profiles a job's retrievals with the job token (found 2026-11-25:
+/// without this, every job-scoped Lumilake run failed 403 at planning).
+async fn profile(scope: &Scope, req: Request, next: Next) -> Result<Response, ApiError> {
+    let (parts, body) = req.into_parts();
+    let bytes = to_bytes(body, MAX_RETRIEVE_BODY)
+        .await
+        .map_err(|_| ApiError::BadRequest("profile body too large for a job token".into()))?;
+    let json: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| ApiError::BadRequest(format!("invalid JSON: {e}")))?;
+    let sql = json
+        .get("sql")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::BadRequest("profile needs a string `sql`".into()))?;
+    check_sql(scope, sql).map_err(|e| refuse("source_not_in_job_scope", e))?;
+    Ok(next.run(Request::from_parts(parts, Body::from(bytes))).await)
 }
 
 /// Count the bytes a successful read response ACTUALLY streams to the job
