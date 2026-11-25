@@ -42,6 +42,9 @@ struct IntrospectData {
     active: bool,
     #[serde(default)]
     scopes: Option<Vec<String>>,
+    /// RFC 7662 `aud` (JWTs only; absent for PATs and from older lum.id).
+    #[serde(default)]
+    aud: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -58,11 +61,15 @@ struct IntrospectBody {
     active: bool,
     #[serde(default)]
     scopes: Option<Vec<String>>,
+    /// RFC 7662 `aud` (JWTs only; absent for PATs and from older lum.id).
+    #[serde(default)]
+    aud: Option<Vec<String>>,
 }
 
 pub struct LumidClient {
     client: reqwest::Client,
     base_url: String,
+    audience: String,
     enabled: bool,
     // Cache value: Some(identity) on success, None negative-cached.
     cache: Cache<String, Option<Identity>>,
@@ -82,6 +89,7 @@ impl LumidClient {
         LumidClient {
             client,
             base_url: s.lumid_url.trim_end_matches('/').to_string(),
+            audience: s.lumid_audience.clone(),
             enabled: s.lumid_enabled,
             cache,
         }
@@ -118,7 +126,8 @@ impl LumidClient {
         let resp = self
             .client
             .post(&url)
-            .json(&serde_json::json!({ "token": token }))
+            // Name ourselves, so lum.id refuses JWTs minted for another service.
+            .json(&serde_json::json!({ "token": token, "audience": self.audience }))
             .send()
             .await
             .map_err(|e| LumidError::Unreachable(e.to_string()))?;
@@ -131,10 +140,24 @@ impl LumidClient {
             Ok(b) => b,
             Err(_) => return Ok(None),
         };
-        let (sub, role, email, active, scopes) = match body.data {
-            Some(d) => (d.sub, d.role, d.email, d.active, d.scopes),
-            None => (body.sub, body.role, body.email, body.active, body.scopes),
+        let (sub, role, email, active, scopes, aud) = match body.data {
+            Some(d) => (d.sub, d.role, d.email, d.active, d.scopes, d.aud),
+            None => (
+                body.sub,
+                body.role,
+                body.email,
+                body.active,
+                body.scopes,
+                body.aud,
+            ),
         };
+        // Defence in depth: lum.id already refuses a foreign audience when we
+        // name ours, but if it reports an `aud` that is not ours, refuse here
+        // too rather than trust an identity server that ignored the request.
+        if active && !audience_ok(aud.as_deref(), &self.audience) {
+            self.cache.insert(key, None).await;
+            return Ok(None);
+        }
         if !active {
             self.cache.insert(key, None).await;
             return Ok(None);
@@ -148,5 +171,39 @@ impl LumidClient {
         };
         self.cache.insert(key, Some(ident.clone())).await;
         Ok(Some(ident))
+    }
+}
+
+/// True when the introspected token may authenticate a caller of the service
+/// named `ours`: no `aud` reported (a PAT, or a lum.id that predates the
+/// field), or `aud` names `ours` or the general `lumid-ecosystem` audience.
+pub(crate) fn audience_ok(aud: Option<&[String]>, ours: &str) -> bool {
+    match aud {
+        None => true,
+        Some(a) if a.is_empty() => true,
+        Some(a) => a.iter().any(|x| x == ours || x == "lumid-ecosystem"),
+    }
+}
+
+#[cfg(test)]
+mod audience_tests {
+    use super::audience_ok;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn audience_rules() {
+        assert!(audience_ok(None, "lumid-data"), "PATs carry no aud");
+        assert!(audience_ok(Some(&[]), "lumid-data"));
+        assert!(audience_ok(Some(&v(&["lumid-ecosystem"])), "lumid-data"));
+        assert!(audience_ok(Some(&v(&["lumid-data"])), "lumid-data"));
+        assert!(!audience_ok(Some(&v(&["flowmesh"])), "lumid-data"));
+        assert!(!audience_ok(Some(&v(&["harbor"])), "lumid-data"));
+        assert!(audience_ok(
+            Some(&v(&["flowmesh", "lumid-data"])),
+            "lumid-data"
+        ));
     }
 }

@@ -92,6 +92,11 @@ pub struct Settings {
 
     // Auth.
     pub lumid_url: String,
+    /// The audience this service names when it introspects (`LUMID_AUTH_AUDIENCE`,
+    /// default `lumid-data`). lum.id then reports a JWT active only if it was
+    /// minted for this audience or for the general `lumid-ecosystem` one, so a
+    /// token minted for FlowMesh, Runmesh, Lumilake, … is not a credential here.
+    pub lumid_audience: String,
     pub lumid_enabled: bool,
     pub lumid_cache_ttl_s: u64,
     pub lumid_timeout_s: u64,
@@ -312,6 +317,7 @@ impl Settings {
             // Auth-service (Lumid identity) config — named AUTH_* so the env
             // var isn't a doubled prefix under the platform's LUMID_ namespace.
             lumid_url: env_str("AUTH_URL", "https://lum.id"),
+            lumid_audience: env_str("AUTH_AUDIENCE", "lumid-data"),
             lumid_enabled: matches!(
                 env_str("AUTH_ENABLED", "true").to_lowercase().as_str(),
                 "1" | "true" | "yes"
