@@ -449,6 +449,7 @@ pub async fn serve(parts: ServeParts) -> anyhow::Result<()> {
                 state.settings.hub_id.clone(),
                 instance,
                 state.settings.user_schemas.clone(),
+                state.settings.restricted_schemas.keys().cloned().collect(),
                 state.settings.hub_catalog_refresh_s,
             );
             tracing::info!(
